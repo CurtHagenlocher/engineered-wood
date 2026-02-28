@@ -10,4 +10,8 @@
     <PackageReference Include="Azure.Storage.Blobs" Version="12.*" />
   </ItemGroup>
 
+  <ItemGroup>
+    <InternalsVisibleTo Include="EngineeredWood.Tests" />
+  </ItemGroup>
+
 </Project>
