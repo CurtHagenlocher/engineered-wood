@@ -7,6 +7,9 @@ obj/
 *.user
 *.suo
 
+## Benchmarks
+BenchmarkDotNet.Artifacts/
+
 ## OS
 Thumbs.db
 Desktop.ini
