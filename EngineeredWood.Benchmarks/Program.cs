@@ -1,4 +1,7 @@
 using BenchmarkDotNet.Running;
 using EngineeredWood.Benchmarks;
 
-BenchmarkRunner.Run<MetadataReadBenchmarks>(args: args);
+BenchmarkSwitcher.FromTypes([
+    typeof(MetadataReadBenchmarks),
+    typeof(RowGroupReadBenchmarks),
+]).Run(args);

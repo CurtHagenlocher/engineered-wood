@@ -12,6 +12,7 @@
   </ItemGroup>
 
   <ItemGroup>
+    <PackageReference Include="Apache.Arrow" Version="18.*" />
     <PackageReference Include="BenchmarkDotNet" Version="0.*" />
     <PackageReference Include="ParquetSharp" Version="21.*" />
     <PackageReference Include="Parquet.Net" Version="5.*" />
