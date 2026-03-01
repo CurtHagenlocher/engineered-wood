@@ -15,12 +15,17 @@ public static class TestFileGenerator
     public const string WideFlat = "wide_flat";
     public const string TallNarrow = "tall_narrow";
     public const string Snappy = "snappy";
+    public const string DeltaByteArray = "delta_byte_array";
+    public const string DeltaLengthByteArray = "delta_length_byte_array";
+    public const string ByteStreamSplit = "byte_stream_split";
 
     private const int WideFlatColumnCount = 100;
     private const int WideFlatRowCount = 1_000_000;
 
     private const int TallNarrowRowCount = 10_000_000;
     private const int TallNarrowRowGroupSize = 2_000_000;
+
+    private const int EncodingBenchRowCount = 1_000_000;
 
     private const double NullRate = 0.10;
     private const int StringPoolSize = 10_000;
@@ -35,6 +40,9 @@ public static class TestFileGenerator
         GenerateWideFlat(Path.Combine(dir, WideFlat + ".parquet"), compressed: false);
         GenerateWideFlat(Path.Combine(dir, Snappy + ".parquet"), compressed: true);
         GenerateTallNarrow(Path.Combine(dir, TallNarrow + ".parquet"));
+        GenerateDeltaByteArray(Path.Combine(dir, DeltaByteArray + ".parquet"));
+        GenerateDeltaLengthByteArray(Path.Combine(dir, DeltaLengthByteArray + ".parquet"));
+        GenerateByteStreamSplit(Path.Combine(dir, ByteStreamSplit + ".parquet"));
 
         return dir;
     }
@@ -238,6 +246,149 @@ public static class TestFileGenerator
         var values = new byte[rowCount][];
         for (int j = 0; j < rowCount; j++)
             values[j] = random.NextDouble() < NullRate ? null! : pool[random.Next(pool.Length)];
+        col.WriteBatch(values);
+    }
+
+    // --- Encoding-specific files ---
+
+    /// <summary>
+    /// Generates a file with DELTA_BYTE_ARRAY encoding: 4 byte[] columns with high prefix sharing.
+    /// </summary>
+    private static void GenerateDeltaByteArray(string path)
+    {
+        var random = new Random(42);
+        var columns = new ParquetSharp.Column[]
+        {
+            new ParquetSharp.Column<byte[]>("url"),
+            new ParquetSharp.Column<byte[]>("path"),
+            new ParquetSharp.Column<byte[]>("email"),
+            new ParquetSharp.Column<byte[]>("random_str"),
+        };
+
+        using var props = new WriterPropertiesBuilder()
+            .Compression(Compression.Uncompressed)
+            .DisableDictionary("url")
+            .DisableDictionary("path")
+            .DisableDictionary("email")
+            .DisableDictionary("random_str")
+            .Encoding("url", ParquetSharp.Encoding.DeltaByteArray)
+            .Encoding("path", ParquetSharp.Encoding.DeltaByteArray)
+            .Encoding("email", ParquetSharp.Encoding.DeltaByteArray)
+            .Encoding("random_str", ParquetSharp.Encoding.DeltaByteArray)
+            .Build();
+
+        using var writer = new ParquetFileWriter(path, columns, props);
+        using var rg = writer.AppendRowGroup();
+
+        // URLs with common prefix
+        WritePrefixedBytesColumn(rg, random, EncodingBenchRowCount, "https://example.com/api/v2/");
+        // File paths with common prefix
+        WritePrefixedBytesColumn(rg, random, EncodingBenchRowCount, "/usr/local/share/data/");
+        // Emails with common domain
+        WritePrefixedBytesColumn(rg, random, EncodingBenchRowCount, "user_");
+        // Random strings (low prefix sharing)
+        WriteBytesColumn(rg, random, GenerateStringPool(random, 10_000, 10, 50), EncodingBenchRowCount);
+
+        writer.Close();
+    }
+
+    /// <summary>
+    /// Generates a file with DELTA_LENGTH_BYTE_ARRAY encoding: 4 byte[] columns of varying string lengths.
+    /// </summary>
+    private static void GenerateDeltaLengthByteArray(string path)
+    {
+        var random = new Random(42);
+        var columns = new ParquetSharp.Column[]
+        {
+            new ParquetSharp.Column<byte[]>("short_str"),
+            new ParquetSharp.Column<byte[]>("medium_str"),
+            new ParquetSharp.Column<byte[]>("long_str"),
+            new ParquetSharp.Column<byte[]>("variable_str"),
+        };
+
+        using var props = new WriterPropertiesBuilder()
+            .Compression(Compression.Uncompressed)
+            .DisableDictionary("short_str")
+            .DisableDictionary("medium_str")
+            .DisableDictionary("long_str")
+            .DisableDictionary("variable_str")
+            .Encoding("short_str", ParquetSharp.Encoding.DeltaLengthByteArray)
+            .Encoding("medium_str", ParquetSharp.Encoding.DeltaLengthByteArray)
+            .Encoding("long_str", ParquetSharp.Encoding.DeltaLengthByteArray)
+            .Encoding("variable_str", ParquetSharp.Encoding.DeltaLengthByteArray)
+            .Build();
+
+        using var writer = new ParquetFileWriter(path, columns, props);
+        using var rg = writer.AppendRowGroup();
+
+        WriteBytesColumn(rg, random, GenerateStringPool(random, 5_000, 5, 15), EncodingBenchRowCount);
+        WriteBytesColumn(rg, random, GenerateStringPool(random, 5_000, 30, 60), EncodingBenchRowCount);
+        WriteBytesColumn(rg, random, GenerateStringPool(random, 5_000, 80, 200), EncodingBenchRowCount);
+        WriteBytesColumn(rg, random, GenerateStringPool(random, 5_000, 5, 200), EncodingBenchRowCount);
+
+        writer.Close();
+    }
+
+    /// <summary>
+    /// Generates a file with BYTE_STREAM_SPLIT encoding: float, double, int, long columns.
+    /// </summary>
+    private static void GenerateByteStreamSplit(string path)
+    {
+        var random = new Random(42);
+        var columns = new ParquetSharp.Column[]
+        {
+            new ParquetSharp.Column<float>("float_col"),
+            new ParquetSharp.Column<double>("double_col"),
+            new ParquetSharp.Column<int>("int_col"),
+            new ParquetSharp.Column<long>("long_col"),
+        };
+
+        using var props = new WriterPropertiesBuilder()
+            .Compression(Compression.Uncompressed)
+            .DisableDictionary("float_col")
+            .DisableDictionary("double_col")
+            .DisableDictionary("int_col")
+            .DisableDictionary("long_col")
+            .Encoding("float_col", ParquetSharp.Encoding.ByteStreamSplit)
+            .Encoding("double_col", ParquetSharp.Encoding.ByteStreamSplit)
+            .Encoding("int_col", ParquetSharp.Encoding.ByteStreamSplit)
+            .Encoding("long_col", ParquetSharp.Encoding.ByteStreamSplit)
+            .Build();
+
+        using var writer = new ParquetFileWriter(path, columns, props);
+        using var rg = writer.AppendRowGroup();
+
+        WriteFloat32Column(rg, random, EncodingBenchRowCount);
+        WriteDoubleColumn(rg, random, EncodingBenchRowCount);
+        WriteInt32Column(rg, random, EncodingBenchRowCount);
+        WriteInt64Column(rg, random, EncodingBenchRowCount);
+
+        writer.Close();
+    }
+
+    private static void WritePrefixedBytesColumn(RowGroupWriter rowGroup, Random random, int rowCount, string prefix)
+    {
+        using var col = rowGroup.NextColumn().LogicalWriter<byte[]>();
+        var prefixBytes = System.Text.Encoding.UTF8.GetBytes(prefix);
+        var values = new byte[rowCount][];
+        for (int j = 0; j < rowCount; j++)
+        {
+            int suffixLen = random.Next(5, 30);
+            var bytes = new byte[prefixBytes.Length + suffixLen];
+            prefixBytes.CopyTo(bytes, 0);
+            for (int k = prefixBytes.Length; k < bytes.Length; k++)
+                bytes[k] = (byte)random.Next(0x61, 0x7B); // lowercase a-z
+            values[j] = bytes;
+        }
+        col.WriteBatch(values);
+    }
+
+    private static void WriteFloat32Column(RowGroupWriter rowGroup, Random random, int rowCount)
+    {
+        using var col = rowGroup.NextColumn().LogicalWriter<float>();
+        var values = new float[rowCount];
+        for (int j = 0; j < rowCount; j++)
+            values[j] = (float)(random.NextDouble() * 1_000_000.0 - 500_000.0);
         col.WriteBatch(values);
     }
 

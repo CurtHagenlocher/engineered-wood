@@ -243,42 +243,122 @@ public class ReadRowGroupTests
         Assert.Equal(300, batch.Length);
         Assert.Equal(2, batch.Schema.FieldsList.Count);
 
-        // Verify float column
-        var floatArray = (FloatArray)batch.Column(0);
-        Assert.Equal(300, floatArray.Length);
-        // Values are random normal distribution — verify they are finite numbers
-        for (int i = 0; i < floatArray.Length; i++)
-            Assert.True(float.IsFinite(floatArray.GetValue(i)!.Value));
+        // Cross-verify against ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("byte_stream_split.zstd.parquet"));
+        using var rowGroupReader = psReader.RowGroup(0);
 
-        // Verify double column
+        var floatArray = (FloatArray)batch.Column(0);
+        using (var col = rowGroupReader.Column(0).LogicalReader<float?>())
+        {
+            var expected = col.ReadAll(300);
+            for (int i = 0; i < 300; i++)
+                Assert.Equal(expected[i], floatArray.GetValue(i));
+        }
+
         var doubleArray = (DoubleArray)batch.Column(1);
-        Assert.Equal(300, doubleArray.Length);
-        for (int i = 0; i < doubleArray.Length; i++)
-            Assert.True(double.IsFinite(doubleArray.GetValue(i)!.Value));
+        using (var col = rowGroupReader.Column(1).LogicalReader<double?>())
+        {
+            var expected = col.ReadAll(300);
+            for (int i = 0; i < 300; i++)
+                Assert.Equal(expected[i], doubleArray.GetValue(i));
+        }
     }
 
     [Fact]
-    public async Task DeltaLengthByteArray_ReadsStringColumn()
+    public async Task ByteStreamSplit_RoundTrip_AllTypes()
     {
-        await using var file = new LocalRandomAccessFile(TestData.GetPath("delta_length_byte_array.parquet"));
-        using var reader = new ParquetFileReader(file, ownsFile: false);
+        // Write Float, Double, Int32, Int64 columns with BYTE_STREAM_SPLIT via ParquetSharp
+        var path = Path.Combine(Path.GetTempPath(), $"ew-bss-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            int rowCount = 500;
+            var floats = Enumerable.Range(0, rowCount).Select(i => (float)(i * 1.5 - 100)).ToArray();
+            var doubles = Enumerable.Range(0, rowCount).Select(i => i * 3.14159 - 500).ToArray();
+            var ints = Enumerable.Range(0, rowCount).Select(i => i * 7 - 1000).ToArray();
+            var longs = Enumerable.Range(0, rowCount).Select(i => (long)i * 100_000 - 25_000_000).ToArray();
 
+            {
+                var columns = new ParquetSharp.Column[]
+                {
+                    new ParquetSharp.Column<float>("f"),
+                    new ParquetSharp.Column<double>("d"),
+                    new ParquetSharp.Column<int>("i"),
+                    new ParquetSharp.Column<long>("l"),
+                };
+
+                using var props = new ParquetSharp.WriterPropertiesBuilder()
+                    .Encoding(ParquetSharp.Encoding.ByteStreamSplit)
+                    .Build();
+                using var writer = new ParquetSharp.ParquetFileWriter(path, columns, props);
+                using var rowGroup = writer.AppendRowGroup();
+
+                using (var col = rowGroup.NextColumn().LogicalWriter<float>())
+                    col.WriteBatch(floats);
+                using (var col = rowGroup.NextColumn().LogicalWriter<double>())
+                    col.WriteBatch(doubles);
+                using (var col = rowGroup.NextColumn().LogicalWriter<int>())
+                    col.WriteBatch(ints);
+                using (var col = rowGroup.NextColumn().LogicalWriter<long>())
+                    col.WriteBatch(longs);
+
+                writer.Close();
+            }
+
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var batch = await reader.ReadRowGroupAsync(0);
+
+            Assert.Equal(rowCount, batch.Length);
+
+            var fArr = (FloatArray)batch.Column("f");
+            for (int i = 0; i < rowCount; i++)
+                Assert.Equal(floats[i], fArr.GetValue(i));
+
+            var dArr = (DoubleArray)batch.Column("d");
+            for (int i = 0; i < rowCount; i++)
+                Assert.Equal(doubles[i], dArr.GetValue(i));
+
+            var iArr = (Int32Array)batch.Column("i");
+            for (int i = 0; i < rowCount; i++)
+                Assert.Equal(ints[i], iArr.GetValue(i));
+
+            var lArr = (Int64Array)batch.Column("l");
+            for (int i = 0; i < rowCount; i++)
+                Assert.Equal(longs[i], lArr.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task DeltaLengthByteArray_CrossVerified()
+    {
+        // Cross-verify delta_length_byte_array.parquet against ParquetSharp
+        var parquetPath = TestData.GetPath("delta_length_byte_array.parquet");
+
+        await using var file = new LocalRandomAccessFile(parquetPath);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
         var batch = await reader.ReadRowGroupAsync(0);
 
-        Assert.True(batch.Length > 0);
-        Assert.True(batch.Schema.FieldsList.Count > 0);
+        using var psReader = new ParquetSharp.ParquetFileReader(parquetPath);
+        using var rowGroupReader = psReader.RowGroup(0);
 
-        // Verify string values are non-empty
+        Assert.True(batch.Length > 0);
+
         for (int c = 0; c < batch.ColumnCount; c++)
         {
             var col = batch.Column(c);
             if (col is StringArray strArr)
             {
-                for (int r = 0; r < strArr.Length; r++)
-                {
-                    if (!strArr.IsNull(r))
-                        Assert.NotNull(strArr.GetString(r));
-                }
+                using var psCol = rowGroupReader.Column(c).LogicalReader<string>();
+                var expected = psCol.ReadAll(batch.Length);
+
+                for (int r = 0; r < batch.Length; r++)
+                    Assert.Equal(expected[r], strArr.GetString(r));
             }
         }
     }

@@ -174,10 +174,12 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
     public void Grow(int newElementCount)
     {
         int elementSize = Unsafe.SizeOf<T>();
-        int newBytes = (newElementCount * elementSize + 63) & ~63;
-        if (newBytes <= _byteLength)
+        int needed = (newElementCount * elementSize + 63) & ~63;
+        if (needed <= _byteLength)
             return;
 
+        // Exponential growth (2x) to amortise repeated grows
+        int newBytes = Math.Max(needed, _byteLength * 2);
         var newOwner = NativeAllocator.Instance.Allocate(newBytes, zeroFill: false);
         _owner!.Memory.Span.CopyTo(newOwner.Memory.Span);
         _owner.Dispose();
