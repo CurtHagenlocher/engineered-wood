@@ -108,6 +108,133 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
         IReadOnlyList<string>? columnNames = null,
         CancellationToken cancellationToken = default)
     {
+        var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
+            .ConfigureAwait(false);
+
+        // Read all column chunks in parallel via ReadRangesAsync
+        var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken)
+            .ConfigureAwait(false);
+
+        try
+        {
+            // Decode columns in parallel
+            var arrowArrays = new IArrowArray[ctx.Count];
+            Parallel.For(0, ctx.Count, i =>
+            {
+                arrowArrays[i] = ColumnChunkReader.ReadColumn(
+                    buffers[i].Memory.Span, ctx.Columns[i],
+                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+            });
+
+            return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+        }
+        finally
+        {
+            for (int i = 0; i < buffers.Count; i++)
+                buffers[i].Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Reads each column sequentially: read I/O buffer, decode, release buffer before the next.
+    /// Only one column's I/O buffer in memory at a time.
+    /// </summary>
+    internal async ValueTask<RecordBatch> ReadRowGroupIncrementalAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default)
+    {
+        var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
+            .ConfigureAwait(false);
+
+        var arrowArrays = new IArrowArray[ctx.Count];
+
+        for (int i = 0; i < ctx.Count; i++)
+        {
+            using var buffer = await _file.ReadAsync(ctx.Ranges[i], cancellationToken)
+                .ConfigureAwait(false);
+
+            arrowArrays[i] = ColumnChunkReader.ReadColumn(
+                buffer.Memory.Span, ctx.Columns[i],
+                ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+        }
+
+        return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+    }
+
+    /// <summary>
+    /// Reads all I/O buffers upfront, then decodes columns in parallel using multiple cores.
+    /// </summary>
+    internal async ValueTask<RecordBatch> ReadRowGroupParallelAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default)
+    {
+        var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
+            .ConfigureAwait(false);
+
+        var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken)
+            .ConfigureAwait(false);
+
+        try
+        {
+            var arrowArrays = new IArrowArray[ctx.Count];
+
+            Parallel.For(0, ctx.Count, i =>
+            {
+                arrowArrays[i] = ColumnChunkReader.ReadColumn(
+                    buffers[i].Memory.Span, ctx.Columns[i],
+                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+            });
+
+            return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+        }
+        finally
+        {
+            for (int i = 0; i < buffers.Count; i++)
+                buffers[i].Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Reads and decodes columns in parallel with bounded concurrency.
+    /// Each iteration reads its I/O buffer, decodes, and releases the buffer immediately.
+    /// </summary>
+    internal async ValueTask<RecordBatch> ReadRowGroupIncrementalParallelAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default)
+    {
+        var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
+            .ConfigureAwait(false);
+
+        var arrowArrays = new IArrowArray[ctx.Count];
+
+        await Parallel.ForEachAsync(
+            Enumerable.Range(0, ctx.Count),
+            new ParallelOptions
+            {
+                MaxDegreeOfParallelism = Environment.ProcessorCount,
+                CancellationToken = cancellationToken,
+            },
+            async (i, ct) =>
+            {
+                using var buffer = await _file.ReadAsync(ctx.Ranges[i], ct)
+                    .ConfigureAwait(false);
+
+                arrowArrays[i] = ColumnChunkReader.ReadColumn(
+                    buffer.Memory.Span, ctx.Columns[i],
+                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+            }).ConfigureAwait(false);
+
+        return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+    }
+
+    private async ValueTask<RowGroupContext> PrepareRowGroupAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames,
+        CancellationToken cancellationToken)
+    {
         ObjectDisposedException.ThrowIf(_disposed, this);
 
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
@@ -120,60 +247,47 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
         var rowGroup = metadata.RowGroups[rowGroupIndex];
         int rowCount = checked((int)rowGroup.NumRows);
 
-        // Resolve columns to read
         var (selectedColumns, selectedChunks) = ResolveColumns(
             schema, rowGroup, columnNames);
 
-        // Compute file ranges for each column chunk
         var ranges = new FileRange[selectedChunks.Count];
+        var arrowFields = new Field[selectedColumns.Count];
+
         for (int i = 0; i < selectedChunks.Count; i++)
         {
             var colMeta = selectedChunks[i].MetaData
                 ?? throw new ParquetFormatException(
                     $"Column chunk {i} has no inline metadata.");
 
-            // DictionaryPageOffset of 0 is a buggy writer sentinel meaning "not set"
             long start = colMeta.DictionaryPageOffset is > 0 and long dpo
                 ? dpo
                 : colMeta.DataPageOffset;
-            long length = colMeta.TotalCompressedSize;
-            ranges[i] = new FileRange(start, length);
+            ranges[i] = new FileRange(start, colMeta.TotalCompressedSize);
+
+            arrowFields[i] = ArrowSchemaConverter.ToArrowField(selectedColumns[i]);
         }
 
-        // Read all column chunks in parallel via ReadRangesAsync
-        var buffers = await _file.ReadRangesAsync(ranges, cancellationToken)
-            .ConfigureAwait(false);
+        return new RowGroupContext(selectedColumns, selectedChunks, ranges, arrowFields, rowCount);
+    }
 
-        try
-        {
-            // Build Arrow schema and arrays
-            var arrowFields = new Field[selectedColumns.Count];
-            var arrowArrays = new IArrowArray[selectedColumns.Count];
+    private static RecordBatch BuildRecordBatch(
+        Field[] arrowFields, IArrowArray[] arrowArrays, int rowCount)
+    {
+        var builder = new Apache.Arrow.Schema.Builder();
+        for (int i = 0; i < arrowFields.Length; i++)
+            builder.Field(arrowFields[i]);
 
-            for (int i = 0; i < selectedColumns.Count; i++)
-            {
-                var column = selectedColumns[i];
-                var colMeta = selectedChunks[i].MetaData!;
-                var field = ArrowSchemaConverter.ToArrowField(column);
-                arrowFields[i] = field;
+        return new RecordBatch(builder.Build(), arrowArrays, rowCount);
+    }
 
-                var data = buffers[i].Memory.Span;
-                arrowArrays[i] = ColumnChunkReader.ReadColumn(
-                    data, column, colMeta, rowCount, field);
-            }
-
-            var arrowSchema = new Apache.Arrow.Schema.Builder();
-            for (int i = 0; i < arrowFields.Length; i++)
-                arrowSchema.Field(arrowFields[i]);
-
-            return new RecordBatch(arrowSchema.Build(), arrowArrays, rowCount);
-        }
-        finally
-        {
-            // Dispose all column chunk buffers
-            for (int i = 0; i < buffers.Count; i++)
-                buffers[i].Dispose();
-        }
+    private sealed record RowGroupContext(
+        IReadOnlyList<ColumnDescriptor> Columns,
+        IReadOnlyList<ColumnChunk> Chunks,
+        FileRange[] Ranges,
+        Field[] ArrowFields,
+        int RowCount)
+    {
+        public int Count => Columns.Count;
     }
 
     private static (IReadOnlyList<ColumnDescriptor>, IReadOnlyList<ColumnChunk>) ResolveColumns(

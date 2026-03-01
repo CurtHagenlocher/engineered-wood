@@ -35,12 +35,36 @@ public class RowGroupReadBenchmarks
         TestFileGenerator.Cleanup(_dir);
     }
 
-    [Benchmark(Description = "EngineeredWood")]
-    public async Task<Apache.Arrow.RecordBatch> EngineeredWood_ReadRowGroup()
+    [Benchmark(Baseline = true, Description = "EW_ReadAll_SeqDecode")]
+    public async Task<Apache.Arrow.RecordBatch> EW_ReadAll_SeqDecode()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file);
         return await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
+    }
+
+    [Benchmark(Description = "EW_Incremental_Seq")]
+    public async Task<Apache.Arrow.RecordBatch> EW_Incremental_Seq()
+    {
+        using var file = new LocalRandomAccessFile(FilePath);
+        using var reader = new ParquetFileReader(file);
+        return await reader.ReadRowGroupIncrementalAsync(0).ConfigureAwait(false);
+    }
+
+    [Benchmark(Description = "EW_ReadAll_Parallel")]
+    public async Task<Apache.Arrow.RecordBatch> EW_ReadAll_Parallel()
+    {
+        using var file = new LocalRandomAccessFile(FilePath);
+        using var reader = new ParquetFileReader(file);
+        return await reader.ReadRowGroupParallelAsync(0).ConfigureAwait(false);
+    }
+
+    [Benchmark(Description = "EW_Incremental_Parallel")]
+    public async Task<Apache.Arrow.RecordBatch> EW_Incremental_Parallel()
+    {
+        using var file = new LocalRandomAccessFile(FilePath);
+        using var reader = new ParquetFileReader(file);
+        return await reader.ReadRowGroupIncrementalParallelAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "ParquetSharp")]
