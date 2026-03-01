@@ -248,6 +248,10 @@ internal static class ColumnChunkReader
         {
             DecodeDeltaLengthByteArrayValues(data, column, nonNullCount, state);
         }
+        else if (encoding == Encoding.DeltaByteArray)
+        {
+            DecodeDeltaByteArrayValues(data, column, nonNullCount, state);
+        }
         else
         {
             throw new NotSupportedException(
@@ -360,6 +364,20 @@ internal static class ColumnChunkReader
                 $"Physical type '{column.PhysicalType}' is not supported for DELTA_LENGTH_BYTE_ARRAY decoding.");
 
         DeltaLengthByteArrayDecoder.Decode(data, count, state);
+    }
+
+    private static void DecodeDeltaByteArrayValues(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        int count,
+        ColumnBuildState state)
+    {
+        if (column.PhysicalType != PhysicalType.ByteArray &&
+            column.PhysicalType != PhysicalType.FixedLenByteArray)
+            throw new NotSupportedException(
+                $"Physical type '{column.PhysicalType}' is not supported for DELTA_BYTE_ARRAY decoding.");
+
+        DeltaByteArrayDecoder.Decode(data, count, state);
     }
 
     private static void DecodeDictValues(

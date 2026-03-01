@@ -154,6 +154,84 @@ public class ReadRowGroupTests
     }
 
     [Fact]
+    public async Task DeltaByteArray_RequiredColumns_MatchesExpectedValues()
+    {
+        // delta_encoding_required_column.parquet: 17 columns (9 INT32 + 8 STRING), 100 rows
+        // INT32 columns use DELTA_BINARY_PACKED, STRING columns use DELTA_BYTE_ARRAY
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("delta_encoding_required_column.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(100, batch.Length);
+        Assert.Equal(17, batch.Schema.FieldsList.Count);
+
+        // Load expected values from CSV (column names differ from Parquet schema — use indices)
+        var csvPath = Path.Combine(
+            Path.GetDirectoryName(TestData.GetPath("delta_encoding_required_column.parquet"))!,
+            "delta_encoding_required_column_expect.csv");
+        var lines = File.ReadAllLines(csvPath);
+
+        for (int col = 0; col < 17; col++)
+        {
+            for (int row = 0; row < 100; row++)
+            {
+                var expected = ParseCsvFields(lines[row + 1])[col];
+
+                if (col < 9) // INT32 columns (DELTA_BINARY_PACKED)
+                {
+                    var arr = (Int32Array)batch.Column(col);
+                    Assert.Equal(int.Parse(expected), arr.GetValue(row));
+                }
+                else // STRING columns (DELTA_BYTE_ARRAY)
+                {
+                    var arr = (StringArray)batch.Column(col);
+                    Assert.Equal(expected, arr.GetString(row));
+                }
+            }
+        }
+    }
+
+    [Fact]
+    public async Task DeltaByteArray_OptionalColumns_HandlesNulls()
+    {
+        // delta_encoding_optional_column.parquet: 17 columns (9 INT64 + 8 STRING), 100 rows, with nulls
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("delta_encoding_optional_column.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(100, batch.Length);
+        Assert.Equal(17, batch.Schema.FieldsList.Count);
+
+        // Load expected values from CSV — use column indices
+        var csvPath = Path.Combine(
+            Path.GetDirectoryName(TestData.GetPath("delta_encoding_optional_column.parquet"))!,
+            "delta_encoding_optional_column_expect.csv");
+        var lines = File.ReadAllLines(csvPath);
+
+        // Verify string columns (cols 9-16) against CSV, handling nulls
+        for (int col = 9; col < 17; col++)
+        {
+            var arr = (StringArray)batch.Column(col);
+
+            for (int row = 0; row < 100; row++)
+            {
+                var expected = ParseCsvFields(lines[row + 1])[col];
+                if (expected == "")
+                {
+                    Assert.True(arr.IsNull(row),
+                        $"Column {col} row {row}: expected null but got '{arr.GetString(row)}'");
+                }
+                else
+                {
+                    Assert.Equal(expected, arr.GetString(row));
+                }
+            }
+        }
+    }
+
+    [Fact]
     public async Task DeltaLengthByteArray_ReadsStringColumn()
     {
         await using var file = new LocalRandomAccessFile(TestData.GetPath("delta_length_byte_array.parquet"));
@@ -294,7 +372,8 @@ public class ReadRowGroupTests
                             enc != Encoding.RleDictionary &&
                             enc != Encoding.Rle &&
                             enc != Encoding.DeltaBinaryPacked &&
-                            enc != Encoding.DeltaLengthByteArray)
+                            enc != Encoding.DeltaLengthByteArray &&
+                            enc != Encoding.DeltaByteArray)
                         {
                             skipped.Add($"{fileName}: unsupported encoding {enc}");
                             unsupported = true;
@@ -430,5 +509,52 @@ public class ReadRowGroupTests
             if (File.Exists(path))
                 File.Delete(path);
         }
+    }
+
+    /// <summary>
+    /// Splits a quoted CSV line into fields, handling commas inside quoted values
+    /// and empty (null) fields represented as consecutive commas.
+    /// </summary>
+    private static List<string> ParseCsvFields(string line)
+    {
+        line = line.TrimEnd('\r', '\n');
+        var fields = new List<string>();
+        int i = 0;
+        while (i <= line.Length)
+        {
+            if (i == line.Length)
+            {
+                // Trailing comma produced an empty field
+                fields.Add("");
+                break;
+            }
+            else if (line[i] == '"')
+            {
+                i++; // skip opening quote
+                int start = i;
+                while (i < line.Length && line[i] != '"')
+                    i++;
+                fields.Add(line[start..i]);
+                if (i < line.Length) i++; // skip closing quote
+                if (i < line.Length && line[i] == ',') i++; // skip delimiter
+                else break;
+            }
+            else if (line[i] == ',')
+            {
+                // Empty field
+                fields.Add("");
+                i++;
+            }
+            else
+            {
+                int start = i;
+                while (i < line.Length && line[i] != ',')
+                    i++;
+                fields.Add(line[start..i]);
+                if (i < line.Length) i++; // skip delimiter
+                else break;
+            }
+        }
+        return fields;
     }
 }
