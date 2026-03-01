@@ -71,18 +71,18 @@ internal static class MetadataDecoder
         };
     }
 
-    private static List<SchemaElement> ReadSchemaList(ref ThriftCompactReader reader)
+    private static SchemaElement[] ReadSchemaList(ref ThriftCompactReader reader)
     {
         var (elemType, count) = reader.ReadListHeader();
-        var list = new List<SchemaElement>(count);
+        var array = new SchemaElement[count];
         for (int i = 0; i < count; i++)
         {
             if (elemType == ThriftType.Struct)
-                list.Add(ReadSchemaElement(ref reader));
+                array[i] = ReadSchemaElement(ref reader);
             else
                 reader.Skip(elemType);
         }
-        return list;
+        return array;
     }
 
     private static SchemaElement ReadSchemaElement(ref ThriftCompactReader reader)
@@ -160,6 +160,17 @@ internal static class MetadataDecoder
         };
     }
 
+    // Cached singletons for parameterless LogicalType variants.
+    private static readonly LogicalType CachedString = new LogicalType.StringType();
+    private static readonly LogicalType CachedMap = new LogicalType.MapType();
+    private static readonly LogicalType CachedList = new LogicalType.ListType();
+    private static readonly LogicalType CachedEnum = new LogicalType.EnumType();
+    private static readonly LogicalType CachedDate = new LogicalType.DateType();
+    private static readonly LogicalType CachedJson = new LogicalType.JsonType();
+    private static readonly LogicalType CachedBson = new LogicalType.BsonType();
+    private static readonly LogicalType CachedUuid = new LogicalType.UuidType();
+    private static readonly LogicalType CachedFloat16 = new LogicalType.Float16Type();
+
     private static LogicalType ReadLogicalType(ref ThriftCompactReader reader)
     {
         // LogicalType is a Thrift union — exactly one field is set.
@@ -176,26 +187,26 @@ internal static class MetadataDecoder
             {
                 case 1: // STRING
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.StringType();
+                    result = CachedString;
                     break;
                 case 2: // MAP
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.MapType();
+                    result = CachedMap;
                     break;
                 case 3: // LIST
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.ListType();
+                    result = CachedList;
                     break;
                 case 4: // ENUM
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.EnumType();
+                    result = CachedEnum;
                     break;
                 case 5: // DECIMAL
                     result = ReadDecimalLogicalType(ref reader);
                     break;
                 case 6: // DATE
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.DateType();
+                    result = CachedDate;
                     break;
                 case 7: // TIME
                     result = ReadTimeLogicalType(ref reader);
@@ -212,19 +223,19 @@ internal static class MetadataDecoder
                     break;
                 case 12: // JSON
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.JsonType();
+                    result = CachedJson;
                     break;
                 case 13: // BSON
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.BsonType();
+                    result = CachedBson;
                     break;
                 case 14: // UUID
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.UuidType();
+                    result = CachedUuid;
                     break;
                 case 15: // FLOAT16
                     SkipEmptyStruct(ref reader);
-                    result = new LogicalType.Float16Type();
+                    result = CachedFloat16;
                     break;
                 default:
                     reader.Skip(type);
@@ -349,18 +360,18 @@ internal static class MetadataDecoder
         return new LogicalType.IntType(bitWidth, isSigned);
     }
 
-    private static List<RowGroup> ReadRowGroupList(ref ThriftCompactReader reader)
+    private static RowGroup[] ReadRowGroupList(ref ThriftCompactReader reader)
     {
         var (elemType, count) = reader.ReadListHeader();
-        var list = new List<RowGroup>(count);
+        var array = new RowGroup[count];
         for (int i = 0; i < count; i++)
         {
             if (elemType == ThriftType.Struct)
-                list.Add(ReadRowGroup(ref reader));
+                array[i] = ReadRowGroup(ref reader);
             else
                 reader.Skip(elemType);
         }
-        return list;
+        return array;
     }
 
     private static RowGroup ReadRowGroup(ref ThriftCompactReader reader)
@@ -421,18 +432,18 @@ internal static class MetadataDecoder
         };
     }
 
-    private static List<ColumnChunk> ReadColumnChunkList(ref ThriftCompactReader reader)
+    private static ColumnChunk[] ReadColumnChunkList(ref ThriftCompactReader reader)
     {
         var (elemType, count) = reader.ReadListHeader();
-        var list = new List<ColumnChunk>(count);
+        var array = new ColumnChunk[count];
         for (int i = 0; i < count; i++)
         {
             if (elemType == ThriftType.Struct)
-                list.Add(ReadColumnChunk(ref reader));
+                array[i] = ReadColumnChunk(ref reader);
             else
                 reader.Skip(elemType);
         }
-        return list;
+        return array;
     }
 
     private static ColumnChunk ReadColumnChunk(ref ThriftCompactReader reader)
@@ -623,36 +634,36 @@ internal static class MetadataDecoder
         };
     }
 
-    private static List<Encoding> ReadEncodingList(ref ThriftCompactReader reader)
+    private static Encoding[] ReadEncodingList(ref ThriftCompactReader reader)
     {
         var (_, count) = reader.ReadListHeader();
-        var list = new List<Encoding>(count);
+        var array = new Encoding[count];
         for (int i = 0; i < count; i++)
-            list.Add((Encoding)reader.ReadZigZagInt32());
-        return list;
+            array[i] = (Encoding)reader.ReadZigZagInt32();
+        return array;
     }
 
-    private static List<string> ReadStringList(ref ThriftCompactReader reader)
+    private static string[] ReadStringList(ref ThriftCompactReader reader)
     {
         var (_, count) = reader.ReadListHeader();
-        var list = new List<string>(count);
+        var array = new string[count];
         for (int i = 0; i < count; i++)
-            list.Add(reader.ReadString());
-        return list;
+            array[i] = reader.ReadString();
+        return array;
     }
 
-    private static List<KeyValue> ReadKeyValueList(ref ThriftCompactReader reader)
+    private static KeyValue[] ReadKeyValueList(ref ThriftCompactReader reader)
     {
         var (elemType, count) = reader.ReadListHeader();
-        var list = new List<KeyValue>(count);
+        var array = new KeyValue[count];
         for (int i = 0; i < count; i++)
         {
             if (elemType == ThriftType.Struct)
-                list.Add(ReadKeyValue(ref reader));
+                array[i] = ReadKeyValue(ref reader);
             else
                 reader.Skip(elemType);
         }
-        return list;
+        return array;
     }
 
     private static KeyValue ReadKeyValue(ref ThriftCompactReader reader)
@@ -682,18 +693,18 @@ internal static class MetadataDecoder
             value);
     }
 
-    private static List<SortingColumn> ReadSortingColumnList(ref ThriftCompactReader reader)
+    private static SortingColumn[] ReadSortingColumnList(ref ThriftCompactReader reader)
     {
         var (elemType, count) = reader.ReadListHeader();
-        var list = new List<SortingColumn>(count);
+        var array = new SortingColumn[count];
         for (int i = 0; i < count; i++)
         {
             if (elemType == ThriftType.Struct)
-                list.Add(ReadSortingColumn(ref reader));
+                array[i] = ReadSortingColumn(ref reader);
             else
                 reader.Skip(elemType);
         }
-        return list;
+        return array;
     }
 
     private static SortingColumn ReadSortingColumn(ref ThriftCompactReader reader)

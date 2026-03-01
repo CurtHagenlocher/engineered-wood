@@ -27,7 +27,9 @@ public sealed class SchemaDescriptor
                 $"Schema element count mismatch: consumed {index} of {schemaElements.Count} elements.");
 
         var columns = new List<ColumnDescriptor>();
-        CollectLeaves(Root, [], defLevel: 0, repLevel: 0, columns);
+        // Pre-allocate a path buffer sized to the maximum possible tree depth.
+        var pathBuffer = new string[schemaElements.Count];
+        CollectLeaves(Root, pathBuffer, depth: 0, defLevel: 0, repLevel: 0, columns);
         Columns = columns;
     }
 
@@ -42,8 +44,17 @@ public sealed class SchemaDescriptor
         var element = elements[index++];
         int numChildren = element.NumChildren ?? 0;
 
-        var children = new List<SchemaNode>(numChildren);
-        // Create the node first (children list will be populated next).
+        if (numChildren == 0)
+        {
+            return new SchemaNode
+            {
+                Element = element,
+                Parent = parent,
+                Children = Array.Empty<SchemaNode>(),
+            };
+        }
+
+        var children = new SchemaNode[numChildren];
         var node = new SchemaNode
         {
             Element = element,
@@ -52,14 +63,15 @@ public sealed class SchemaDescriptor
         };
 
         for (int i = 0; i < numChildren; i++)
-            children.Add(BuildTree(elements, ref index, node));
+            children[i] = BuildTree(elements, ref index, node);
 
         return node;
     }
 
     private static void CollectLeaves(
         SchemaNode node,
-        List<string> path,
+        string[] pathBuffer,
+        int depth,
         int defLevel,
         int repLevel,
         List<ColumnDescriptor> columns)
@@ -67,7 +79,7 @@ public sealed class SchemaDescriptor
         // The root has no repetition type and doesn't contribute to levels.
         if (node.Parent != null)
         {
-            path.Add(node.Name);
+            pathBuffer[depth++] = node.Name;
 
             var rep = node.Element.RepetitionType;
             if (rep == FieldRepetitionType.Optional)
@@ -83,7 +95,7 @@ public sealed class SchemaDescriptor
         {
             columns.Add(new ColumnDescriptor
             {
-                Path = path.ToArray(),
+                Path = pathBuffer[..depth].ToArray(),
                 PhysicalType = node.Element.Type!.Value,
                 TypeLength = node.Element.TypeLength,
                 MaxDefinitionLevel = defLevel,
@@ -95,10 +107,7 @@ public sealed class SchemaDescriptor
         else
         {
             foreach (var child in node.Children)
-                CollectLeaves(child, path, defLevel, repLevel, columns);
+                CollectLeaves(child, pathBuffer, depth, defLevel, repLevel, columns);
         }
-
-        if (node.Parent != null)
-            path.RemoveAt(path.Count - 1);
     }
 }
