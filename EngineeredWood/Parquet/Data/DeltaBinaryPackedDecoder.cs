@@ -47,6 +47,11 @@ internal ref struct DeltaBinaryPackedDecoder
     }
 
     /// <summary>
+    /// Number of bytes consumed from the input so far (valid after decoding).
+    /// </summary>
+    public readonly int BytesConsumed => _pos;
+
+    /// <summary>
     /// Decodes all values as INT32 into <paramref name="destination"/>.
     /// Uses unchecked 32-bit arithmetic (deltas may wrap around).
     /// </summary>

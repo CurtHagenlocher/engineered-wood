@@ -154,6 +154,32 @@ public class ReadRowGroupTests
     }
 
     [Fact]
+    public async Task DeltaLengthByteArray_ReadsStringColumn()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("delta_length_byte_array.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.True(batch.Length > 0);
+        Assert.True(batch.Schema.FieldsList.Count > 0);
+
+        // Verify string values are non-empty
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            var col = batch.Column(c);
+            if (col is StringArray strArr)
+            {
+                for (int r = 0; r < strArr.Length; r++)
+                {
+                    if (!strArr.IsNull(r))
+                        Assert.NotNull(strArr.GetString(r));
+                }
+            }
+        }
+    }
+
+    [Fact]
     public async Task NullsSnappy_HandlesNulls()
     {
         await using var file = new LocalRandomAccessFile(TestData.GetPath("nulls.snappy.parquet"));
@@ -267,7 +293,8 @@ public class ReadRowGroupTests
                             enc != Encoding.PlainDictionary &&
                             enc != Encoding.RleDictionary &&
                             enc != Encoding.Rle &&
-                            enc != Encoding.DeltaBinaryPacked)
+                            enc != Encoding.DeltaBinaryPacked &&
+                            enc != Encoding.DeltaLengthByteArray)
                         {
                             skipped.Add($"{fileName}: unsupported encoding {enc}");
                             unsupported = true;
