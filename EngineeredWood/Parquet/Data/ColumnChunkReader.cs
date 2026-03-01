@@ -7,9 +7,9 @@ using EngineeredWood.Parquet.Schema;
 namespace EngineeredWood.Parquet.Data;
 
 /// <summary>
-/// Result of reading a single column chunk: the Arrow array and optionally the raw definition levels.
+/// Result of reading a single column chunk: the Arrow array and optionally the raw definition/repetition levels.
 /// </summary>
-internal readonly record struct ColumnResult(IArrowArray Array, int[]? DefinitionLevels);
+internal readonly record struct ColumnResult(IArrowArray Array, int[]? DefinitionLevels, int[]? RepetitionLevels);
 
 /// <summary>
 /// Reads a single column chunk's pages and produces an Arrow array.
@@ -35,11 +35,11 @@ internal static class ColumnChunkReader
         Field arrowField,
         bool preserveDefLevels = false)
     {
-        if (column.MaxRepetitionLevel > 0)
-            throw new NotSupportedException(
-                $"Nested/repeated columns are not supported. Column '{column.DottedPath}' has MaxRepetitionLevel={column.MaxRepetitionLevel}.");
+        bool isRepeated = column.MaxRepetitionLevel > 0;
+        int capacity = isRepeated ? checked((int)columnMeta.NumValues) : rowCount;
 
-        using var state = new ColumnBuildState(column.PhysicalType, column.MaxDefinitionLevel, rowCount);
+        using var state = new ColumnBuildState(
+            column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity);
         DictionaryDecoder? dictionary = null;
 
         int pos = 0;
@@ -76,11 +76,25 @@ internal static class ColumnChunkReader
         }
 
         int[]? defLevels = null;
-        if (preserveDefLevels && column.MaxDefinitionLevel > 0)
+        if ((preserveDefLevels || isRepeated) && column.MaxDefinitionLevel > 0)
             defLevels = state.DefLevelSpan.ToArray();
 
-        var array = ArrowArrayBuilder.Build(state, arrowField, rowCount);
-        return new ColumnResult(array, defLevels);
+        int[]? repLevels = null;
+        if (isRepeated)
+            repLevels = state.RepLevelSpan.ToArray();
+
+        IArrowArray array;
+        if (isRepeated)
+        {
+            int numValues = checked((int)columnMeta.NumValues);
+            array = ArrowArrayBuilder.BuildDense(state, arrowField, numValues);
+        }
+        else
+        {
+            array = ArrowArrayBuilder.Build(state, arrowField, rowCount);
+        }
+
+        return new ColumnResult(array, defLevels, repLevels);
     }
 
     private static DictionaryDecoder ReadDictionaryPage(
@@ -141,9 +155,17 @@ internal static class ColumnChunkReader
 
         int offset = 0;
 
-        // Decode repetition levels (omitted if maxRepLevel == 0)
-        var repLevels = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
-        offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxRepetitionLevel, numValues, repLevels);
+        // Decode repetition levels
+        if (column.MaxRepetitionLevel > 0)
+        {
+            var repDest = state.ReserveRepLevels(numValues);
+            offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxRepetitionLevel, numValues, repDest);
+        }
+        else
+        {
+            var repLevels = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
+            offset += LevelDecoder.DecodeV1(pageData.Slice(offset), 0, numValues, repLevels);
+        }
 
         // Decode definition levels directly into native buffer
         if (column.MaxDefinitionLevel > 0)
@@ -184,10 +206,20 @@ internal static class ColumnChunkReader
         int offset = 0;
 
         // V2: repetition and definition levels are uncompressed
-        var repLevels = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
-        LevelDecoder.DecodeV2(
-            rawData.Slice(offset, v2Header.RepetitionLevelsByteLength),
-            column.MaxRepetitionLevel, numValues, repLevels);
+        if (column.MaxRepetitionLevel > 0)
+        {
+            var repDest = state.ReserveRepLevels(numValues);
+            LevelDecoder.DecodeV2(
+                rawData.Slice(offset, v2Header.RepetitionLevelsByteLength),
+                column.MaxRepetitionLevel, numValues, repDest);
+        }
+        else if (v2Header.RepetitionLevelsByteLength > 0)
+        {
+            var tempRep = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
+            LevelDecoder.DecodeV2(
+                rawData.Slice(offset, v2Header.RepetitionLevelsByteLength),
+                column.MaxRepetitionLevel, numValues, tempRep);
+        }
         offset += v2Header.RepetitionLevelsByteLength;
 
         // Decode definition levels directly into native buffer

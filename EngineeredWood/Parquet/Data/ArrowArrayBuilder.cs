@@ -13,6 +13,247 @@ namespace EngineeredWood.Parquet.Data;
 internal static class ArrowArrayBuilder
 {
     /// <summary>
+    /// Builds a dense flat array for repeated columns. Elements where defLevel &lt; maxDefLevel
+    /// are null; all others are present. Used by the list/map assembler to get the inner element array.
+    /// </summary>
+    public static IArrowArray BuildDense(ColumnBuildState state, Field field, int numValues)
+    {
+        // For repeated columns, the leaf field type may be wrapped in ListType/MapType.
+        // We need the element type for building the flat array.
+        var arrowType = field.DataType;
+
+        // The number of non-null values is state.ValueCount.
+        // If there are no def levels (required leaf), all values are present — build directly.
+        if (!state.IsNullable)
+        {
+            return BuildNonNullableDense(state, arrowType, numValues);
+        }
+
+        // Nullable: build array of numValues length, inserting nulls for elements
+        // where defLevel < maxDefLevel
+        return arrowType switch
+        {
+            BooleanType => BuildDenseBooleanArray(state, numValues),
+            Int8Type => BuildDenseNarrowIntArray<sbyte>(state, arrowType, numValues),
+            UInt8Type => BuildDenseNarrowIntArray<byte>(state, arrowType, numValues),
+            Int16Type => BuildDenseNarrowIntArray<short>(state, arrowType, numValues),
+            UInt16Type => BuildDenseNarrowIntArray<ushort>(state, arrowType, numValues),
+            Int32Type or Date32Type or Time32Type => BuildDenseFixedArray<int>(state, arrowType, numValues),
+            UInt32Type => BuildDenseFixedArray<uint>(state, arrowType, numValues),
+            Int64Type or TimestampType or Time64Type => BuildDenseFixedArray<long>(state, arrowType, numValues),
+            UInt64Type => BuildDenseFixedArray<ulong>(state, arrowType, numValues),
+            HalfFloatType => BuildDenseFixedArray<Half>(state, arrowType, numValues),
+            FloatType => BuildDenseFixedArray<float>(state, arrowType, numValues),
+            DoubleType => BuildDenseFixedArray<double>(state, arrowType, numValues),
+            StringType => BuildDenseVarBinaryArray(state, arrowType, numValues),
+            BinaryType => BuildDenseVarBinaryArray(state, arrowType, numValues),
+            FixedSizeBinaryType fsb => BuildDenseFixedSizeBinaryArray(state, numValues, fsb),
+            _ => throw new NotSupportedException(
+                $"Arrow type '{arrowType.Name}' is not supported for dense array building."),
+        };
+    }
+
+    private static IArrowArray BuildNonNullableDense(ColumnBuildState state, IArrowType arrowType, int numValues)
+    {
+        // Non-nullable: all numValues values are present, buffer is already dense
+        if (arrowType is BooleanType)
+        {
+            var valueBuffer = state.BuildValueBuffer();
+            var arrayData = new ArrayData(BooleanType.Default, numValues, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, valueBuffer });
+            return new BooleanArray(arrayData);
+        }
+
+        if (arrowType is StringType or BinaryType)
+        {
+            var offsetsBuffer = state.BuildOffsetsBuffer();
+            var dataBuffer = state.BuildDataBuffer();
+            var arrayData = new ArrayData(arrowType, numValues, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, offsetsBuffer, dataBuffer });
+            return ArrowArrayFactory.BuildArray(arrayData);
+        }
+
+        {
+            var valueBuffer = state.BuildValueBuffer();
+            var arrayData = new ArrayData(arrowType, numValues, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, valueBuffer });
+            return ArrowArrayFactory.BuildArray(arrayData);
+        }
+    }
+
+    private static IArrowArray BuildDenseFixedArray<T>(ColumnBuildState state, IArrowType arrowType, int numValues)
+        where T : unmanaged
+    {
+        var denseValues = state.GetValueSpan<T>();
+        var defLevels = state.DefLevelSpan;
+        int nullCount = numValues - state.ValueCount;
+
+        using var scatteredBuf = new NativeBuffer<T>(numValues, zeroFill: false);
+        using var bitmapBuf = new NativeBuffer<byte>((numValues + 7) / 8);
+
+        var scattered = scatteredBuf.Span;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] == state.MaxDefLevel)
+            {
+                scattered[i] = denseValues[valueIdx++];
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+            }
+        }
+
+        var valueArrow = scatteredBuf.Build();
+        var bitmapArrow = bitmapBuf.Build();
+        state.DisposeValueBuffer();
+
+        var data = new ArrayData(arrowType, numValues, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
+    private static IArrowArray BuildDenseNarrowIntArray<TNarrow>(ColumnBuildState state, IArrowType arrowType, int numValues)
+        where TNarrow : unmanaged
+    {
+        var sourceValues = state.GetValueSpan<int>();
+        var defLevels = state.DefLevelSpan;
+        int nullCount = numValues - state.ValueCount;
+
+        using var scatteredBuf = new NativeBuffer<TNarrow>(numValues, zeroFill: false);
+        using var bitmapBuf = new NativeBuffer<byte>((numValues + 7) / 8);
+
+        var scattered = scatteredBuf.Span;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] == state.MaxDefLevel)
+            {
+                scattered[i] = CastNarrow<TNarrow>(sourceValues[valueIdx++]);
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+            }
+        }
+
+        var valueArrow = scatteredBuf.Build();
+        var bitmapArrow = bitmapBuf.Build();
+        state.DisposeValueBuffer();
+
+        var data = new ArrayData(arrowType, numValues, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
+    private static IArrowArray BuildDenseBooleanArray(ColumnBuildState state, int numValues)
+    {
+        var defLevels = state.DefLevelSpan;
+        var denseBits = state.ValueByteSpan;
+        int nullCount = numValues - state.ValueCount;
+
+        using var scatteredBuf = new NativeBuffer<byte>((numValues + 7) / 8);
+        using var bitmapBuf = new NativeBuffer<byte>((numValues + 7) / 8);
+
+        var scattered = scatteredBuf.ByteSpan;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] == state.MaxDefLevel)
+            {
+                bool val = ((denseBits[valueIdx >> 3] >> (valueIdx & 7)) & 1) == 1;
+                if (val)
+                    scattered[i >> 3] |= (byte)(1 << (i & 7));
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                valueIdx++;
+            }
+        }
+
+        var valueArrow = scatteredBuf.Build();
+        var bitmapArrow = bitmapBuf.Build();
+        state.DisposeValueBuffer();
+
+        var data = new ArrayData(BooleanType.Default, numValues, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return new BooleanArray(data);
+    }
+
+    private static IArrowArray BuildDenseVarBinaryArray(ColumnBuildState state, IArrowType arrowType, int numValues)
+    {
+        var defLevels = state.DefLevelSpan;
+        var denseOffsets = state.GetOffsetsSpan();
+        int nonNullCount = state.ValueCount;
+        int nullCount = numValues - nonNullCount;
+
+        using var scatteredOffsets = new NativeBuffer<int>(numValues + 1, zeroFill: false);
+        using var bitmapBuf = new NativeBuffer<byte>((numValues + 7) / 8);
+
+        var offsets = scatteredOffsets.Span;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] == state.MaxDefLevel)
+            {
+                offsets[i] = denseOffsets[valueIdx];
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                valueIdx++;
+            }
+            else
+            {
+                offsets[i] = valueIdx < denseOffsets.Length ? denseOffsets[valueIdx] : (nonNullCount > 0 ? denseOffsets[nonNullCount] : 0);
+            }
+        }
+        offsets[numValues] = nonNullCount > 0 ? denseOffsets[nonNullCount] : 0;
+
+        var offsetsArrow = scatteredOffsets.Build();
+        var bitmapArrow = bitmapBuf.Build();
+        var dataArrow = state.BuildDataBuffer();
+        state.DisposeOffsetsBuffer();
+
+        var data = new ArrayData(arrowType, numValues, nullCount, offset: 0,
+            new[] { bitmapArrow, offsetsArrow, dataArrow });
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
+    private static IArrowArray BuildDenseFixedSizeBinaryArray(
+        ColumnBuildState state, int numValues, FixedSizeBinaryType fixedType)
+    {
+        int byteWidth = fixedType.ByteWidth;
+        var defLevels = state.DefLevelSpan;
+        var denseBytes = state.ValueByteSpan;
+        int nullCount = numValues - state.ValueCount;
+
+        using var scatteredBuf = new NativeBuffer<byte>(numValues * byteWidth, zeroFill: false);
+        using var bitmapBuf = new NativeBuffer<byte>((numValues + 7) / 8);
+
+        var scattered = scatteredBuf.ByteSpan;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] == state.MaxDefLevel)
+            {
+                denseBytes.Slice(valueIdx * byteWidth, byteWidth)
+                    .CopyTo(scattered.Slice(i * byteWidth, byteWidth));
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                valueIdx++;
+            }
+        }
+
+        var valueArrow = scatteredBuf.Build();
+        var bitmapArrow = bitmapBuf.Build();
+        state.DisposeValueBuffer();
+
+        var data = new ArrayData(fixedType, numValues, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return new FixedSizeBinaryArray(data);
+    }
+
+    /// <summary>
     /// Creates an Arrow <see cref="IArrowArray"/> from accumulated column data.
     /// </summary>
     public static IArrowArray Build(ColumnBuildState state, Field field, int rowCount)
@@ -320,10 +561,15 @@ internal sealed class ColumnBuildState : IDisposable
 {
     private readonly PhysicalType _physicalType;
     internal readonly int MaxDefLevel;
+    internal readonly int MaxRepLevel;
 
     // Definition levels (nullable columns only)
     private NativeBuffer<int>? _defLevels;
     private int _defLevelCount;
+
+    // Repetition levels (repeated columns only)
+    private NativeBuffer<int>? _repLevels;
+    private int _repLevelCount;
 
     // Value buffer: stores dense non-null values for fixed-width types and fixed-len byte arrays
     private NativeBuffer<byte>? _valueBuffer;
@@ -339,7 +585,7 @@ internal sealed class ColumnBuildState : IDisposable
     private NativeBuffer<byte>? _dataBuffer;
     private int _dataByteOffset;
 
-    private readonly int _rowCount;
+    private readonly int _capacity;
     private readonly int _elementSize; // bytes per element for fixed-width types
 
     /// <summary>Whether this column is nullable (has def levels).</summary>
@@ -348,16 +594,30 @@ internal sealed class ColumnBuildState : IDisposable
     /// <summary>Number of non-null values accumulated.</summary>
     public int ValueCount => _valueCount;
 
-    public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int rowCount)
+    /// <summary>
+    /// Creates a new column build state.
+    /// </summary>
+    /// <param name="physicalType">Parquet physical type.</param>
+    /// <param name="maxDefLevel">Maximum definition level.</param>
+    /// <param name="maxRepLevel">Maximum repetition level (0 for flat/struct-only columns).</param>
+    /// <param name="capacity">Buffer capacity: rowCount for flat columns, numValues for repeated.</param>
+    public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity)
     {
         _physicalType = physicalType;
         MaxDefLevel = maxDefLevel;
-        _rowCount = rowCount;
+        MaxRepLevel = maxRepLevel;
+        _capacity = capacity;
 
         if (maxDefLevel > 0)
         {
-            _defLevels = new NativeBuffer<int>(rowCount, zeroFill: false);
+            _defLevels = new NativeBuffer<int>(capacity, zeroFill: false);
             _defLevelCount = 0;
+        }
+
+        if (maxRepLevel > 0)
+        {
+            _repLevels = new NativeBuffer<int>(capacity, zeroFill: false);
+            _repLevelCount = 0;
         }
 
         switch (physicalType)
@@ -365,27 +625,27 @@ internal sealed class ColumnBuildState : IDisposable
             case PhysicalType.Boolean:
                 _elementSize = 0; // bit-packed, special handling
                 // Boolean bits are set via |=, so buffer must start zeroed
-                _valueBuffer = new NativeBuffer<byte>((rowCount + 7) / 8, zeroFill: true);
+                _valueBuffer = new NativeBuffer<byte>((capacity + 7) / 8, zeroFill: true);
                 break;
             case PhysicalType.Int32:
                 _elementSize = sizeof(int);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
+                _valueBuffer = new NativeBuffer<byte>(capacity * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Int64:
                 _elementSize = sizeof(long);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
+                _valueBuffer = new NativeBuffer<byte>(capacity * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Float:
                 _elementSize = sizeof(float);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
+                _valueBuffer = new NativeBuffer<byte>(capacity * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Double:
                 _elementSize = sizeof(double);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
+                _valueBuffer = new NativeBuffer<byte>(capacity * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Int96:
                 _elementSize = 12;
-                _valueBuffer = new NativeBuffer<byte>(rowCount * 12, zeroFill: false);
+                _valueBuffer = new NativeBuffer<byte>(capacity * 12, zeroFill: false);
                 break;
             case PhysicalType.FixedLenByteArray:
                 // elementSize will be set on first decode (needs TypeLength from column)
@@ -393,10 +653,10 @@ internal sealed class ColumnBuildState : IDisposable
                 break;
             case PhysicalType.ByteArray:
                 _elementSize = 0;
-                _offsetsBuffer = new NativeBuffer<int>(rowCount + 1, zeroFill: false);
+                _offsetsBuffer = new NativeBuffer<int>(capacity + 1, zeroFill: false);
                 _offsetsBuffer.Span[0] = 0;
                 _offsetsCount = 1;
-                _dataBuffer = new NativeBuffer<byte>(rowCount * 32, zeroFill: false);
+                _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false);
                 break;
         }
     }
@@ -408,6 +668,9 @@ internal sealed class ColumnBuildState : IDisposable
     /// <summary>Gets the definition levels span (for the build phase).</summary>
     public ReadOnlySpan<int> DefLevelSpan => _defLevels!.Span.Slice(0, _defLevelCount);
 
+    /// <summary>Gets the repetition levels span (for the build phase).</summary>
+    public ReadOnlySpan<int> RepLevelSpan => _repLevels!.Span.Slice(0, _repLevelCount);
+
     /// <summary>
     /// Reserves space for <paramref name="count"/> definition levels and returns a writable span.
     /// </summary>
@@ -416,6 +679,17 @@ internal sealed class ColumnBuildState : IDisposable
         if (_defLevels == null) return Span<int>.Empty;
         var span = _defLevels.Span.Slice(_defLevelCount, count);
         _defLevelCount += count;
+        return span;
+    }
+
+    /// <summary>
+    /// Reserves space for <paramref name="count"/> repetition levels and returns a writable span.
+    /// </summary>
+    public Span<int> ReserveRepLevels(int count)
+    {
+        if (_repLevels == null) return Span<int>.Empty;
+        var span = _repLevels.Span.Slice(_repLevelCount, count);
+        _repLevelCount += count;
         return span;
     }
 
@@ -456,7 +730,7 @@ internal sealed class ColumnBuildState : IDisposable
     {
         // Lazy init for FixedLenByteArray (needs typeLength from column descriptor)
         if (_valueBuffer == null)
-            _valueBuffer = new NativeBuffer<byte>(_rowCount * typeLength, zeroFill: false);
+            _valueBuffer = new NativeBuffer<byte>(_capacity * typeLength, zeroFill: false);
 
         int byteSize = count * typeLength;
         var span = _valueBuffer.ByteSpan.Slice(_valueByteOffset, byteSize);
@@ -547,6 +821,7 @@ internal sealed class ColumnBuildState : IDisposable
     public void Dispose()
     {
         _defLevels?.Dispose();
+        _repLevels?.Dispose();
         _valueBuffer?.Dispose();
         _offsetsBuffer?.Dispose();
         _dataBuffer?.Dispose();

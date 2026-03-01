@@ -456,11 +456,12 @@ public class ReadRowGroupTests
         {
             var fileName = Path.GetFileName(filePath);
 
-            // Skip encrypted and deliberately malformed files
+            // Skip encrypted, deliberately malformed, and pathological files
             if (fileName.Contains("encrypt", StringComparison.OrdinalIgnoreCase) ||
-                fileName.Contains("malformed", StringComparison.OrdinalIgnoreCase))
+                fileName.Contains("malformed", StringComparison.OrdinalIgnoreCase) ||
+                fileName == "large_string_map.brotli.parquet") // 2GB+ uncompressed data
             {
-                skipped.Add($"{fileName}: encrypted/malformed");
+                skipped.Add($"{fileName}: encrypted/malformed/pathological");
                 continue;
             }
 
@@ -525,36 +526,6 @@ public class ReadRowGroupTests
                 if (unsupported)
                     continue;
 
-                // Check for nested columns (repetition levels > 0)
-                var schema = await reader.GetSchemaAsync();
-                bool hasNested = false;
-                foreach (var col in schema.Columns)
-                {
-                    if (col.MaxRepetitionLevel > 0)
-                    {
-                        hasNested = true;
-                        break;
-                    }
-                }
-
-                if (hasNested)
-                {
-                    // Try reading only flat columns
-                    var flatColumns = schema.Columns
-                        .Where(c => c.MaxRepetitionLevel == 0)
-                        .Select(c => c.DottedPath)
-                        .ToList();
-
-                    if (flatColumns.Count == 0)
-                    {
-                        skipped.Add($"{fileName}: all columns are nested");
-                        continue;
-                    }
-
-                    var batch = await reader.ReadRowGroupAsync(0, flatColumns);
-                    Assert.True(batch.Length >= 0);
-                }
-                else
                 {
                     var batch = await reader.ReadRowGroupAsync(0);
                     Assert.True(batch.Length >= 0);
@@ -1405,5 +1376,230 @@ public class ReadRowGroupTests
         }
         currentIndex++;
         return null;
+    }
+
+    // ---- List and Map column tests ----
+
+    [Fact]
+    public async Task ListColumns_ReadsStandard3LevelList()
+    {
+        // list_columns.parquet: 3 rows, 2 columns: int64_list (list<int64>), utf8_list (list<string>)
+        // Row 0: [1,2,3], ["abc","efg","hij"]
+        // Row 1: [null,1], null
+        // Row 2: [4], ["efg",null,"hij","xyz"]
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("list_columns.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(3, batch.Length);
+        Assert.Equal(2, batch.Schema.FieldsList.Count);
+
+        // Verify schema types
+        Assert.IsType<ListType>(batch.Schema.FieldsList[0].DataType);
+        Assert.IsType<ListType>(batch.Schema.FieldsList[1].DataType);
+
+        var int64List = (ListArray)batch.Column(0);
+        var utf8List = (ListArray)batch.Column(1);
+
+        // Row 0: [1, 2, 3]
+        Assert.False(int64List.IsNull(0));
+        var row0Values = (Int64Array)int64List.GetSlicedValues(0);
+        Assert.Equal(3, row0Values.Length);
+        Assert.Equal(1L, row0Values.GetValue(0));
+        Assert.Equal(2L, row0Values.GetValue(1));
+        Assert.Equal(3L, row0Values.GetValue(2));
+
+        // Row 1: [null, 1]
+        Assert.False(int64List.IsNull(1));
+        var row1Values = (Int64Array)int64List.GetSlicedValues(1);
+        Assert.Equal(2, row1Values.Length);
+        Assert.True(row1Values.IsNull(0));
+        Assert.Equal(1L, row1Values.GetValue(1));
+
+        // Row 2: [4]
+        Assert.False(int64List.IsNull(2));
+        var row2Values = (Int64Array)int64List.GetSlicedValues(2);
+        Assert.Equal(1, row2Values.Length);
+        Assert.Equal(4L, row2Values.GetValue(0));
+
+        // utf8_list: Row 0: ["abc","efg","hij"]
+        Assert.False(utf8List.IsNull(0));
+        var utf8Row0 = (StringArray)utf8List.GetSlicedValues(0);
+        Assert.Equal(3, utf8Row0.Length);
+        Assert.Equal("abc", utf8Row0.GetString(0));
+        Assert.Equal("efg", utf8Row0.GetString(1));
+        Assert.Equal("hij", utf8Row0.GetString(2));
+
+        // utf8_list: Row 1: null (null list)
+        Assert.True(utf8List.IsNull(1));
+
+        // utf8_list: Row 2: ["efg", null, "hij", "xyz"]
+        Assert.False(utf8List.IsNull(2));
+        var utf8Row2 = (StringArray)utf8List.GetSlicedValues(2);
+        Assert.Equal(4, utf8Row2.Length);
+        Assert.Equal("efg", utf8Row2.GetString(0));
+        Assert.True(utf8Row2.IsNull(1));
+        Assert.Equal("hij", utf8Row2.GetString(2));
+        Assert.Equal("xyz", utf8Row2.GetString(3));
+    }
+
+    [Fact]
+    public async Task NullList_ReadsEmptyList()
+    {
+        // null_list.parquet: 1 row, 1 column: emptylist (list<null>)
+        // Row 0: [] (empty list)
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("null_list.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(1, batch.Length);
+        var listArray = (ListArray)batch.Column(0);
+        Assert.False(listArray.IsNull(0));
+        var values = listArray.GetSlicedValues(0);
+        Assert.Equal(0, values.Length);
+    }
+
+    [Fact]
+    public async Task MapNoValue_ReadsMapWithAllNullValues()
+    {
+        // map_no_value.parquet: 3 rows, 3 columns:
+        //   my_map: map<int32, int32> (all values null)
+        //   my_map_no_v: map with no value child (pyarrow reads as list)
+        //   my_list: list<int32>
+        // Row 0: keys=[1,2,3], Row 1: keys=[4,5,6], Row 2: keys=[7,8,9]
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("map_no_value.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(3, batch.Length);
+        Assert.Equal(3, batch.Schema.FieldsList.Count);
+
+        // First column: my_map
+        var mapType = batch.Schema.FieldsList[0].DataType;
+        Assert.IsType<MapType>(mapType);
+
+        var mapArray = (MapArray)batch.Column(0);
+        Assert.False(mapArray.IsNull(0));
+
+        // Row 0: 3 entries with keys 1,2,3 and null values
+        var allKeys = (Int32Array)mapArray.Keys;
+        int offset0 = mapArray.ValueOffsets[0];
+        int length0 = mapArray.ValueOffsets[1] - offset0;
+        Assert.Equal(3, length0);
+        Assert.Equal(1, allKeys.GetValue(offset0));
+        Assert.Equal(2, allKeys.GetValue(offset0 + 1));
+        Assert.Equal(3, allKeys.GetValue(offset0 + 2));
+
+        // Third column: my_list
+        var listArray = (ListArray)batch.Column(2);
+        Assert.False(listArray.IsNull(0));
+        var listRow0 = (Int32Array)listArray.GetSlicedValues(0);
+        Assert.Equal(3, listRow0.Length);
+        Assert.Equal(1, listRow0.GetValue(0));
+        Assert.Equal(2, listRow0.GetValue(1));
+        Assert.Equal(3, listRow0.GetValue(2));
+    }
+
+    [Fact]
+    public async Task RepeatedPrimitiveNoList_ReadsBareRepeatedPrimitive()
+    {
+        // repeated_primitive_no_list.parquet: 4 rows, bare repeated primitives
+        // Row 0: Int32_list=[0,1,2,3], String_list=["foo","zero","one","two"]
+        // Row 1: Int32_list=[], String_list=["three"]
+        // Row 2: Int32_list=[4], String_list=["four"]
+        // Row 3: Int32_list=[5,6,7,8], String_list=["five","six","seven","eight"]
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("repeated_primitive_no_list.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(4, batch.Length);
+
+        // Int32_list should be a ListType
+        Assert.IsType<ListType>(batch.Schema.FieldsList[0].DataType);
+
+        var intList = (ListArray)batch.Column(0);
+
+        // Row 0: [0,1,2,3]
+        var row0 = (Int32Array)intList.GetSlicedValues(0);
+        Assert.Equal(4, row0.Length);
+        Assert.Equal(0, row0.GetValue(0));
+        Assert.Equal(1, row0.GetValue(1));
+        Assert.Equal(2, row0.GetValue(2));
+        Assert.Equal(3, row0.GetValue(3));
+
+        // Row 1: [] (empty)
+        var row1 = (Int32Array)intList.GetSlicedValues(1);
+        Assert.Equal(0, row1.Length);
+
+        // Row 2: [4]
+        var row2 = (Int32Array)intList.GetSlicedValues(2);
+        Assert.Equal(1, row2.Length);
+        Assert.Equal(4, row2.GetValue(0));
+
+        // Row 3: [5,6,7,8]
+        var row3 = (Int32Array)intList.GetSlicedValues(3);
+        Assert.Equal(4, row3.Length);
+        Assert.Equal(5, row3.GetValue(0));
+        Assert.Equal(8, row3.GetValue(3));
+
+        // String_list
+        var stringList = (ListArray)batch.Column(1);
+        var strRow0 = (StringArray)stringList.GetSlicedValues(0);
+        Assert.Equal(4, strRow0.Length);
+        Assert.Equal("foo", strRow0.GetString(0));
+    }
+
+    [Fact]
+    public async Task OldListStructure_ReadsListOfLists()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("old_list_structure.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(1, batch.Length);
+
+        // Column "a" is LIST<LIST<INT32>>, data: [[1,2],[3,4]]
+        var outerList = (ListArray)batch.Column(0);
+        Assert.Equal(1, outerList.Length);
+
+        // Outer list row 0 has 2 inner lists
+        var innerLists = (ListArray)outerList.GetSlicedValues(0);
+        Assert.Equal(2, innerLists.Length);
+
+        // Inner list 0: [1,2]
+        var inner0 = (Int32Array)innerLists.GetSlicedValues(0);
+        Assert.Equal(2, inner0.Length);
+        Assert.Equal(1, inner0.GetValue(0));
+        Assert.Equal(2, inner0.GetValue(1));
+
+        // Inner list 1: [3,4]
+        var inner1 = (Int32Array)innerLists.GetSlicedValues(1);
+        Assert.Equal(2, inner1.Length);
+        Assert.Equal(3, inner1.GetValue(0));
+        Assert.Equal(4, inner1.GetValue(1));
+    }
+
+    [Fact]
+    public async Task NestedLists_ReadsCorrectly()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("nested_lists.snappy.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.True(batch.Length > 0);
+    }
+
+    [Fact]
+    public async Task NestedMaps_ReadsCorrectly()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("nested_maps.snappy.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.True(batch.Length > 0);
     }
 }

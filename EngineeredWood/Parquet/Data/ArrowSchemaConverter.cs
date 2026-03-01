@@ -37,9 +37,22 @@ internal static class ArrowSchemaConverter
 
         if (node.IsLeaf)
         {
+            // Bare repeated primitive: repeated leaf at top level → list of that type
+            if (node.Element.RepetitionType == FieldRepetitionType.Repeated)
+            {
+                var elementType = LeafToArrowType(node);
+                var elementField = new Apache.Arrow.Field("element", elementType, nullable: false);
+                return new Apache.Arrow.Field(node.Name, new ListType(elementField), nullable: false);
+            }
+
             var arrowType = LeafToArrowType(node);
             return new Apache.Arrow.Field(node.Name, arrowType, nullable);
         }
+
+        if (IsListNode(node))
+            return BuildListField(node);
+        if (IsMapNode(node))
+            return BuildMapField(node);
 
         // Group node → StructType
         var childFields = new Apache.Arrow.Field[node.Children.Count];
@@ -48,6 +61,76 @@ internal static class ArrowSchemaConverter
 
         var structType = new StructType(childFields);
         return new Apache.Arrow.Field(node.Name, structType, nullable);
+    }
+
+    internal static bool IsListNode(SchemaNode node) =>
+        !node.IsLeaf &&
+        (node.Element.LogicalType is LogicalType.ListType ||
+         node.Element.ConvertedType == ConvertedType.List);
+
+    internal static bool IsMapNode(SchemaNode node) =>
+        !node.IsLeaf &&
+        (node.Element.LogicalType is LogicalType.MapType ||
+         node.Element.ConvertedType == ConvertedType.Map ||
+         node.Element.ConvertedType == ConvertedType.MapKeyValue);
+
+    private static Apache.Arrow.Field BuildListField(SchemaNode node)
+    {
+        bool nullable = node.Element.RepetitionType == FieldRepetitionType.Optional;
+
+        // Determine element schema:
+        // 3-level standard: node → repeated group (list/bag/array) → element child
+        // 2-level legacy: node → repeated leaf (the leaf is the element)
+        var repeatedChild = node.Children[0]; // always has exactly one repeated child
+
+        Apache.Arrow.Field elementField;
+        if (repeatedChild.IsLeaf)
+        {
+            // 2-level: repeated leaf is the element
+            var elementType = LeafToArrowType(repeatedChild);
+            elementField = new Apache.Arrow.Field(repeatedChild.Name, elementType, nullable: false);
+        }
+        else if (repeatedChild.Children.Count == 1)
+        {
+            // 3-level standard: recurse into single element child
+            elementField = NodeToArrowField(repeatedChild.Children[0]);
+        }
+        else
+        {
+            // 3-level with multiple children in repeated group → treat repeated group as struct element
+            var childFields = new Apache.Arrow.Field[repeatedChild.Children.Count];
+            for (int i = 0; i < repeatedChild.Children.Count; i++)
+                childFields[i] = NodeToArrowField(repeatedChild.Children[i]);
+            var structType = new StructType(childFields);
+            elementField = new Apache.Arrow.Field(repeatedChild.Name, structType, nullable: false);
+        }
+
+        return new Apache.Arrow.Field(node.Name, new ListType(elementField), nullable);
+    }
+
+    private static Apache.Arrow.Field BuildMapField(SchemaNode node)
+    {
+        bool nullable = node.Element.RepetitionType == FieldRepetitionType.Optional;
+
+        // Standard map: node → repeated key_value → key + value
+        var keyValueGroup = node.Children[0];
+        var keyField = NodeToArrowField(keyValueGroup.Children[0]);
+        // Key field must be non-nullable per Arrow spec
+        keyField = new Apache.Arrow.Field(keyField.Name, keyField.DataType, nullable: false);
+
+        Apache.Arrow.Field valueField;
+        if (keyValueGroup.Children.Count > 1)
+        {
+            valueField = NodeToArrowField(keyValueGroup.Children[1]);
+        }
+        else
+        {
+            // Map with no value column — use null type (shouldn't happen often)
+            valueField = new Apache.Arrow.Field("value", Apache.Arrow.Types.StringType.Default, nullable: true);
+        }
+
+        var mapType = new MapType(keyField, valueField);
+        return new Apache.Arrow.Field(node.Name, mapType, nullable);
     }
 
     private static IArrowType LeafToArrowType(SchemaNode node)
