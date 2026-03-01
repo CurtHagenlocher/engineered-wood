@@ -17,11 +17,12 @@ internal sealed class NativeMemoryManager : MemoryManager<byte>
     private unsafe void* _pointer;
     private readonly int _length;
 
-    public unsafe NativeMemoryManager(int length, int alignment)
+    public unsafe NativeMemoryManager(int length, int alignment, bool zeroFill)
     {
         _length = length;
         _pointer = NativeMemory.AlignedAlloc((nuint)length, (nuint)alignment);
-        NativeMemory.Clear(_pointer, (nuint)length);
+        if (zeroFill)
+            NativeMemory.Clear(_pointer, (nuint)length);
     }
 
     public override Span<byte> GetSpan()
@@ -68,10 +69,24 @@ internal sealed class NativeAllocator : MemoryAllocator
 
     protected override IMemoryOwner<byte> AllocateInternal(int length, out int bytesAllocated)
     {
-        // Round up to alignment boundary
+        return AllocateInternal(length, zeroFill: true, out bytesAllocated);
+    }
+
+    /// <summary>
+    /// Allocates aligned native memory, optionally skipping zero-fill for buffers
+    /// that will be fully overwritten by the caller.
+    /// </summary>
+    public IMemoryOwner<byte> Allocate(int length, bool zeroFill)
+    {
+        int aligned = (length + Alignment - 1) & ~(Alignment - 1);
+        return new NativeMemoryManager(aligned, Alignment, zeroFill);
+    }
+
+    private static IMemoryOwner<byte> AllocateInternal(int length, bool zeroFill, out int bytesAllocated)
+    {
         int aligned = (length + Alignment - 1) & ~(Alignment - 1);
         bytesAllocated = aligned;
-        return new NativeMemoryManager(aligned, Alignment);
+        return new NativeMemoryManager(aligned, Alignment, zeroFill);
     }
 
     /// <summary>
@@ -116,14 +131,17 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
     public int Length { get; private set; }
 
     /// <summary>Creates a native buffer sized for <paramref name="elementCount"/> elements of <typeparamref name="T"/>.</summary>
-    public NativeBuffer(int elementCount)
+    /// <param name="elementCount">Number of elements.</param>
+    /// <param name="zeroFill">If true, the buffer is zeroed. Set to false when the caller
+    /// will overwrite all bytes (e.g. value buffers for non-nullable columns).</param>
+    public NativeBuffer(int elementCount, bool zeroFill = true)
     {
         int elementSize = Unsafe.SizeOf<T>();
         int rawBytes = elementCount * elementSize;
         // Round up to 64-byte boundary
         _byteLength = (rawBytes + 63) & ~63;
         Length = _byteLength / elementSize;
-        _owner = NativeAllocator.Instance.Allocate(_byteLength);
+        _owner = NativeAllocator.Instance.Allocate(_byteLength, zeroFill);
     }
 
     /// <summary>Gets a <see cref="Span{T}"/> over the native buffer.</summary>
@@ -160,7 +178,7 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
         if (newBytes <= _byteLength)
             return;
 
-        var newOwner = NativeAllocator.Instance.Allocate(newBytes);
+        var newOwner = NativeAllocator.Instance.Allocate(newBytes, zeroFill: false);
         _owner!.Memory.Span.CopyTo(newOwner.Memory.Span);
         _owner.Dispose();
         _owner = newOwner;

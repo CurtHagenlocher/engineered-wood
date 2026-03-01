@@ -58,7 +58,7 @@ internal static class ArrowArrayBuilder
         int nullCount = rowCount - nonNullCount;
         var defLevels = state.DefLevelSpan;
 
-        using var scatteredBuf = new NativeBuffer<T>(rowCount);
+        using var scatteredBuf = new NativeBuffer<T>(rowCount, zeroFill: false);
         using var bitmapBuf = new NativeBuffer<byte>((rowCount + 7) / 8);
 
         var scattered = scatteredBuf.Span;
@@ -95,7 +95,7 @@ internal static class ArrowArrayBuilder
 
         if (!state.IsNullable)
         {
-            using var narrowBuf = new NativeBuffer<TNarrow>(rowCount);
+            using var narrowBuf = new NativeBuffer<TNarrow>(rowCount, zeroFill: false);
             var dest = narrowBuf.Span;
             for (int i = 0; i < nonNullCount; i++)
                 dest[i] = CastNarrow<TNarrow>(sourceValues[i]);
@@ -111,7 +111,7 @@ internal static class ArrowArrayBuilder
         int nullCount = rowCount - nonNullCount;
         var defLevels = state.DefLevelSpan;
 
-        using var scatteredBuf = new NativeBuffer<TNarrow>(rowCount);
+        using var scatteredBuf = new NativeBuffer<TNarrow>(rowCount, zeroFill: false);
         using var bitmapBuf = new NativeBuffer<byte>((rowCount + 7) / 8);
 
         var scattered = scatteredBuf.Span;
@@ -163,6 +163,7 @@ internal static class ArrowArrayBuilder
         var defLevels = state.DefLevelSpan;
         var denseBits = state.ValueByteSpan;
 
+        // Both buffers need zeroing: bits are set via |=
         using var scatteredBuf = new NativeBuffer<byte>((rowCount + 7) / 8);
         using var bitmapBuf = new NativeBuffer<byte>((rowCount + 7) / 8);
 
@@ -229,7 +230,7 @@ internal static class ArrowArrayBuilder
         var denseOffsets = state.GetOffsetsSpan();
         var denseData = state.GetDataSpan();
 
-        using var scatteredOffsets = new NativeBuffer<int>(rowCount + 1);
+        using var scatteredOffsets = new NativeBuffer<int>(rowCount + 1, zeroFill: false);
         using var bitmapBuf = new NativeBuffer<byte>((rowCount + 7) / 8);
 
         var offsets = scatteredOffsets.Span;
@@ -282,7 +283,7 @@ internal static class ArrowArrayBuilder
         var defLevels = state.DefLevelSpan;
         var denseBytes = state.ValueByteSpan;
 
-        using var scatteredBuf = new NativeBuffer<byte>(rowCount * byteWidth);
+        using var scatteredBuf = new NativeBuffer<byte>(rowCount * byteWidth, zeroFill: false);
         using var bitmapBuf = new NativeBuffer<byte>((rowCount + 7) / 8);
 
         var scattered = scatteredBuf.ByteSpan;
@@ -354,7 +355,7 @@ internal sealed class ColumnBuildState : IDisposable
 
         if (maxDefLevel > 0)
         {
-            _defLevels = new NativeBuffer<int>(rowCount);
+            _defLevels = new NativeBuffer<int>(rowCount, zeroFill: false);
             _defLevelCount = 0;
         }
 
@@ -362,27 +363,28 @@ internal sealed class ColumnBuildState : IDisposable
         {
             case PhysicalType.Boolean:
                 _elementSize = 0; // bit-packed, special handling
-                _valueBuffer = new NativeBuffer<byte>((rowCount + 7) / 8);
+                // Boolean bits are set via |=, so buffer must start zeroed
+                _valueBuffer = new NativeBuffer<byte>((rowCount + 7) / 8, zeroFill: true);
                 break;
             case PhysicalType.Int32:
                 _elementSize = sizeof(int);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize);
+                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Int64:
                 _elementSize = sizeof(long);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize);
+                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Float:
                 _elementSize = sizeof(float);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize);
+                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Double:
                 _elementSize = sizeof(double);
-                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize);
+                _valueBuffer = new NativeBuffer<byte>(rowCount * _elementSize, zeroFill: false);
                 break;
             case PhysicalType.Int96:
                 _elementSize = 12;
-                _valueBuffer = new NativeBuffer<byte>(rowCount * 12);
+                _valueBuffer = new NativeBuffer<byte>(rowCount * 12, zeroFill: false);
                 break;
             case PhysicalType.FixedLenByteArray:
                 // elementSize will be set on first decode (needs TypeLength from column)
@@ -390,11 +392,10 @@ internal sealed class ColumnBuildState : IDisposable
                 break;
             case PhysicalType.ByteArray:
                 _elementSize = 0;
-                _offsetsBuffer = new NativeBuffer<int>(rowCount + 1);
+                _offsetsBuffer = new NativeBuffer<int>(rowCount + 1, zeroFill: false);
                 _offsetsBuffer.Span[0] = 0;
                 _offsetsCount = 1;
-                // Data buffer starts with estimated size, can grow
-                _dataBuffer = new NativeBuffer<byte>(rowCount * 32);
+                _dataBuffer = new NativeBuffer<byte>(rowCount * 32, zeroFill: false);
                 break;
         }
     }
@@ -454,7 +455,7 @@ internal sealed class ColumnBuildState : IDisposable
     {
         // Lazy init for FixedLenByteArray (needs typeLength from column descriptor)
         if (_valueBuffer == null)
-            _valueBuffer = new NativeBuffer<byte>(_rowCount * typeLength);
+            _valueBuffer = new NativeBuffer<byte>(_rowCount * typeLength, zeroFill: false);
 
         int byteSize = count * typeLength;
         var span = _valueBuffer.ByteSpan.Slice(_valueByteOffset, byteSize);
