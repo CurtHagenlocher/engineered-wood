@@ -7,6 +7,11 @@ using EngineeredWood.Parquet.Schema;
 namespace EngineeredWood.Parquet.Data;
 
 /// <summary>
+/// Result of reading a single column chunk: the Arrow array and optionally the raw definition levels.
+/// </summary>
+internal readonly record struct ColumnResult(IArrowArray Array, int[]? DefinitionLevels);
+
+/// <summary>
 /// Reads a single column chunk's pages and produces an Arrow array.
 /// </summary>
 internal static class ColumnChunkReader
@@ -19,12 +24,16 @@ internal static class ColumnChunkReader
     /// <param name="columnMeta">The column chunk metadata (codec, num_values, etc.).</param>
     /// <param name="rowCount">Number of rows in the row group.</param>
     /// <param name="arrowField">The Arrow field for this column.</param>
-    public static IArrowArray ReadColumn(
+    /// <param name="preserveDefLevels">
+    /// If true, the raw definition levels are returned in the result for struct bitmap derivation.
+    /// </param>
+    public static ColumnResult ReadColumn(
         ReadOnlySpan<byte> data,
         ColumnDescriptor column,
         ColumnMetaData columnMeta,
         int rowCount,
-        Field arrowField)
+        Field arrowField,
+        bool preserveDefLevels = false)
     {
         if (column.MaxRepetitionLevel > 0)
             throw new NotSupportedException(
@@ -66,7 +75,12 @@ internal static class ColumnChunkReader
             }
         }
 
-        return ArrowArrayBuilder.Build(state, arrowField, rowCount);
+        int[]? defLevels = null;
+        if (preserveDefLevels && column.MaxDefinitionLevel > 0)
+            defLevels = state.DefLevelSpan.ToArray();
+
+        var array = ArrowArrayBuilder.Build(state, arrowField, rowCount);
+        return new ColumnResult(array, defLevels);
     }
 
     private static DictionaryDecoder ReadDictionaryPage(

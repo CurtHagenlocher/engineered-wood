@@ -20,6 +20,71 @@ internal static class ArrowSchemaConverter
     }
 
     /// <summary>
+    /// Converts the top-level children of a schema root into Arrow fields,
+    /// recursing into group nodes to produce nested <see cref="StructType"/> fields.
+    /// </summary>
+    public static Apache.Arrow.Field[] ToArrowFields(SchemaNode root)
+    {
+        var fields = new Apache.Arrow.Field[root.Children.Count];
+        for (int i = 0; i < root.Children.Count; i++)
+            fields[i] = NodeToArrowField(root.Children[i]);
+        return fields;
+    }
+
+    private static Apache.Arrow.Field NodeToArrowField(SchemaNode node)
+    {
+        bool nullable = node.Element.RepetitionType == FieldRepetitionType.Optional;
+
+        if (node.IsLeaf)
+        {
+            var arrowType = LeafToArrowType(node);
+            return new Apache.Arrow.Field(node.Name, arrowType, nullable);
+        }
+
+        // Group node → StructType
+        var childFields = new Apache.Arrow.Field[node.Children.Count];
+        for (int i = 0; i < node.Children.Count; i++)
+            childFields[i] = NodeToArrowField(node.Children[i]);
+
+        var structType = new StructType(childFields);
+        return new Apache.Arrow.Field(node.Name, structType, nullable);
+    }
+
+    private static IArrowType LeafToArrowType(SchemaNode node)
+    {
+        var element = node.Element;
+
+        // LogicalType → ConvertedType → PhysicalType fallthrough
+        if (element.LogicalType != null)
+        {
+            // Build a temporary descriptor to reuse existing logic
+            var desc = BuildTempDescriptor(node);
+            var result = FromLogicalType(element.LogicalType, desc);
+            if (result != null) return result;
+        }
+
+        if (element.ConvertedType.HasValue)
+        {
+            var desc = BuildTempDescriptor(node);
+            var result = FromConvertedType(element.ConvertedType.Value, desc);
+            if (result != null) return result;
+        }
+
+        return FromPhysicalType(BuildTempDescriptor(node));
+    }
+
+    private static ColumnDescriptor BuildTempDescriptor(SchemaNode node) => new()
+    {
+        Path = [node.Name],
+        PhysicalType = node.Element.Type!.Value,
+        TypeLength = node.Element.TypeLength,
+        MaxDefinitionLevel = 0,
+        MaxRepetitionLevel = 0,
+        SchemaElement = node.Element,
+        SchemaNode = node,
+    };
+
+    /// <summary>
     /// Converts a Parquet column's type information to an Arrow <see cref="IArrowType"/>.
     /// Falls through: LogicalType → ConvertedType → PhysicalType.
     /// </summary>

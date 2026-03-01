@@ -388,18 +388,31 @@ public class ReadRowGroupTests
 
         Assert.True(batch.Length > 0);
 
-        // Verify nulls exist in at least one column
+        // Verify nulls exist in at least one column (check struct children recursively)
         bool hasNulls = false;
         for (int c = 0; c < batch.ColumnCount; c++)
         {
-            var col = batch.Column(c);
-            if (col.NullCount > 0)
+            if (HasNullsRecursive(batch.Column(c)))
             {
                 hasNulls = true;
                 break;
             }
         }
         Assert.True(hasNulls, "Expected at least one column with null values.");
+    }
+
+    private static bool HasNullsRecursive(IArrowArray array)
+    {
+        if (array.NullCount > 0) return true;
+        if (array is StructArray sa)
+        {
+            for (int i = 0; i < sa.Fields.Count; i++)
+            {
+                if (HasNullsRecursive(sa.Fields[i]))
+                    return true;
+            }
+        }
+        return false;
     }
 
     [Fact]
@@ -1082,5 +1095,315 @@ public class ReadRowGroupTests
             }
         }
         return fields;
+    }
+
+    [Fact]
+    public async Task NestedStructsRust_ReadsStructColumns()
+    {
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("nested_structs.rust.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.True(batch.Length > 0);
+        Assert.True(batch.Schema.FieldsList.Count > 0);
+
+        // Verify at least one field has StructType
+        bool hasStruct = false;
+        foreach (var field in batch.Schema.FieldsList)
+        {
+            if (field.DataType is StructType)
+            {
+                hasStruct = true;
+                break;
+            }
+        }
+        Assert.True(hasStruct, "Expected at least one StructType field.");
+
+        // Verify struct arrays have accessible children
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            if (batch.Column(c) is StructArray sa)
+            {
+                Assert.True(sa.Fields.Count > 0,
+                    $"StructArray at column {c} should have children.");
+            }
+        }
+    }
+
+    [Fact]
+    public async Task NestedStructsRust_CrossVerifiedWithParquetSharp()
+    {
+        var path = TestData.GetPath("nested_structs.rust.parquet");
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        // Cross-verify leaf values against ParquetSharp using physical reader API
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = psReader.RowGroup(0);
+        int numRows = checked((int)rg.MetaData.NumRows);
+
+        Assert.Equal(numRows, batch.Length);
+
+        // Verify some leaf columns against ParquetSharp using physical readers
+        int verified = 0;
+        for (int c = 0; c < rg.MetaData.NumColumns && verified < 5; c++)
+        {
+            var desc = psReader.FileMetaData.Schema.Column(c);
+            // Only verify plain Int64 physical columns (skip timestamp/date logical types)
+            if (desc.PhysicalType != ParquetSharp.PhysicalType.Int64)
+                continue;
+
+            try
+            {
+                var leafArray = FindLeafArray(batch, c);
+                using var physCol = rg.Column(c);
+                var pr = physCol.LogicalReader<long>();
+                var expected = pr.ReadAll(numRows);
+                var i64 = (Int64Array)leafArray;
+                for (int i = 0; i < numRows; i++)
+                    Assert.Equal(expected[i], i64.GetValue(i));
+                verified++;
+            }
+            catch (InvalidCastException)
+            {
+                // Skip columns whose logical type doesn't match raw Int64 (e.g. DateTime, UInt64)
+            }
+        }
+        Assert.True(verified > 0, "Expected to verify at least one leaf column.");
+    }
+
+    [Fact]
+    public async Task StructRoundTrip_OptionalStructWithNulls()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"ew-struct-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            int rowCount = 10;
+
+            // Write a file with optional struct via ParquetSharp low-level API:
+            // schema: struct_col (optional group) → a (optional int32), b (optional int64)
+            {
+                var node = new ParquetSharp.Schema.GroupNode("schema", ParquetSharp.Repetition.Required, new ParquetSharp.Schema.Node[]
+                {
+                    new ParquetSharp.Schema.GroupNode("struct_col", ParquetSharp.Repetition.Optional, new ParquetSharp.Schema.Node[]
+                    {
+                        new ParquetSharp.Schema.PrimitiveNode("a", ParquetSharp.Repetition.Optional,
+                            ParquetSharp.LogicalType.Int(32, true), ParquetSharp.PhysicalType.Int32),
+                        new ParquetSharp.Schema.PrimitiveNode("b", ParquetSharp.Repetition.Optional,
+                            ParquetSharp.LogicalType.Int(64, true), ParquetSharp.PhysicalType.Int64),
+                    }),
+                });
+
+                using var props = new ParquetSharp.WriterPropertiesBuilder()
+                    .Encoding(ParquetSharp.Encoding.Plain)
+                    .DisableDictionary()
+                    .Build();
+                using var writer = new ParquetSharp.ParquetFileWriter(path, node, props);
+                using var rowGroup = writer.AppendRowGroup();
+
+                // def levels for struct_col.a (maxDef=2):
+                // def=0 → struct null, def=1 → struct present + a null, def=2 → both present
+                short[] aDefLevels = [0, 1, 2, 1, 2, 0, 1, 2, 0, 2];
+                short[] repLevels = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+                int[] aValues = [10, 40, 70, 90]; // only non-null values
+                using (var col = rowGroup.NextColumn())
+                {
+                    using var pw = (ParquetSharp.ColumnWriter<int>)col;
+                    pw.WriteBatch(rowCount, aDefLevels, repLevels, aValues);
+                }
+
+                // def levels for struct_col.b (maxDef=2):
+                short[] bDefLevels = [0, 1, 2, 1, 2, 0, 1, 2, 0, 2];
+                long[] bValues = [100, 400, 700, 900];
+                using (var col = rowGroup.NextColumn())
+                {
+                    using var pw = (ParquetSharp.ColumnWriter<long>)col;
+                    pw.WriteBatch(rowCount, bDefLevels, repLevels, bValues);
+                }
+
+                writer.Close();
+            }
+
+            // Read back with EngineeredWood
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var batch = await reader.ReadRowGroupAsync(0);
+
+            Assert.Equal(rowCount, batch.Length);
+
+            // Should have 1 top-level column: struct_col
+            Assert.Single(batch.Schema.FieldsList);
+            Assert.IsType<StructType>(batch.Schema.FieldsList[0].DataType);
+
+            var structArray = (StructArray)batch.Column(0);
+            Assert.Equal(2, structArray.Fields.Count);
+
+            // Verify struct validity: null at rows 0, 5, 8
+            Assert.True(structArray.IsNull(0));
+            Assert.False(structArray.IsNull(1));
+            Assert.False(structArray.IsNull(2));
+            Assert.True(structArray.IsNull(5));
+            Assert.True(structArray.IsNull(8));
+
+            // Verify child values
+            var intArray = (Int32Array)structArray.Fields[0];
+            Assert.True(intArray.IsNull(0)); // struct null
+            Assert.True(intArray.IsNull(1)); // struct present, field null
+            Assert.Equal(10, intArray.GetValue(2)); // both present
+            Assert.True(intArray.IsNull(3)); // struct present, field null
+            Assert.Equal(40, intArray.GetValue(4));
+            Assert.Equal(90, intArray.GetValue(9));
+
+            var longArray = (Int64Array)structArray.Fields[1];
+            Assert.True(longArray.IsNull(0)); // struct null
+            Assert.True(longArray.IsNull(1)); // struct present, field null
+            Assert.Equal(100, longArray.GetValue(2));
+            Assert.Equal(400, longArray.GetValue(4));
+            Assert.Equal(700, longArray.GetValue(7));
+            Assert.Equal(900, longArray.GetValue(9));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task StructRoundTrip_NestedStructInStruct()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"ew-nested-struct-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            int rowCount = 5;
+
+            {
+                var node = new ParquetSharp.Schema.GroupNode("schema", ParquetSharp.Repetition.Required, new ParquetSharp.Schema.Node[]
+                {
+                    new ParquetSharp.Schema.GroupNode("outer", ParquetSharp.Repetition.Optional, new ParquetSharp.Schema.Node[]
+                    {
+                        new ParquetSharp.Schema.PrimitiveNode("x", ParquetSharp.Repetition.Required,
+                            ParquetSharp.LogicalType.Int(32, true), ParquetSharp.PhysicalType.Int32),
+                        new ParquetSharp.Schema.GroupNode("inner", ParquetSharp.Repetition.Optional, new ParquetSharp.Schema.Node[]
+                        {
+                            new ParquetSharp.Schema.PrimitiveNode("y", ParquetSharp.Repetition.Required,
+                                ParquetSharp.LogicalType.Int(64, true), ParquetSharp.PhysicalType.Int64),
+                        }),
+                    }),
+                });
+
+                using var props = new ParquetSharp.WriterPropertiesBuilder()
+                    .Encoding(ParquetSharp.Encoding.Plain)
+                    .DisableDictionary()
+                    .Build();
+                using var writer = new ParquetSharp.ParquetFileWriter(path, node, props);
+                using var rowGroup = writer.AppendRowGroup();
+
+                // outer.x (required under optional outer, maxDef=1):
+                // def=0 → outer null, def=1 → outer present + x present (required field)
+                short[] xDefLevels = [0, 1, 1, 0, 1];
+                short[] repLevels = [0, 0, 0, 0, 0];
+                int[] xValues = [10, 20, 40]; // non-null values only
+                using (var col = rowGroup.NextColumn())
+                {
+                    using var pw = (ParquetSharp.ColumnWriter<int>)col;
+                    pw.WriteBatch(rowCount, xDefLevels, repLevels, xValues);
+                }
+
+                // outer.inner.y (required under optional inner under optional outer, maxDef=2):
+                // def=0 → outer null, def=1 → outer present + inner null, def=2 → both present + y present
+                short[] yDefLevels = [0, 1, 2, 0, 2];
+                long[] yValues = [200, 400]; // non-null values only
+                using (var col = rowGroup.NextColumn())
+                {
+                    using var pw = (ParquetSharp.ColumnWriter<long>)col;
+                    pw.WriteBatch(rowCount, yDefLevels, repLevels, yValues);
+                }
+
+                writer.Close();
+            }
+
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var batch = await reader.ReadRowGroupAsync(0);
+
+            Assert.Equal(rowCount, batch.Length);
+            Assert.Single(batch.Schema.FieldsList);
+
+            var outerArray = (StructArray)batch.Column(0);
+            Assert.Equal(2, outerArray.Fields.Count);
+
+            // Verify outer struct validity: null at rows 0, 3
+            Assert.True(outerArray.IsNull(0));
+            Assert.False(outerArray.IsNull(1));
+            Assert.False(outerArray.IsNull(2));
+            Assert.True(outerArray.IsNull(3));
+            Assert.False(outerArray.IsNull(4));
+
+            // outer.x (required): should have values where outer is non-null
+            var xArray = (Int32Array)outerArray.Fields[0];
+            Assert.Equal(10, xArray.GetValue(1));
+            Assert.Equal(20, xArray.GetValue(2));
+            Assert.Equal(40, xArray.GetValue(4));
+
+            // outer.inner should be a StructArray
+            Assert.IsType<StructArray>(outerArray.Fields[1]);
+            var innerArray = (StructArray)outerArray.Fields[1];
+            Assert.Single(innerArray.Fields);
+
+            // inner validity: null at rows 0 (outer null), 1 (inner null), 3 (outer null)
+            Assert.True(innerArray.IsNull(0));
+            Assert.True(innerArray.IsNull(1));
+            Assert.False(innerArray.IsNull(2));
+            Assert.True(innerArray.IsNull(3));
+            Assert.False(innerArray.IsNull(4));
+
+            // inner.y
+            var yArray = (Int64Array)innerArray.Fields[0];
+            Assert.Equal(200, yArray.GetValue(2));
+            Assert.Equal(400, yArray.GetValue(4));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    /// <summary>
+    /// Finds a leaf array at a given leaf index by recursively walking the RecordBatch columns.
+    /// </summary>
+    private static IArrowArray FindLeafArray(RecordBatch batch, int leafIndex)
+    {
+        int idx = 0;
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            var result = FindLeafRecursive(batch.Column(c), leafIndex, ref idx);
+            if (result != null) return result;
+        }
+        throw new InvalidOperationException($"Leaf index {leafIndex} not found.");
+    }
+
+    private static IArrowArray? FindLeafRecursive(IArrowArray array, int targetIndex, ref int currentIndex)
+    {
+        if (array is StructArray sa)
+        {
+            for (int i = 0; i < sa.Fields.Count; i++)
+            {
+                var result = FindLeafRecursive(sa.Fields[i], targetIndex, ref currentIndex);
+                if (result != null) return result;
+            }
+            return null;
+        }
+
+        if (currentIndex == targetIndex)
+        {
+            currentIndex++;
+            return array;
+        }
+        currentIndex++;
+        return null;
     }
 }

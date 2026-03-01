@@ -99,7 +99,8 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
     /// </summary>
     /// <param name="rowGroupIndex">Zero-based index of the row group to read.</param>
     /// <param name="columnNames">
-    /// Optional list of column names to read. If null, reads all flat columns.
+    /// Optional list of column names to read. If null, reads all supported columns
+    /// (flat columns and struct-only groups).
     /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>An Arrow RecordBatch containing the requested columns.</returns>
@@ -117,16 +118,16 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
 
         try
         {
-            // Decode columns in parallel
-            var arrowArrays = new IArrowArray[ctx.Count];
+            var results = new ColumnResult[ctx.Count];
             Parallel.For(0, ctx.Count, i =>
             {
-                arrowArrays[i] = ColumnChunkReader.ReadColumn(
+                results[i] = ColumnChunkReader.ReadColumn(
                     buffers[i].Memory.Span, ctx.Columns[i],
-                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
+                    ctx.HasStructColumns);
             });
 
-            return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+            return AssembleRecordBatch(ctx, results);
         }
         finally
         {
@@ -147,19 +148,20 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
         var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
             .ConfigureAwait(false);
 
-        var arrowArrays = new IArrowArray[ctx.Count];
+        var results = new ColumnResult[ctx.Count];
 
         for (int i = 0; i < ctx.Count; i++)
         {
             using var buffer = await _file.ReadAsync(ctx.Ranges[i], cancellationToken)
                 .ConfigureAwait(false);
 
-            arrowArrays[i] = ColumnChunkReader.ReadColumn(
+            results[i] = ColumnChunkReader.ReadColumn(
                 buffer.Memory.Span, ctx.Columns[i],
-                ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+                ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
+                ctx.HasStructColumns);
         }
 
-        return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+        return AssembleRecordBatch(ctx, results);
     }
 
     /// <summary>
@@ -178,16 +180,17 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
 
         try
         {
-            var arrowArrays = new IArrowArray[ctx.Count];
+            var results = new ColumnResult[ctx.Count];
 
             Parallel.For(0, ctx.Count, i =>
             {
-                arrowArrays[i] = ColumnChunkReader.ReadColumn(
+                results[i] = ColumnChunkReader.ReadColumn(
                     buffers[i].Memory.Span, ctx.Columns[i],
-                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
+                    ctx.HasStructColumns);
             });
 
-            return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+            return AssembleRecordBatch(ctx, results);
         }
         finally
         {
@@ -208,7 +211,7 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
         var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
             .ConfigureAwait(false);
 
-        var arrowArrays = new IArrowArray[ctx.Count];
+        var results = new ColumnResult[ctx.Count];
 
         await Parallel.ForEachAsync(
             Enumerable.Range(0, ctx.Count),
@@ -222,12 +225,13 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
                 using var buffer = await _file.ReadAsync(ctx.Ranges[i], ct)
                     .ConfigureAwait(false);
 
-                arrowArrays[i] = ColumnChunkReader.ReadColumn(
+                results[i] = ColumnChunkReader.ReadColumn(
                     buffer.Memory.Span, ctx.Columns[i],
-                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.ArrowFields[i]);
+                    ctx.Chunks[i].MetaData!, ctx.RowCount, ctx.LeafArrowFields[i],
+                    ctx.HasStructColumns);
             }).ConfigureAwait(false);
 
-        return BuildRecordBatch(ctx.ArrowFields, arrowArrays, ctx.RowCount);
+        return AssembleRecordBatch(ctx, results);
     }
 
     private async ValueTask<RowGroupContext> PrepareRowGroupAsync(
@@ -251,7 +255,7 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
             schema, rowGroup, columnNames);
 
         var ranges = new FileRange[selectedChunks.Count];
-        var arrowFields = new Field[selectedColumns.Count];
+        var leafArrowFields = new Field[selectedColumns.Count];
 
         for (int i = 0; i < selectedChunks.Count; i++)
         {
@@ -264,10 +268,60 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
                 : colMeta.DataPageOffset;
             ranges[i] = new FileRange(start, colMeta.TotalCompressedSize);
 
-            arrowFields[i] = ArrowSchemaConverter.ToArrowField(selectedColumns[i]);
+            leafArrowFields[i] = ArrowSchemaConverter.ToArrowField(selectedColumns[i]);
         }
 
-        return new RowGroupContext(selectedColumns, selectedChunks, ranges, arrowFields, rowCount);
+        // Detect struct columns: when reading all columns, check if any
+        // top-level schema child is a struct-only group.
+        bool hasStructColumns = false;
+        SchemaNode? schemaRoot = null;
+        Field[]? topLevelFields = null;
+
+        if (columnNames == null)
+        {
+            schemaRoot = schema.Root;
+            foreach (var child in schemaRoot.Children)
+            {
+                if (!child.IsLeaf && IsStructOnly(child))
+                {
+                    hasStructColumns = true;
+                    break;
+                }
+            }
+
+            if (hasStructColumns)
+                topLevelFields = ArrowSchemaConverter.ToArrowFields(schemaRoot);
+        }
+
+        return new RowGroupContext(selectedColumns, selectedChunks, ranges,
+            leafArrowFields, rowCount, hasStructColumns, schemaRoot, topLevelFields);
+    }
+
+    private RecordBatch AssembleRecordBatch(RowGroupContext ctx, ColumnResult[] results)
+    {
+        if (!ctx.HasStructColumns)
+        {
+            // Fast path: flat columns only
+            var arrowArrays = new IArrowArray[results.Length];
+            for (int i = 0; i < results.Length; i++)
+                arrowArrays[i] = results[i].Array;
+
+            return BuildRecordBatch(ctx.LeafArrowFields, arrowArrays, ctx.RowCount);
+        }
+
+        // Struct path: group leaf arrays into StructArrays
+        var leafArrays = new IArrowArray[results.Length];
+        var leafDefLevels = new int[]?[results.Length];
+        for (int i = 0; i < results.Length; i++)
+        {
+            leafArrays[i] = results[i].Array;
+            leafDefLevels[i] = results[i].DefinitionLevels;
+        }
+
+        var topLevelArrays = StructAssembler.Assemble(
+            ctx.SchemaRoot!, leafArrays, leafDefLevels, ctx.RowCount);
+
+        return BuildRecordBatch(ctx.TopLevelFields!, topLevelArrays, ctx.RowCount);
     }
 
     private static RecordBatch BuildRecordBatch(
@@ -284,10 +338,30 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
         IReadOnlyList<ColumnDescriptor> Columns,
         IReadOnlyList<ColumnChunk> Chunks,
         FileRange[] Ranges,
-        Field[] ArrowFields,
-        int RowCount)
+        Field[] LeafArrowFields,
+        int RowCount,
+        bool HasStructColumns = false,
+        SchemaNode? SchemaRoot = null,
+        Field[]? TopLevelFields = null)
     {
         public int Count => Columns.Count;
+    }
+
+    /// <summary>
+    /// Checks recursively that no node in the subtree has RepetitionType == Repeated.
+    /// </summary>
+    private static bool IsStructOnly(SchemaNode node)
+    {
+        if (node.Element.RepetitionType == FieldRepetitionType.Repeated)
+            return false;
+
+        foreach (var child in node.Children)
+        {
+            if (!IsStructOnly(child))
+                return false;
+        }
+
+        return true;
     }
 
     private static (IReadOnlyList<ColumnDescriptor>, IReadOnlyList<ColumnChunk>) ResolveColumns(
@@ -297,14 +371,14 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
     {
         if (columnNames == null)
         {
-            // All flat columns
+            // All columns with MaxRepetitionLevel == 0 (flat + struct leaves)
             var allColumns = new List<ColumnDescriptor>();
             var allChunks = new List<ColumnChunk>();
             for (int i = 0; i < schema.Columns.Count; i++)
             {
                 var col = schema.Columns[i];
                 if (col.MaxRepetitionLevel > 0)
-                    continue; // skip nested/repeated
+                    continue; // skip repeated columns
 
                 allColumns.Add(col);
                 allChunks.Add(rowGroup.Columns[i]);
@@ -318,6 +392,8 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
         foreach (var name in columnNames)
         {
             bool found = false;
+
+            // First, try matching a leaf column by dotted path
             for (int i = 0; i < schema.Columns.Count; i++)
             {
                 var col = schema.Columns[i];
@@ -328,6 +404,32 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
                             $"Column '{name}' is nested/repeated and is not supported.");
                     columns.Add(col);
                     chunks.Add(rowGroup.Columns[i]);
+                    found = true;
+                    break;
+                }
+            }
+
+            if (found) continue;
+
+            // Second, try matching a top-level group name → resolve to all descendant leaves
+            foreach (var child in schema.Root.Children)
+            {
+                if (child.Name == name && !child.IsLeaf)
+                {
+                    if (!IsStructOnly(child))
+                        throw new NotSupportedException(
+                            $"Column group '{name}' contains repeated fields and is not supported.");
+
+                    // Add all descendant leaves
+                    for (int i = 0; i < schema.Columns.Count; i++)
+                    {
+                        var col = schema.Columns[i];
+                        if (col.Path.Count > 0 && col.Path[0] == name)
+                        {
+                            columns.Add(col);
+                            chunks.Add(rowGroup.Columns[i]);
+                        }
+                    }
                     found = true;
                     break;
                 }
