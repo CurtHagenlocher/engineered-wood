@@ -51,33 +51,60 @@ public class RowGroupReadBenchmarks
         int numColumns = rowGroup.MetaData.NumColumns;
         long numRows = rowGroup.MetaData.NumRows;
 
+        // Second half of columns are nullable (optional) in wide files;
+        // for tall_narrow (4 cols): columns 2,3 are optional
+        int nullableStart = numColumns / 2;
+
         for (int c = 0; c < numColumns; c++)
         {
             using var col = rowGroup.Column(c);
+            bool nullable = c >= nullableStart;
+
             switch (c % 4)
             {
-                case 0:
-                {
-                    using var logical = col.LogicalReader<int>();
-                    var buffer = new int[numRows];
-                    logical.ReadBatch(buffer);
+                case 0: // int
+                    if (nullable)
+                    {
+                        using var logical = col.LogicalReader<int?>();
+                        var buffer = new int?[numRows];
+                        logical.ReadBatch(buffer);
+                    }
+                    else
+                    {
+                        using var logical = col.LogicalReader<int>();
+                        var buffer = new int[numRows];
+                        logical.ReadBatch(buffer);
+                    }
                     break;
-                }
-                case 1:
-                {
-                    using var logical = col.LogicalReader<long>();
-                    var buffer = new long[numRows];
-                    logical.ReadBatch(buffer);
+                case 1: // long
+                    if (nullable)
+                    {
+                        using var logical = col.LogicalReader<long?>();
+                        var buffer = new long?[numRows];
+                        logical.ReadBatch(buffer);
+                    }
+                    else
+                    {
+                        using var logical = col.LogicalReader<long>();
+                        var buffer = new long[numRows];
+                        logical.ReadBatch(buffer);
+                    }
                     break;
-                }
-                case 2:
-                {
-                    using var logical = col.LogicalReader<double>();
-                    var buffer = new double[numRows];
-                    logical.ReadBatch(buffer);
+                case 2: // double
+                    if (nullable)
+                    {
+                        using var logical = col.LogicalReader<double?>();
+                        var buffer = new double?[numRows];
+                        logical.ReadBatch(buffer);
+                    }
+                    else
+                    {
+                        using var logical = col.LogicalReader<double>();
+                        var buffer = new double[numRows];
+                        logical.ReadBatch(buffer);
+                    }
                     break;
-                }
-                default:
+                default: // byte[] — always optional (reference type)
                 {
                     using var logical = col.LogicalReader<byte[]>();
                     var buffer = new byte[numRows][];
