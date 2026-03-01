@@ -636,6 +636,49 @@ public class ReadRowGroupTests
         }
     }
 
+    [Theory]
+    [InlineData("float16_nonzeros_and_nans.parquet")]
+    [InlineData("float16_zeros_and_nans.parquet")]
+    public async Task Float16_ReadsTestFiles(string fileName)
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath(fileName));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.True(batch.Length > 0);
+
+        // Verify the column is a HalfFloatArray
+        var col = batch.Column(0);
+        Assert.IsType<HalfFloatArray>(col);
+        var arr = (HalfFloatArray)col;
+
+        // Cross-verify against ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(TestData.GetPath(fileName));
+        using var rg = psReader.RowGroup(0);
+        long numRows = rg.MetaData.NumRows;
+
+        Assert.Equal(numRows, batch.Length);
+
+        // ParquetSharp reads Float16 as Half? (nullable)
+        using var psCol = rg.Column(0).LogicalReader<Half?>();
+        var expected = psCol.ReadAll(checked((int)numRows));
+
+        for (int i = 0; i < numRows; i++)
+        {
+            if (expected[i] is null)
+            {
+                Assert.True(arr.IsNull(i));
+            }
+            else
+            {
+                // Compare bitwise to handle NaN correctly
+                Assert.Equal(
+                    BitConverter.HalfToInt16Bits(expected[i]!.Value),
+                    BitConverter.HalfToInt16Bits(arr.GetValue(i)!.Value));
+            }
+        }
+    }
+
     [Fact]
     public async Task GzipCompressed_ReadsTestFile()
     {

@@ -83,6 +83,7 @@ internal static class ArrowSchemaConverter
             LogicalType.EnumType => Apache.Arrow.Types.StringType.Default,
             LogicalType.JsonType => Apache.Arrow.Types.StringType.Default,
             LogicalType.UuidType => new FixedSizeBinaryType(16),
+            LogicalType.Float16Type => HalfFloatType.Default,
             _ => null, // fall through to ConvertedType or PhysicalType
         };
     }
