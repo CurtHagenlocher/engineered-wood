@@ -1,3 +1,4 @@
+using System.Buffers.Binary;
 using Apache.Arrow;
 using EngineeredWood.Parquet.Compression;
 using EngineeredWood.Parquet.Metadata;
@@ -29,7 +30,7 @@ internal static class ColumnChunkReader
             throw new NotSupportedException(
                 $"Nested/repeated columns are not supported. Column '{column.DottedPath}' has MaxRepetitionLevel={column.MaxRepetitionLevel}.");
 
-        var state = new ColumnBuildState(column.PhysicalType, column.MaxDefinitionLevel, rowCount);
+        using var state = new ColumnBuildState(column.PhysicalType, column.MaxDefinitionLevel, rowCount);
         DictionaryDecoder? dictionary = null;
 
         int pos = 0;
@@ -130,14 +131,21 @@ internal static class ColumnChunkReader
         var repLevels = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
         offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxRepetitionLevel, numValues, repLevels);
 
-        // Decode definition levels (omitted if maxDefLevel == 0)
-        var defLevels = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
-        offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxDefinitionLevel, numValues, defLevels);
-
-        state.AddDefLevels(defLevels.Slice(0, numValues));
+        // Decode definition levels directly into native buffer
+        if (column.MaxDefinitionLevel > 0)
+        {
+            var defDest = state.ReserveDefLevels(numValues);
+            offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxDefinitionLevel, numValues, defDest);
+        }
+        else
+        {
+            // Skip def level decoding — no levels to write
+            var tempDef = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
+            offset += LevelDecoder.DecodeV1(pageData.Slice(offset), 0, numValues, tempDef);
+        }
 
         // Count non-null values
-        int nonNullCount = CountNonNull(defLevels.Slice(0, numValues), column.MaxDefinitionLevel);
+        int nonNullCount = CountNonNull(state, numValues, column.MaxDefinitionLevel);
 
         // Decode values
         var valueData = pageData.Slice(offset);
@@ -168,16 +176,18 @@ internal static class ColumnChunkReader
             column.MaxRepetitionLevel, numValues, repLevels);
         offset += v2Header.RepetitionLevelsByteLength;
 
-        var defLevels = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
-        LevelDecoder.DecodeV2(
-            rawData.Slice(offset, v2Header.DefinitionLevelsByteLength),
-            column.MaxDefinitionLevel, numValues, defLevels);
+        // Decode definition levels directly into native buffer
+        if (column.MaxDefinitionLevel > 0)
+        {
+            var defDest = state.ReserveDefLevels(numValues);
+            LevelDecoder.DecodeV2(
+                rawData.Slice(offset, v2Header.DefinitionLevelsByteLength),
+                column.MaxDefinitionLevel, numValues, defDest);
+        }
         offset += v2Header.DefinitionLevelsByteLength;
 
-        state.AddDefLevels(defLevels.Slice(0, numValues));
-
         // Count non-null values
-        int nonNullCount = CountNonNull(defLevels.Slice(0, numValues), column.MaxDefinitionLevel);
+        int nonNullCount = CountNonNull(state, numValues, column.MaxDefinitionLevel);
 
         // V2: only values portion is compressed (if is_compressed, default true)
         var valuesCompressed = rawData.Slice(offset);
@@ -254,46 +264,40 @@ internal static class ColumnChunkReader
             }
             case PhysicalType.Int32:
             {
-                Span<int> values = count <= 1024 ? stackalloc int[count] : new int[count];
-                PlainDecoder.DecodeInt32s(data, values, count);
-                state.AddInt32Values(values.Slice(0, count));
+                var dest = state.ReserveValues<int>(count);
+                PlainDecoder.DecodeInt32s(data, dest, count);
                 break;
             }
             case PhysicalType.Int64:
             {
-                Span<long> values = count <= 512 ? stackalloc long[count] : new long[count];
-                PlainDecoder.DecodeInt64s(data, values, count);
-                state.AddInt64Values(values.Slice(0, count));
+                var dest = state.ReserveValues<long>(count);
+                PlainDecoder.DecodeInt64s(data, dest, count);
                 break;
             }
             case PhysicalType.Float:
             {
-                Span<float> values = count <= 1024 ? stackalloc float[count] : new float[count];
-                PlainDecoder.DecodeFloats(data, values, count);
-                state.AddFloatValues(values.Slice(0, count));
+                var dest = state.ReserveValues<float>(count);
+                PlainDecoder.DecodeFloats(data, dest, count);
                 break;
             }
             case PhysicalType.Double:
             {
-                Span<double> values = count <= 512 ? stackalloc double[count] : new double[count];
-                PlainDecoder.DecodeDoubles(data, values, count);
-                state.AddDoubleValues(values.Slice(0, count));
+                var dest = state.ReserveValues<double>(count);
+                PlainDecoder.DecodeDoubles(data, dest, count);
                 break;
             }
             case PhysicalType.Int96:
             {
-                var values = new byte[count * 12];
-                PlainDecoder.DecodeInt96s(data, values, count);
-                state.AddFixedBytes(values);
+                var dest = state.ReserveFixedBytes(count, 12);
+                PlainDecoder.DecodeInt96s(data, dest, count);
                 break;
             }
             case PhysicalType.FixedLenByteArray:
             {
                 int typeLength = column.TypeLength ?? throw new ParquetFormatException(
                     "FIXED_LEN_BYTE_ARRAY column missing TypeLength.");
-                var values = new byte[count * typeLength];
-                PlainDecoder.DecodeFixedLenByteArrays(data, values, count, typeLength);
-                state.AddFixedBytes(values);
+                var dest = state.ReserveFixedBytes(count, typeLength);
+                PlainDecoder.DecodeFixedLenByteArrays(data, dest, count, typeLength);
                 break;
             }
             case PhysicalType.ByteArray:
@@ -340,43 +344,43 @@ internal static class ColumnChunkReader
             }
             case PhysicalType.Int32:
             {
-                Span<int> values = count <= 1024 ? stackalloc int[count] : new int[count];
+                var dest = state.ReserveValues<int>(count);
                 for (int i = 0; i < count; i++)
-                    values[i] = dictionary.GetInt32(indices[i]);
-                state.AddInt32Values(values.Slice(0, count));
+                    dest[i] = dictionary.GetInt32(indices[i]);
                 break;
             }
             case PhysicalType.Int64:
             {
-                Span<long> values = count <= 512 ? stackalloc long[count] : new long[count];
+                var dest = state.ReserveValues<long>(count);
                 for (int i = 0; i < count; i++)
-                    values[i] = dictionary.GetInt64(indices[i]);
-                state.AddInt64Values(values.Slice(0, count));
+                    dest[i] = dictionary.GetInt64(indices[i]);
                 break;
             }
             case PhysicalType.Float:
             {
-                Span<float> values = count <= 1024 ? stackalloc float[count] : new float[count];
+                var dest = state.ReserveValues<float>(count);
                 for (int i = 0; i < count; i++)
-                    values[i] = dictionary.GetFloat(indices[i]);
-                state.AddFloatValues(values.Slice(0, count));
+                    dest[i] = dictionary.GetFloat(indices[i]);
                 break;
             }
             case PhysicalType.Double:
             {
-                Span<double> values = count <= 512 ? stackalloc double[count] : new double[count];
+                var dest = state.ReserveValues<double>(count);
                 for (int i = 0; i < count; i++)
-                    values[i] = dictionary.GetDouble(indices[i]);
-                state.AddDoubleValues(values.Slice(0, count));
+                    dest[i] = dictionary.GetDouble(indices[i]);
                 break;
             }
             case PhysicalType.Int96:
             case PhysicalType.FixedLenByteArray:
             {
+                int typeLength = column.PhysicalType == PhysicalType.Int96 ? 12
+                    : column.TypeLength ?? throw new ParquetFormatException(
+                        "FIXED_LEN_BYTE_ARRAY column missing TypeLength.");
+                var dest = state.ReserveFixedBytes(count, typeLength);
                 for (int i = 0; i < count; i++)
                 {
                     var bytes = dictionary.GetFixedBytes(indices[i]);
-                    state.AddFixedBytes(bytes);
+                    bytes.CopyTo(dest.Slice(i * typeLength, typeLength));
                 }
                 break;
             }
@@ -410,15 +414,19 @@ internal static class ColumnChunkReader
         }
     }
 
-    private static int CountNonNull(ReadOnlySpan<int> defLevels, int maxDefLevel)
+    private static int CountNonNull(ColumnBuildState state, int numValues, int maxDefLevel)
     {
         if (maxDefLevel == 0)
-            return defLevels.Length;
+            return numValues;
+
+        // Read the last numValues def levels from the state
+        var allDefs = state.DefLevelSpan;
+        var pageDefs = allDefs.Slice(allDefs.Length - numValues);
 
         int count = 0;
-        for (int i = 0; i < defLevels.Length; i++)
+        for (int i = 0; i < pageDefs.Length; i++)
         {
-            if (defLevels[i] == maxDefLevel)
+            if (pageDefs[i] == maxDefLevel)
                 count++;
         }
         return count;
