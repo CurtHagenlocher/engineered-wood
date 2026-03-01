@@ -10,6 +10,7 @@
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="18.*" />
     <PackageReference Include="Azure.Storage.Blobs" Version="12.*" />
+    <PackageReference Include="K4os.Compression.LZ4" Version="1.*" />
     <PackageReference Include="Snappier" Version="1.*" />
     <PackageReference Include="ZstdSharp.Port" Version="0.*" />
   </ItemGroup>

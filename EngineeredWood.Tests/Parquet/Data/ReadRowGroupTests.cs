@@ -463,7 +463,11 @@ public class ReadRowGroupTests
                     // Check codec
                     if (col.MetaData.Codec != CompressionCodec.Uncompressed &&
                         col.MetaData.Codec != CompressionCodec.Snappy &&
-                        col.MetaData.Codec != CompressionCodec.Zstd)
+                        col.MetaData.Codec != CompressionCodec.Gzip &&
+                        col.MetaData.Codec != CompressionCodec.Brotli &&
+                        col.MetaData.Codec != CompressionCodec.Lz4 &&
+                        col.MetaData.Codec != CompressionCodec.Zstd &&
+                        col.MetaData.Codec != CompressionCodec.Lz4Raw)
                     {
                         skipped.Add($"{fileName}: unsupported codec {col.MetaData.Codec}");
                         unsupported = true;
@@ -616,6 +620,260 @@ public class ReadRowGroupTests
             if (File.Exists(path))
                 File.Delete(path);
         }
+    }
+
+    [Fact]
+    public async Task GzipCompressed_ReadsTestFile()
+    {
+        // concatenated_gzip_members.parquet: 1 column (UInt64, optional), 513 rows, Gzip compressed
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("concatenated_gzip_members.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        Assert.Contains(metadata.RowGroups[0].Columns,
+            c => c.MetaData!.Codec == CompressionCodec.Gzip);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(513, batch.Length);
+
+        // Cross-verify against ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("concatenated_gzip_members.parquet"));
+        using var rg = psReader.RowGroup(0);
+        using var col = rg.Column(0).LogicalReader<ulong?>();
+        var expected = col.ReadAll(513);
+
+        var arr = (UInt64Array)batch.Column(0);
+        for (int i = 0; i < 513; i++)
+            Assert.Equal(expected[i], (ulong?)arr.GetValue(i));
+    }
+
+    [Fact]
+    public async Task GzipCompressed_RoundTrip()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"ew-gzip-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            int rowCount = 1000;
+            var ids = Enumerable.Range(0, rowCount).ToArray();
+            var values = Enumerable.Range(0, rowCount).Select(i => i * 3.14).ToArray();
+
+            {
+                var columns = new ParquetSharp.Column[]
+                {
+                    new ParquetSharp.Column<int>("id"),
+                    new ParquetSharp.Column<double>("value"),
+                };
+                using var props = new ParquetSharp.WriterPropertiesBuilder()
+                    .Compression(ParquetSharp.Compression.Gzip)
+                    .Build();
+                using var writer = new ParquetSharp.ParquetFileWriter(path, columns, props);
+                using var rowGroup = writer.AppendRowGroup();
+                using (var col = rowGroup.NextColumn().LogicalWriter<int>())
+                    col.WriteBatch(ids);
+                using (var col = rowGroup.NextColumn().LogicalWriter<double>())
+                    col.WriteBatch(values);
+                writer.Close();
+            }
+
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var batch = await reader.ReadRowGroupAsync(0);
+
+            Assert.Equal(rowCount, batch.Length);
+            var idArr = (Int32Array)batch.Column("id");
+            var valArr = (DoubleArray)batch.Column("value");
+            for (int i = 0; i < rowCount; i++)
+            {
+                Assert.Equal(ids[i], idArr.GetValue(i));
+                Assert.Equal(values[i], valArr.GetValue(i));
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task BrotliCompressed_RoundTrip()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"ew-brotli-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            int rowCount = 1000;
+            var ids = Enumerable.Range(0, rowCount).ToArray();
+            var values = Enumerable.Range(0, rowCount).Select(i => (long)i * 42).ToArray();
+
+            {
+                var columns = new ParquetSharp.Column[]
+                {
+                    new ParquetSharp.Column<int>("id"),
+                    new ParquetSharp.Column<long>("value"),
+                };
+                using var props = new ParquetSharp.WriterPropertiesBuilder()
+                    .Compression(ParquetSharp.Compression.Brotli)
+                    .Build();
+                using var writer = new ParquetSharp.ParquetFileWriter(path, columns, props);
+                using var rowGroup = writer.AppendRowGroup();
+                using (var col = rowGroup.NextColumn().LogicalWriter<int>())
+                    col.WriteBatch(ids);
+                using (var col = rowGroup.NextColumn().LogicalWriter<long>())
+                    col.WriteBatch(values);
+                writer.Close();
+            }
+
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var metadata = await reader.ReadMetadataAsync();
+            Assert.Contains(metadata.RowGroups[0].Columns,
+                c => c.MetaData!.Codec == CompressionCodec.Brotli);
+
+            var batch = await reader.ReadRowGroupAsync(0);
+            Assert.Equal(rowCount, batch.Length);
+            var idArr = (Int32Array)batch.Column("id");
+            var valArr = (Int64Array)batch.Column("value");
+            for (int i = 0; i < rowCount; i++)
+            {
+                Assert.Equal(ids[i], idArr.GetValue(i));
+                Assert.Equal(values[i], valArr.GetValue(i));
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task Lz4RawCompressed_ReadsTestFile()
+    {
+        // lz4_raw_compressed.parquet: 3 columns (Int64, ByteArray, Double?), 4 rows, LZ4_RAW
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("lz4_raw_compressed.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        Assert.Contains(metadata.RowGroups[0].Columns,
+            c => c.MetaData!.Codec == CompressionCodec.Lz4Raw);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(4, batch.Length);
+
+        // Cross-verify against ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("lz4_raw_compressed.parquet"));
+        using var rg = psReader.RowGroup(0);
+
+        {
+            using var col = rg.Column(0).LogicalReader<long>();
+            var expected = col.ReadAll(4);
+            var arr = (Int64Array)batch.Column(0);
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+        {
+            using var col = rg.Column(1).LogicalReader<byte[]>();
+            var expected = col.ReadAll(4);
+            var arr = (BinaryArray)batch.Column(1);
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(expected[i], arr.GetBytes(i).ToArray());
+        }
+        {
+            using var col = rg.Column(2).LogicalReader<double?>();
+            var expected = col.ReadAll(4);
+            var arr = (DoubleArray)batch.Column(2);
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task Lz4RawCompressed_LargerFile()
+    {
+        // lz4_raw_compressed_larger.parquet: 1 String column, 10000 rows
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("lz4_raw_compressed_larger.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(10_000, batch.Length);
+
+        // Cross-verify
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("lz4_raw_compressed_larger.parquet"));
+        using var rg = psReader.RowGroup(0);
+        using var col = rg.Column(0).LogicalReader<string>();
+        var expected = col.ReadAll(10_000);
+        var arr = (StringArray)batch.Column(0);
+        for (int i = 0; i < 10_000; i++)
+            Assert.Equal(expected[i], arr.GetString(i));
+    }
+
+    [Fact]
+    public async Task HadoopLz4Compressed_ReadsTestFile()
+    {
+        // hadoop_lz4_compressed.parquet: 3 columns (Int64, ByteArray, Double?), 4 rows, Hadoop LZ4
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("hadoop_lz4_compressed.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        Assert.Contains(metadata.RowGroups[0].Columns,
+            c => c.MetaData!.Codec == CompressionCodec.Lz4);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(4, batch.Length);
+
+        // Cross-verify against ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("hadoop_lz4_compressed.parquet"));
+        using var rg = psReader.RowGroup(0);
+
+        {
+            using var col = rg.Column(0).LogicalReader<long>();
+            var expected = col.ReadAll(4);
+            var arr = (Int64Array)batch.Column(0);
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+        {
+            using var col = rg.Column(1).LogicalReader<byte[]>();
+            var expected = col.ReadAll(4);
+            var arr = (BinaryArray)batch.Column(1);
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(expected[i], arr.GetBytes(i).ToArray());
+        }
+        {
+            using var col = rg.Column(2).LogicalReader<double?>();
+            var expected = col.ReadAll(4);
+            var arr = (DoubleArray)batch.Column(2);
+            for (int i = 0; i < 4; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task HadoopLz4Compressed_LargerFile()
+    {
+        // hadoop_lz4_compressed_larger.parquet: 1 String column, 10000 rows
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("hadoop_lz4_compressed_larger.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(10_000, batch.Length);
+
+        // Cross-verify
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("hadoop_lz4_compressed_larger.parquet"));
+        using var rg = psReader.RowGroup(0);
+        using var col = rg.Column(0).LogicalReader<string>();
+        var expected = col.ReadAll(10_000);
+        var arr = (StringArray)batch.Column(0);
+        for (int i = 0; i < 10_000; i++)
+            Assert.Equal(expected[i], arr.GetString(i));
     }
 
     /// <summary>
