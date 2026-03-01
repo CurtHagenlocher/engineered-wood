@@ -232,6 +232,32 @@ public class ReadRowGroupTests
     }
 
     [Fact]
+    public async Task ByteStreamSplit_Zstd_ReadsFloatAndDouble()
+    {
+        // byte_stream_split.zstd.parquet: 2 columns (float32, float64), 300 rows, Zstd compressed
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("byte_stream_split.zstd.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(300, batch.Length);
+        Assert.Equal(2, batch.Schema.FieldsList.Count);
+
+        // Verify float column
+        var floatArray = (FloatArray)batch.Column(0);
+        Assert.Equal(300, floatArray.Length);
+        // Values are random normal distribution — verify they are finite numbers
+        for (int i = 0; i < floatArray.Length; i++)
+            Assert.True(float.IsFinite(floatArray.GetValue(i)!.Value));
+
+        // Verify double column
+        var doubleArray = (DoubleArray)batch.Column(1);
+        Assert.Equal(300, doubleArray.Length);
+        for (int i = 0; i < doubleArray.Length; i++)
+            Assert.True(double.IsFinite(doubleArray.GetValue(i)!.Value));
+    }
+
+    [Fact]
     public async Task DeltaLengthByteArray_ReadsStringColumn()
     {
         await using var file = new LocalRandomAccessFile(TestData.GetPath("delta_length_byte_array.parquet"));
@@ -373,7 +399,8 @@ public class ReadRowGroupTests
                             enc != Encoding.Rle &&
                             enc != Encoding.DeltaBinaryPacked &&
                             enc != Encoding.DeltaLengthByteArray &&
-                            enc != Encoding.DeltaByteArray)
+                            enc != Encoding.DeltaByteArray &&
+                            enc != Encoding.ByteStreamSplit)
                         {
                             skipped.Add($"{fileName}: unsupported encoding {enc}");
                             unsupported = true;

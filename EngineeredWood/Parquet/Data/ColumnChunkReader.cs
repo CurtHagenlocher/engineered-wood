@@ -252,6 +252,10 @@ internal static class ColumnChunkReader
         {
             DecodeDeltaByteArrayValues(data, column, nonNullCount, state);
         }
+        else if (encoding == Encoding.ByteStreamSplit)
+        {
+            DecodeByteStreamSplitValues(data, column, nonNullCount, state);
+        }
         else
         {
             throw new NotSupportedException(
@@ -378,6 +382,52 @@ internal static class ColumnChunkReader
                 $"Physical type '{column.PhysicalType}' is not supported for DELTA_BYTE_ARRAY decoding.");
 
         DeltaByteArrayDecoder.Decode(data, count, state);
+    }
+
+    private static void DecodeByteStreamSplitValues(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        int count,
+        ColumnBuildState state)
+    {
+        switch (column.PhysicalType)
+        {
+            case PhysicalType.Float:
+            {
+                var dest = state.ReserveValues<float>(count);
+                ByteStreamSplitDecoder.DecodeFloats(data, dest, count);
+                break;
+            }
+            case PhysicalType.Double:
+            {
+                var dest = state.ReserveValues<double>(count);
+                ByteStreamSplitDecoder.DecodeDoubles(data, dest, count);
+                break;
+            }
+            case PhysicalType.Int32:
+            {
+                var dest = state.ReserveValues<int>(count);
+                ByteStreamSplitDecoder.DecodeInt32s(data, dest, count);
+                break;
+            }
+            case PhysicalType.Int64:
+            {
+                var dest = state.ReserveValues<long>(count);
+                ByteStreamSplitDecoder.DecodeInt64s(data, dest, count);
+                break;
+            }
+            case PhysicalType.FixedLenByteArray:
+            {
+                int typeLength = column.TypeLength ?? throw new ParquetFormatException(
+                    "FIXED_LEN_BYTE_ARRAY column missing TypeLength.");
+                var dest = state.ReserveFixedBytes(count, typeLength);
+                ByteStreamSplitDecoder.DecodeFixedLenByteArrays(data, dest, count, typeLength);
+                break;
+            }
+            default:
+                throw new NotSupportedException(
+                    $"Physical type '{column.PhysicalType}' is not supported for BYTE_STREAM_SPLIT decoding.");
+        }
     }
 
     private static void DecodeDictValues(
