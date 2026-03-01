@@ -240,6 +240,10 @@ internal static class ColumnChunkReader
         {
             DecodePlainValues(data, column, nonNullCount, state);
         }
+        else if (encoding == Encoding.DeltaBinaryPacked)
+        {
+            DecodeDeltaBinaryPackedValues(data, column, nonNullCount, state);
+        }
         else
         {
             throw new NotSupportedException(
@@ -310,6 +314,34 @@ internal static class ColumnChunkReader
             default:
                 throw new NotSupportedException(
                     $"Physical type '{column.PhysicalType}' is not supported for PLAIN decoding.");
+        }
+    }
+
+    private static void DecodeDeltaBinaryPackedValues(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        int count,
+        ColumnBuildState state)
+    {
+        switch (column.PhysicalType)
+        {
+            case PhysicalType.Int32:
+            {
+                var dest = state.ReserveValues<int>(count);
+                var decoder = new DeltaBinaryPackedDecoder(data);
+                decoder.DecodeInt32s(dest);
+                break;
+            }
+            case PhysicalType.Int64:
+            {
+                var dest = state.ReserveValues<long>(count);
+                var decoder = new DeltaBinaryPackedDecoder(data);
+                decoder.DecodeInt64s(dest);
+                break;
+            }
+            default:
+                throw new NotSupportedException(
+                    $"Physical type '{column.PhysicalType}' is not supported for DELTA_BINARY_PACKED decoding.");
         }
     }
 

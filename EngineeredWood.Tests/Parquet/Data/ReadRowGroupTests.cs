@@ -100,16 +100,57 @@ public class ReadRowGroupTests
     [Fact]
     public async Task DataPageV2_Snappy_ReadsSupportedColumns()
     {
-        // datapage_v2.snappy.parquet uses DeltaBinaryPacked for some columns (out of MVP scope).
-        // Read only the "a" column which uses PLAIN/DICTIONARY encoding.
+        // Column "d" uses RLE encoding for boolean values (not yet supported for value decoding).
+        // Read columns that use PLAIN/DICTIONARY/DELTA_BINARY_PACKED encodings.
         await using var file = new LocalRandomAccessFile(TestData.GetPath("datapage_v2.snappy.parquet"));
         using var reader = new ParquetFileReader(file, ownsFile: false);
 
-        var batch = await reader.ReadRowGroupAsync(0, ["a"]);
+        var batch = await reader.ReadRowGroupAsync(0, ["a", "b", "c"]);
 
         Assert.True(batch.Length > 0);
-        Assert.Single(batch.Schema.FieldsList);
-        Assert.Equal("a", batch.Schema.FieldsList[0].Name);
+        Assert.Equal(3, batch.Schema.FieldsList.Count);
+    }
+
+    [Fact]
+    public async Task DeltaBinaryPacked_MatchesExpectedValues()
+    {
+        // delta_binary_packed.parquet: 66 columns (65 INT64 + 1 INT32), 200 rows
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("delta_binary_packed.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.Equal(200, batch.Length);
+        Assert.Equal(66, batch.Schema.FieldsList.Count);
+
+        // Load expected values from CSV
+        var csvPath = Path.Combine(
+            Path.GetDirectoryName(TestData.GetPath("delta_binary_packed.parquet"))!,
+            "delta_binary_packed_expect.csv");
+        var lines = File.ReadAllLines(csvPath);
+        var headers = lines[0].Split(',');
+
+        // Verify a selection of columns against expected CSV
+        for (int col = 0; col < 66; col++)
+        {
+            var column = batch.Column(headers[col]);
+
+            for (int row = 0; row < 200; row++)
+            {
+                var expected = lines[row + 1].Split(',')[col];
+
+                if (col == 65) // int_value: INT32
+                {
+                    var arr = (Int32Array)column;
+                    Assert.Equal(int.Parse(expected), arr.GetValue(row));
+                }
+                else // INT64
+                {
+                    var arr = (Int64Array)column;
+                    Assert.Equal(long.Parse(expected), arr.GetValue(row));
+                }
+            }
+        }
     }
 
     [Fact]
@@ -225,7 +266,8 @@ public class ReadRowGroupTests
                         if (enc != Encoding.Plain &&
                             enc != Encoding.PlainDictionary &&
                             enc != Encoding.RleDictionary &&
-                            enc != Encoding.Rle)
+                            enc != Encoding.Rle &&
+                            enc != Encoding.DeltaBinaryPacked)
                         {
                             skipped.Add($"{fileName}: unsupported encoding {enc}");
                             unsupported = true;
@@ -276,6 +318,10 @@ public class ReadRowGroupTests
             catch (NotSupportedException ex)
             {
                 skipped.Add($"{fileName}: {ex.Message}");
+            }
+            catch (AggregateException ex) when (ex.InnerExceptions.All(e => e is NotSupportedException))
+            {
+                skipped.Add($"{fileName}: {ex.InnerExceptions[0].Message}");
             }
             catch (Exception ex)
             {
