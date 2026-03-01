@@ -211,7 +211,8 @@ public class ReadRowGroupTests
 
                     // Check codec
                     if (col.MetaData.Codec != CompressionCodec.Uncompressed &&
-                        col.MetaData.Codec != CompressionCodec.Snappy)
+                        col.MetaData.Codec != CompressionCodec.Snappy &&
+                        col.MetaData.Codec != CompressionCodec.Zstd)
                     {
                         skipped.Add($"{fileName}: unsupported codec {col.MetaData.Codec}");
                         unsupported = true;
@@ -284,5 +285,77 @@ public class ReadRowGroupTests
 
         Assert.True(failures.Count == 0,
             $"Failed on {failures.Count} files:\n" + string.Join("\n", failures));
+    }
+
+    [Fact]
+    public async Task ZstdCompressedFile_RoundTrips()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"ew-zstd-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            // Write a Zstd-compressed file via Parquet.Net
+            int rowCount = 1000;
+            var ids = Enumerable.Range(0, rowCount).ToArray();
+            var values = Enumerable.Range(0, rowCount).Select(i => (long)i * 100).ToArray();
+            var scores = Enumerable.Range(0, rowCount)
+                .Select(i => i % 10 == 0 ? (double?)null : i * 1.5)
+                .ToArray();
+
+            // Write via ParquetSharp (uses PLAIN/RLE_DICTIONARY encodings we support)
+            {
+                var columns = new ParquetSharp.Column[]
+                {
+                    new ParquetSharp.Column<int>("id"),
+                    new ParquetSharp.Column<long>("value"),
+                    new ParquetSharp.Column<double?>("score"),
+                };
+
+                using var props = new ParquetSharp.WriterPropertiesBuilder()
+                    .Compression(ParquetSharp.Compression.Zstd)
+                    .Build();
+                using var writer = new ParquetSharp.ParquetFileWriter(path, columns, props);
+                using var rowGroup = writer.AppendRowGroup();
+
+                using (var col = rowGroup.NextColumn().LogicalWriter<int>())
+                    col.WriteBatch(ids);
+                using (var col = rowGroup.NextColumn().LogicalWriter<long>())
+                    col.WriteBatch(values);
+                using (var col = rowGroup.NextColumn().LogicalWriter<double?>())
+                    col.WriteBatch(scores);
+
+                writer.Close();
+            }
+
+            // Read it back with EngineeredWood
+            await using var file = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(file, ownsFile: false);
+            var metadata = await reader.ReadMetadataAsync();
+
+            // Verify Zstd codec is actually used
+            Assert.Contains(metadata.RowGroups[0].Columns,
+                c => c.MetaData!.Codec == CompressionCodec.Zstd);
+
+            var batch = await reader.ReadRowGroupAsync(0);
+
+            Assert.Equal(rowCount, batch.Length);
+            Assert.Equal(3, batch.Schema.FieldsList.Count);
+
+            var idArray = (Int32Array)batch.Column("id");
+            Assert.Equal(0, idArray.GetValue(0));
+            Assert.Equal(999, idArray.GetValue(999));
+
+            var valueArray = (Int64Array)batch.Column("value");
+            Assert.Equal(0L, valueArray.GetValue(0));
+            Assert.Equal(99900L, valueArray.GetValue(999));
+
+            var scoreArray = (DoubleArray)batch.Column("score");
+            Assert.True(scoreArray.IsNull(0)); // index 0: null (0 % 10 == 0)
+            Assert.Equal(1.5, scoreArray.GetValue(1));
+        }
+        finally
+        {
+            if (File.Exists(path))
+                File.Delete(path);
+        }
     }
 }
