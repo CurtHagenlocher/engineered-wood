@@ -256,6 +256,10 @@ internal static class ColumnChunkReader
         {
             DecodeByteStreamSplitValues(data, column, nonNullCount, state);
         }
+        else if (encoding == Encoding.Rle)
+        {
+            DecodeRleBooleanValues(data, column, nonNullCount, state);
+        }
         else
         {
             throw new NotSupportedException(
@@ -428,6 +432,33 @@ internal static class ColumnChunkReader
                 throw new NotSupportedException(
                     $"Physical type '{column.PhysicalType}' is not supported for BYTE_STREAM_SPLIT decoding.");
         }
+    }
+
+    private static void DecodeRleBooleanValues(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        int count,
+        ColumnBuildState state)
+    {
+        if (column.PhysicalType != PhysicalType.Boolean)
+            throw new NotSupportedException(
+                $"RLE encoding for values is only supported for BOOLEAN columns, not '{column.PhysicalType}'.");
+
+        // RLE boolean values are prefixed with a 4-byte little-endian length
+        if (data.Length < 4)
+            throw new ParquetFormatException("RLE boolean data too short for length prefix.");
+        int rleLength = System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(data);
+        var rleData = data.Slice(4, rleLength);
+
+        var decoder = new RleBitPackedDecoder(rleData, bitWidth: 1);
+        var ints = new int[count];
+        decoder.ReadBatch(ints);
+
+        Span<bool> values = count <= 1024 ? stackalloc bool[count] : new bool[count];
+        for (int i = 0; i < count; i++)
+            values[i] = ints[i] != 0;
+
+        state.AddBoolValues(values.Slice(0, count));
     }
 
     private static void DecodeDictValues(

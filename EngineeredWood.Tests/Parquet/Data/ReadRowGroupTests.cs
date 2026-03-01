@@ -98,17 +98,31 @@ public class ReadRowGroupTests
     }
 
     [Fact]
-    public async Task DataPageV2_Snappy_ReadsSupportedColumns()
+    public async Task DataPageV2_Snappy_ReadsAllColumns()
     {
-        // Column "d" uses RLE encoding for boolean values (not yet supported for value decoding).
-        // Read columns that use PLAIN/DICTIONARY/DELTA_BINARY_PACKED encodings.
+        // Column "d" uses RLE encoding for boolean values.
         await using var file = new LocalRandomAccessFile(TestData.GetPath("datapage_v2.snappy.parquet"));
         using var reader = new ParquetFileReader(file, ownsFile: false);
 
-        var batch = await reader.ReadRowGroupAsync(0, ["a", "b", "c"]);
+        // Read all flat columns (column "e" is nested and unsupported)
+        var batch = await reader.ReadRowGroupAsync(0, ["a", "b", "c", "d"]);
 
         Assert.True(batch.Length > 0);
-        Assert.Equal(3, batch.Schema.FieldsList.Count);
+        Assert.Equal(4, batch.Schema.FieldsList.Count);
+
+        // Cross-verify column "d" (RLE boolean) against ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("datapage_v2.snappy.parquet"));
+        using var rg = psReader.RowGroup(0);
+        long numRows = rg.MetaData.NumRows;
+
+        using var col = rg.Column(3).LogicalReader<bool>();
+        var expected = col.ReadAll(checked((int)numRows));
+
+        var arr = (BooleanArray)batch.Column("d");
+        Assert.Equal(numRows, arr.Length);
+        for (int i = 0; i < numRows; i++)
+            Assert.Equal(expected[i], arr.GetValue(i));
     }
 
     [Fact]
