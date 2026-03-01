@@ -48,18 +48,21 @@ internal static class Decompressor
         return Snappy.Decompress(source, destination);
     }
 
-    private static int DecompressGzip(ReadOnlySpan<byte> source, Span<byte> destination)
+    private static unsafe int DecompressGzip(ReadOnlySpan<byte> source, Span<byte> destination)
     {
-        using var sourceStream = new MemoryStream(source.ToArray(), writable: false);
-        using var gzip = new GZipStream(sourceStream, CompressionMode.Decompress);
-        int totalRead = 0;
-        while (totalRead < destination.Length)
+        fixed (byte* ptr = source)
         {
-            int read = gzip.Read(destination.Slice(totalRead));
-            if (read == 0) break;
-            totalRead += read;
+            using var sourceStream = new UnmanagedMemoryStream(ptr, source.Length);
+            using var gzip = new GZipStream(sourceStream, CompressionMode.Decompress);
+            int totalRead = 0;
+            while (totalRead < destination.Length)
+            {
+                int read = gzip.Read(destination.Slice(totalRead));
+                if (read == 0) break;
+                totalRead += read;
+            }
+            return totalRead;
         }
-        return totalRead;
     }
 
     private static int DecompressBrotli(ReadOnlySpan<byte> source, Span<byte> destination)
