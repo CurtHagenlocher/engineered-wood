@@ -1,4 +1,5 @@
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 using EngineeredWood.IO;
 using EngineeredWood.IO.Local;
@@ -633,6 +634,109 @@ public class ReadRowGroupTests
         {
             if (File.Exists(path))
                 File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ByteStreamSplitExtendedGzip_ReadsAllColumns()
+    {
+        // 14 columns (Float16, float, double, int32, int64, FLBA5, decimal) × PLAIN + BYTE_STREAM_SPLIT,
+        // 200 rows, all Gzip compressed.
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("byte_stream_split_extended.gzip.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(200, batch.Length);
+        Assert.Equal(14, batch.Schema.FieldsList.Count);
+
+        // Cross-verify every column against ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(
+            TestData.GetPath("byte_stream_split_extended.gzip.parquet"));
+        using var rg = psReader.RowGroup(0);
+
+        // Float16 columns (0, 1) — nullable
+        for (int c = 0; c < 2; c++)
+        {
+            using var col = rg.Column(c).LogicalReader<Half?>();
+            var expected = col.ReadAll(200);
+            var arr = (HalfFloatArray)batch.Column(c);
+            for (int i = 0; i < 200; i++)
+            {
+                if (expected[i] is null)
+                    Assert.True(arr.IsNull(i));
+                else
+                    Assert.Equal(
+                        BitConverter.HalfToInt16Bits(expected[i]!.Value),
+                        BitConverter.HalfToInt16Bits(arr.GetValue(i)!.Value));
+            }
+        }
+
+        // Float columns (2, 3) — nullable
+        for (int c = 2; c < 4; c++)
+        {
+            using var col = rg.Column(c).LogicalReader<float?>();
+            var expected = col.ReadAll(200);
+            var arr = (FloatArray)batch.Column(c);
+            for (int i = 0; i < 200; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+
+        // Double columns (4, 5) — nullable
+        for (int c = 4; c < 6; c++)
+        {
+            using var col = rg.Column(c).LogicalReader<double?>();
+            var expected = col.ReadAll(200);
+            var arr = (DoubleArray)batch.Column(c);
+            for (int i = 0; i < 200; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+
+        // Int32 columns (6, 7) — nullable
+        for (int c = 6; c < 8; c++)
+        {
+            using var col = rg.Column(c).LogicalReader<int?>();
+            var expected = col.ReadAll(200);
+            var arr = (Int32Array)batch.Column(c);
+            for (int i = 0; i < 200; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+
+        // Int64 columns (8, 9) — nullable
+        for (int c = 8; c < 10; c++)
+        {
+            using var col = rg.Column(c).LogicalReader<long?>();
+            var expected = col.ReadAll(200);
+            var arr = (Int64Array)batch.Column(c);
+            for (int i = 0; i < 200; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+
+        // FLBA5 columns (10, 11) — nullable, verify PLAIN vs BYTE_STREAM_SPLIT match
+        {
+            var plain = (FixedSizeBinaryArray)batch.Column(10);
+            var bss = (FixedSizeBinaryArray)batch.Column(11);
+            for (int i = 0; i < 200; i++)
+            {
+                Assert.Equal(plain.IsNull(i), bss.IsNull(i));
+                if (!plain.IsNull(i))
+                    Assert.Equal(plain.GetBytes(i).ToArray(), bss.GetBytes(i).ToArray());
+            }
+        }
+
+        // Decimal columns (12, 13) — nullable, stored as FixedSizeBinary
+        for (int c = 12; c < 14; c++)
+        {
+            using var col = rg.Column(c).LogicalReader<decimal?>();
+            var expected = col.ReadAll(200);
+            var arr = (FixedSizeBinaryArray)batch.Column(c);
+            for (int i = 0; i < 200; i++)
+            {
+                if (expected[i] is null)
+                    Assert.True(arr.IsNull(i));
+                else
+                    Assert.False(arr.IsNull(i)); // value is present; exact decimal decode not yet supported
+            }
         }
     }
 
