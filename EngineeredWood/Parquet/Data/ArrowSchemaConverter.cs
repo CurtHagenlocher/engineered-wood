@@ -232,6 +232,7 @@ internal static class ArrowSchemaConverter
             LogicalType.JsonType => Apache.Arrow.Types.StringType.Default,
             LogicalType.UuidType => new FixedSizeBinaryType(16),
             LogicalType.Float16Type => HalfFloatType.Default,
+            LogicalType.DecimalType dt => MakeDecimalType(dt.Precision, dt.Scale, column.PhysicalType),
             _ => null, // fall through to ConvertedType or PhysicalType
         };
     }
@@ -256,7 +257,27 @@ internal static class ArrowSchemaConverter
             ConvertedType.Uint64 => UInt64Type.Default,
             ConvertedType.Enum => Apache.Arrow.Types.StringType.Default,
             ConvertedType.Json => Apache.Arrow.Types.StringType.Default,
+            ConvertedType.Decimal => MakeDecimalType(
+                column.SchemaElement.Precision ?? 0,
+                column.SchemaElement.Scale ?? 0,
+                column.PhysicalType),
             _ => null, // fall through to PhysicalType
+        };
+    }
+
+    private static IArrowType MakeDecimalType(int precision, int scale, PhysicalType physicalType)
+    {
+        return physicalType switch
+        {
+            PhysicalType.Int32 => new Decimal32Type(precision, scale),
+            PhysicalType.Int64 => new Decimal64Type(precision, scale),
+            _ => precision switch
+            {
+                <= 9 => new Decimal32Type(precision, scale),
+                <= 18 => new Decimal64Type(precision, scale),
+                <= 38 => new Decimal128Type(precision, scale),
+                _ => new Decimal256Type(precision, scale),
+            },
         };
     }
 

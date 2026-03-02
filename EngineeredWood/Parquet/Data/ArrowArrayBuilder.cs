@@ -47,6 +47,8 @@ internal static class ArrowArrayBuilder
             DoubleType => BuildDenseFixedArray<double>(state, arrowType, numValues),
             StringType => BuildDenseVarBinaryArray(state, arrowType, numValues),
             BinaryType => BuildDenseVarBinaryArray(state, arrowType, numValues),
+            Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
+                => BuildDecimalArray(state, arrowType, numValues, dense: true),
             FixedSizeBinaryType fsb => BuildDenseFixedSizeBinaryArray(state, numValues, fsb),
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for dense array building."),
@@ -276,6 +278,8 @@ internal static class ArrowArrayBuilder
             DoubleType => BuildFixedArray<double>(state, arrowType, rowCount),
             StringType => BuildStringArray(state, rowCount),
             BinaryType => BuildBinaryArray(state, rowCount),
+            Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
+                => BuildDecimalArray(state, arrowType, rowCount, dense: false),
             FixedSizeBinaryType fsb => BuildFixedSizeBinaryArray(state, rowCount, fsb),
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for array building."),
@@ -551,6 +555,208 @@ internal static class ArrowArrayBuilder
             new[] { bitmapArrow, valueArrow });
         return new FixedSizeBinaryArray(data);
     }
+
+    /// <summary>
+    /// Builds a decimal Arrow array from column data. Handles all physical type sources:
+    /// INT32/INT64 (reinterpret as little-endian bytes) and FLBA/ByteArray (reverse from big-endian + sign-extend).
+    /// </summary>
+    private static IArrowArray BuildDecimalArray(ColumnBuildState state, IArrowType arrowType, int count, bool dense)
+    {
+        int byteWidth = arrowType switch
+        {
+            Decimal32Type => 4,
+            Decimal64Type => 8,
+            Decimal128Type => 16,
+            Decimal256Type => 32,
+            _ => throw new NotSupportedException($"Unexpected decimal type: {arrowType.Name}"),
+        };
+
+        var physicalType = state.PhysicalType;
+
+        if (physicalType == PhysicalType.Int32)
+            return BuildDecimalFromInt32(state, arrowType, count, byteWidth, dense);
+        if (physicalType == PhysicalType.Int64)
+            return BuildDecimalFromInt64(state, arrowType, count, byteWidth, dense);
+
+        // FLBA or ByteArray: raw bytes, big-endian → little-endian + sign-extend to target width
+        return BuildDecimalFromBytes(state, arrowType, count, byteWidth, dense);
+    }
+
+    private static IArrowArray BuildDecimalFromInt32(
+        ColumnBuildState state, IArrowType arrowType, int count, int byteWidth, bool dense)
+    {
+        var denseValues = state.GetValueSpan<int>();
+        var defLevels = state.IsNullable ? state.DefLevelSpan : default;
+        int nullCount = state.IsNullable ? count - state.ValueCount : 0;
+
+        using var valueBuf = new NativeBuffer<byte>(count * byteWidth);
+        using var bitmapBuf = new NativeBuffer<byte>((count + 7) / 8);
+
+        var values = valueBuf.ByteSpan;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!state.IsNullable || defLevels[i] == state.MaxDefLevel)
+            {
+                int val = denseValues[valueIdx++];
+                var slot = values.Slice(i * byteWidth, byteWidth);
+                byte fill = val < 0 ? (byte)0xFF : (byte)0x00;
+                slot.Fill(fill);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(slot, val);
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+            }
+        }
+
+        var valueArrow = valueBuf.Build();
+        var bitmapArrow = state.IsNullable ? bitmapBuf.Build() : ArrowBuffer.Empty;
+        state.DisposeValueBuffer();
+
+        var data = new ArrayData(arrowType, count, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return BuildDecimalArrayFromData(data);
+    }
+
+    private static IArrowArray BuildDecimalFromInt64(
+        ColumnBuildState state, IArrowType arrowType, int count, int byteWidth, bool dense)
+    {
+        var denseValues = state.GetValueSpan<long>();
+        var defLevels = state.IsNullable ? state.DefLevelSpan : default;
+        int nullCount = state.IsNullable ? count - state.ValueCount : 0;
+
+        using var valueBuf = new NativeBuffer<byte>(count * byteWidth);
+        using var bitmapBuf = new NativeBuffer<byte>((count + 7) / 8);
+
+        var values = valueBuf.ByteSpan;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!state.IsNullable || defLevels[i] == state.MaxDefLevel)
+            {
+                long val = denseValues[valueIdx++];
+                var slot = values.Slice(i * byteWidth, byteWidth);
+                byte fill = val < 0 ? (byte)0xFF : (byte)0x00;
+                slot.Fill(fill);
+                System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(slot, val);
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+            }
+        }
+
+        var valueArrow = valueBuf.Build();
+        var bitmapArrow = state.IsNullable ? bitmapBuf.Build() : ArrowBuffer.Empty;
+        state.DisposeValueBuffer();
+
+        var data = new ArrayData(arrowType, count, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return BuildDecimalArrayFromData(data);
+    }
+
+    private static IArrowArray BuildDecimalFromBytes(
+        ColumnBuildState state, IArrowType arrowType, int count, int byteWidth, bool dense)
+    {
+        if (state.PhysicalType == PhysicalType.ByteArray)
+            return BuildDecimalFromVarBytes(state, arrowType, count, byteWidth, dense);
+
+        // FLBA: fixed source width
+        var denseBytes = state.ValueByteSpan;
+        int sourceByteWidth = state.ValueCount > 0 ? denseBytes.Length / state.ValueCount : 0;
+
+        var defLevels = state.IsNullable ? state.DefLevelSpan : default;
+        int nullCount = state.IsNullable ? count - state.ValueCount : 0;
+
+        using var valueBuf = new NativeBuffer<byte>(count * byteWidth);
+        using var bitmapBuf = new NativeBuffer<byte>((count + 7) / 8);
+
+        var values = valueBuf.ByteSpan;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!state.IsNullable || defLevels[i] == state.MaxDefLevel)
+            {
+                var src = denseBytes.Slice(valueIdx * sourceByteWidth, sourceByteWidth);
+                var dst = values.Slice(i * byteWidth, byteWidth);
+                ReverseAndSignExtend(src, dst);
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                valueIdx++;
+            }
+        }
+
+        var valueArrow = valueBuf.Build();
+        var bitmapArrow = state.IsNullable ? bitmapBuf.Build() : ArrowBuffer.Empty;
+        state.DisposeValueBuffer();
+
+        var data = new ArrayData(arrowType, count, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return BuildDecimalArrayFromData(data);
+    }
+
+    private static IArrowArray BuildDecimalFromVarBytes(
+        ColumnBuildState state, IArrowType arrowType, int count, int byteWidth, bool dense)
+    {
+        var offsets = state.GetOffsetsSpan();
+        var dataSpan = state.GetDataSpan();
+        var defLevels = state.IsNullable ? state.DefLevelSpan : default;
+        int nullCount = state.IsNullable ? count - state.ValueCount : 0;
+
+        using var valueBuf = new NativeBuffer<byte>(count * byteWidth);
+        using var bitmapBuf = new NativeBuffer<byte>((count + 7) / 8);
+
+        var values = valueBuf.ByteSpan;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!state.IsNullable || defLevels[i] == state.MaxDefLevel)
+            {
+                int start = offsets[valueIdx];
+                int end = offsets[valueIdx + 1];
+                var src = dataSpan.Slice(start, end - start);
+                var dst = values.Slice(i * byteWidth, byteWidth);
+                ReverseAndSignExtend(src, dst);
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                valueIdx++;
+            }
+        }
+
+        var valueArrow = valueBuf.Build();
+        var bitmapArrow = state.IsNullable ? bitmapBuf.Build() : ArrowBuffer.Empty;
+        state.DisposeOffsetsBuffer();
+
+        var data = new ArrayData(arrowType, count, nullCount, offset: 0,
+            new[] { bitmapArrow, valueArrow });
+        return BuildDecimalArrayFromData(data);
+    }
+
+    /// <summary>
+    /// Reverses big-endian Parquet decimal bytes to little-endian and sign-extends to the target width.
+    /// </summary>
+    private static void ReverseAndSignExtend(ReadOnlySpan<byte> source, Span<byte> target)
+    {
+        // Sign-extend: fill with 0xFF if negative (high bit of big-endian first byte), else 0x00
+        byte fill = (source.Length > 0 && (source[0] & 0x80) != 0) ? (byte)0xFF : (byte)0x00;
+        target.Fill(fill);
+
+        // Reverse big-endian source into little-endian target
+        int len = Math.Min(source.Length, target.Length);
+        for (int j = 0; j < len; j++)
+            target[j] = source[source.Length - 1 - j];
+    }
+
+    private static IArrowArray BuildDecimalArrayFromData(ArrayData data) =>
+        data.DataType switch
+        {
+            Decimal32Type => new Decimal32Array(data),
+            Decimal64Type => new Decimal64Array(data),
+            Decimal128Type => new Decimal128Array(data),
+            Decimal256Type => new Decimal256Array(data),
+            _ => throw new NotSupportedException($"Unexpected decimal type: {data.DataType.Name}"),
+        };
 }
 
 /// <summary>
@@ -587,6 +793,9 @@ internal sealed class ColumnBuildState : IDisposable
 
     private readonly int _capacity;
     private readonly int _elementSize; // bytes per element for fixed-width types
+
+    /// <summary>The Parquet physical type for this column.</summary>
+    public PhysicalType PhysicalType => _physicalType;
 
     /// <summary>Whether this column is nullable (has def levels).</summary>
     public bool IsNullable => MaxDefLevel > 0;
@@ -854,6 +1063,10 @@ file static class ArrowArrayFactory
             TimestampType => new TimestampArray(data),
             Apache.Arrow.Types.StringType => new StringArray(data),
             BinaryType => new BinaryArray(data),
+            Decimal32Type => new Decimal32Array(data),
+            Decimal64Type => new Decimal64Array(data),
+            Decimal128Type => new Decimal128Array(data),
+            Decimal256Type => new Decimal256Array(data),
             FixedSizeBinaryType => new FixedSizeBinaryArray(data),
             _ => throw new NotSupportedException($"Cannot construct Arrow array for type '{data.DataType.Name}'."),
         };
