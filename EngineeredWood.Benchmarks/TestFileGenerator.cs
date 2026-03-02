@@ -19,13 +19,13 @@ public static class TestFileGenerator
     public const string DeltaLengthByteArray = "delta_length_byte_array";
     public const string ByteStreamSplit = "byte_stream_split";
 
-    private const int WideFlatColumnCount = 100;
-    private const int WideFlatRowCount = 1_000_000;
+    private const int WideFlatColumnCount = 50;
+    private const int WideFlatRowCount = 100_000;
 
-    private const int TallNarrowRowCount = 10_000_000;
-    private const int TallNarrowRowGroupSize = 2_000_000;
+    private const int TallNarrowRowCount = 1_000_000;
+    private const int TallNarrowRowGroupSize = 200_000;
 
-    private const int EncodingBenchRowCount = 1_000_000;
+    private const int EncodingBenchRowCount = 100_000;
 
     private const double NullRate = 0.10;
     private const int StringPoolSize = 10_000;
