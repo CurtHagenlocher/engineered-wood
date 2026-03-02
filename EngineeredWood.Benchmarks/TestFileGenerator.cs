@@ -4,6 +4,8 @@ namespace EngineeredWood.Benchmarks;
 
 /// <summary>
 /// Generates synthetic Parquet files for benchmarking using ParquetSharp.
+/// Files are cached in a stable temp directory so that BenchmarkDotNet child
+/// processes and multiple benchmark classes reuse the same generated data.
 /// Data is designed to be representative of real workloads:
 /// - Random numeric values (not sequential)
 /// - High-cardinality, variable-length strings
@@ -32,25 +34,56 @@ public static class TestFileGenerator
     private const int StringMinLen = 5;
     private const int StringMaxLen = 100;
 
+    private static readonly string[] AllFileNames =
+    [
+        WideFlat, TallNarrow, Snappy,
+        DeltaByteArray, DeltaLengthByteArray, ByteStreamSplit,
+    ];
+
+    private static readonly string CacheDir =
+        Path.Combine(Path.GetTempPath(), "ew-bench-data");
+
     public static string GenerateAll()
     {
-        string dir = Path.Combine(Path.GetTempPath(), "ew-bench-" + Guid.NewGuid().ToString("N")[..8]);
-        Directory.CreateDirectory(dir);
+        Directory.CreateDirectory(CacheDir);
 
-        GenerateWideFlat(Path.Combine(dir, WideFlat + ".parquet"), compressed: false);
-        GenerateWideFlat(Path.Combine(dir, Snappy + ".parquet"), compressed: true);
-        GenerateTallNarrow(Path.Combine(dir, TallNarrow + ".parquet"));
-        GenerateDeltaByteArray(Path.Combine(dir, DeltaByteArray + ".parquet"));
-        GenerateDeltaLengthByteArray(Path.Combine(dir, DeltaLengthByteArray + ".parquet"));
-        GenerateByteStreamSplit(Path.Combine(dir, ByteStreamSplit + ".parquet"));
+        // Skip generation entirely if all files already exist
+        if (AllFileNames.All(f => File.Exists(Path.Combine(CacheDir, f + ".parquet"))))
+            return CacheDir;
 
-        return dir;
+        GenerateIfMissing(WideFlat, () =>
+            GenerateWideFlat(Path.Combine(CacheDir, WideFlat + ".parquet"), compressed: false));
+        GenerateIfMissing(Snappy, () =>
+            GenerateWideFlat(Path.Combine(CacheDir, Snappy + ".parquet"), compressed: true));
+        GenerateIfMissing(TallNarrow, () =>
+            GenerateTallNarrow(Path.Combine(CacheDir, TallNarrow + ".parquet")));
+        GenerateIfMissing(DeltaByteArray, () =>
+            GenerateDeltaByteArray(Path.Combine(CacheDir, DeltaByteArray + ".parquet")));
+        GenerateIfMissing(DeltaLengthByteArray, () =>
+            GenerateDeltaLengthByteArray(Path.Combine(CacheDir, DeltaLengthByteArray + ".parquet")));
+        GenerateIfMissing(ByteStreamSplit, () =>
+            GenerateByteStreamSplit(Path.Combine(CacheDir, ByteStreamSplit + ".parquet")));
+
+        return CacheDir;
     }
 
     public static void Cleanup(string dir)
     {
-        if (Directory.Exists(dir))
-            Directory.Delete(dir, recursive: true);
+        // No-op: files are cached for reuse across benchmark processes.
+        // Call ForceCleanup() to delete them explicitly.
+    }
+
+    public static void ForceCleanup()
+    {
+        if (Directory.Exists(CacheDir))
+            Directory.Delete(CacheDir, recursive: true);
+    }
+
+    private static void GenerateIfMissing(string name, Action generate)
+    {
+        string path = Path.Combine(CacheDir, name + ".parquet");
+        if (!File.Exists(path))
+            generate();
     }
 
     /// <summary>
