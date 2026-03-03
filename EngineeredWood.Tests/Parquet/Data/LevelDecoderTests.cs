@@ -1,3 +1,4 @@
+using EngineeredWood.Parquet;
 using EngineeredWood.Parquet.Data;
 
 namespace EngineeredWood.Tests.Parquet.Data;
@@ -49,6 +50,56 @@ public class LevelDecoderTests
         var levels = new int[3];
         LevelDecoder.DecodeV2(data, maxLevel: 1, valueCount: 3, levels);
         Assert.Equal([1, 1, 1], levels);
+    }
+
+    [Fact]
+    public void DecodeV1_BitPacked_1BitWidth()
+    {
+        // MSB-packed: values [1, 0, 1, 0, 1, 1, 0, 0] with bitWidth=1
+        // Packed MSB-first: 10101100 = 0xAC
+        byte[] data = [0xAC];
+        var levels = new int[8];
+        int consumed = LevelDecoder.DecodeV1(data, maxLevel: 1, valueCount: 8, levels,
+            Encoding.BitPacked);
+        Assert.Equal(1, consumed);
+        Assert.Equal([1, 0, 1, 0, 1, 1, 0, 0], levels);
+    }
+
+    [Fact]
+    public void DecodeV1_BitPacked_2BitWidth()
+    {
+        // MSB-packed: values [0, 1, 2, 3] with bitWidth=2
+        // Bit stream: 00 01 10 11 → 00011011 = 0x1B
+        byte[] data = [0x1B];
+        var levels = new int[4];
+        int consumed = LevelDecoder.DecodeV1(data, maxLevel: 3, valueCount: 4, levels,
+            Encoding.BitPacked);
+        Assert.Equal(1, consumed);
+        Assert.Equal([0, 1, 2, 3], levels);
+    }
+
+    [Fact]
+    public void DecodeV1_BitPacked_3BitWidth_CrossesByteBoundary()
+    {
+        // MSB-packed: values [1, 2, 5] with bitWidth=3
+        // Bit stream: 001 010 101 (pad) → 00101010 1(0000000) → 0x2A, 0x80
+        byte[] data = [0x2A, 0x80];
+        var levels = new int[3];
+        int consumed = LevelDecoder.DecodeV1(data, maxLevel: 7, valueCount: 3, levels,
+            Encoding.BitPacked);
+        Assert.Equal(2, consumed); // ceil(3*3/8) = 2
+        Assert.Equal([1, 2, 5], levels);
+    }
+
+    [Fact]
+    public void DecodeV1_BitPacked_MaxLevelZero_ReturnsZeros()
+    {
+        byte[] data = [0xFF]; // irrelevant — should not be read
+        var levels = new int[4];
+        int consumed = LevelDecoder.DecodeV1(data, maxLevel: 0, valueCount: 4, levels,
+            Encoding.BitPacked);
+        Assert.Equal(0, consumed);
+        Assert.Equal([0, 0, 0, 0], levels);
     }
 
     [Fact]

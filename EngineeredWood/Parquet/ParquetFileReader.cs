@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Text.RegularExpressions;
 using Apache.Arrow;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet.Data;
@@ -18,10 +19,17 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
     private const int FooterSuffixSize = 8; // 4-byte footer length + 4-byte magic
     private const int MinFileSize = MagicSize + FooterSuffixSize; // leading PAR1 + trailing 8
 
+    /// <summary>
+    /// Maximum size of a dictionary page Thrift header that could be missing from
+    /// TotalCompressedSize due to the PARQUET-816 bug in parquet-mr &lt;= 1.2.8.
+    /// </summary>
+    private const int MaxDictHeaderPadding = 100;
+
     private readonly IRandomAccessFile _file;
     private readonly bool _ownsFile;
     private FileMetaData? _metadata;
     private SchemaDescriptor? _schema;
+    private long _fileLength;
     private bool _disposed;
 
     /// <summary>
@@ -74,6 +82,7 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
             new FileRange(footerOffset, footerLength),
             cancellationToken).ConfigureAwait(false);
 
+        _fileLength = fileLength;
         _metadata = MetadataDecoder.DecodeFileMetaData(footerBuffer.Memory.Span);
         return _metadata;
     }
@@ -255,6 +264,7 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
 
         var ranges = new FileRange[selectedChunks.Count];
         var leafArrowFields = new Field[selectedColumns.Count];
+        bool hasParquet816Bug = HasParquet816Bug(metadata.CreatedBy);
 
         for (int i = 0; i < selectedChunks.Count; i++)
         {
@@ -265,7 +275,20 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
             long start = colMeta.DictionaryPageOffset is > 0 and long dpo
                 ? dpo
                 : colMeta.DataPageOffset;
-            ranges[i] = new FileRange(start, colMeta.TotalCompressedSize);
+            long length = colMeta.TotalCompressedSize;
+
+            // PARQUET-816 workaround: old parquet-mr writers (<= 1.2.8) exclude the
+            // dictionary page header from TotalCompressedSize. Add padding to cover
+            // the potentially missing header bytes. Extra trailing bytes are harmless
+            // — ColumnChunkReader stops after consuming all values.
+            if (start < colMeta.DataPageOffset || hasParquet816Bug)
+            {
+                long bytesRemaining = _fileLength - (start + length);
+                if (bytesRemaining > 0)
+                    length += Math.Min(MaxDictHeaderPadding, bytesRemaining);
+            }
+
+            ranges[i] = new FileRange(start, length);
 
             leafArrowFields[i] = ArrowSchemaConverter.ToArrowField(selectedColumns[i]);
         }
@@ -427,6 +450,33 @@ public sealed class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         return (columns, chunks);
+    }
+
+    /// <summary>
+    /// Detects whether the file was written by a parquet-mr version affected by PARQUET-816,
+    /// where TotalCompressedSize excludes the dictionary page header.
+    /// The fix was in parquet-mr 1.2.9.
+    /// </summary>
+    private static bool HasParquet816Bug(string? createdBy)
+    {
+        if (createdBy == null)
+            return false;
+
+        // Must start with "parquet-mr"
+        if (!createdBy.StartsWith("parquet-mr", StringComparison.OrdinalIgnoreCase))
+            return false;
+
+        // "parquet-mr" with no version → pre-1.0, definitely buggy
+        var match = Regex.Match(createdBy, @"version\s+(\d+)\.(\d+)\.(\d+)");
+        if (!match.Success)
+            return true;
+
+        int major = int.Parse(match.Groups[1].Value);
+        int minor = int.Parse(match.Groups[2].Value);
+        int patch = int.Parse(match.Groups[3].Value);
+
+        // Bug was fixed in 1.2.9
+        return major < 1 || (major == 1 && (minor < 2 || (minor == 2 && patch < 9)));
     }
 
     public async ValueTask DisposeAsync()

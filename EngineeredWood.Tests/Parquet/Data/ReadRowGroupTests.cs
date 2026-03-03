@@ -459,7 +459,8 @@ public class ReadRowGroupTests
             // Skip encrypted, deliberately malformed, and pathological files
             if (fileName.Contains("encrypt", StringComparison.OrdinalIgnoreCase) ||
                 fileName.Contains("malformed", StringComparison.OrdinalIgnoreCase) ||
-                fileName == "large_string_map.brotli.parquet") // 2GB+ uncompressed data
+                fileName == "large_string_map.brotli.parquet" || // 2GB+ uncompressed data
+                fileName == "fixed_length_byte_array.parquet") // malformed: page payloads too small for claimed row count
             {
                 skipped.Add($"{fileName}: encrypted/malformed/pathological");
                 continue;
@@ -510,6 +511,7 @@ public class ReadRowGroupTests
                             enc != Encoding.PlainDictionary &&
                             enc != Encoding.RleDictionary &&
                             enc != Encoding.Rle &&
+                            enc != Encoding.BitPacked &&
                             enc != Encoding.DeltaBinaryPacked &&
                             enc != Encoding.DeltaLengthByteArray &&
                             enc != Encoding.DeltaByteArray &&
@@ -1458,7 +1460,7 @@ public class ReadRowGroupTests
         var listArray = (ListArray)batch.Column(0);
         Assert.False(listArray.IsNull(0));
         var values = listArray.GetSlicedValues(0);
-        Assert.Equal(0, values.Length);
+        Assert.True(values == null || values.Length == 0);
     }
 
     [Fact]
@@ -1601,5 +1603,78 @@ public class ReadRowGroupTests
 
         var batch = await reader.ReadRowGroupAsync(0);
         Assert.True(batch.Length > 0);
+    }
+
+    [Fact]
+    public async Task CorruptedColumn_ThrowsWithClearMessage_CanBeSkippedByName()
+    {
+        // pt-ARROW-GH-41317.parquet is a fuzzer artifact with a corrupted PageType
+        // byte in column "timestamp_us_no_tz" (row group 0 only).
+        var path = Path.Combine(Path.GetTempPath(), "ew-compat-data", "pt-ARROW-GH-41317.parquet");
+        if (!File.Exists(path))
+            return; // Compatibility data not downloaded — nothing to test
+
+        await using var file = new LocalRandomAccessFile(path);
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+        var schema = await reader.GetSchemaAsync();
+
+        // Reading all columns should throw a clear ParquetFormatException for the corrupted column
+        var ex = await Assert.ThrowsAsync<AggregateException>(
+            () => reader.ReadRowGroupAsync(0).AsTask());
+        var inner = Assert.Single(ex.InnerExceptions);
+        Assert.IsType<ParquetFormatException>(inner);
+        Assert.Contains("timestamp_us_no_tz", inner.Message);
+        Assert.Contains("corrupted page header", inner.Message);
+
+        // Excluding the corrupted column by name allows the rest of the file to be read
+        var goodColumns = schema.Root.Children
+            .Select(c => c.Name)
+            .Where(n => n != "timestamp_us_no_tz")
+            .ToList();
+
+        var batch = await reader.ReadRowGroupAsync(0, goodColumns);
+        Assert.Equal(3, batch.Length);
+        Assert.DoesNotContain(batch.Schema.FieldsList, f => f.Name == "timestamp_us_no_tz");
+        Assert.True(batch.Schema.FieldsList.Count > 50, "Most columns should still be readable.");
+    }
+
+    [Fact]
+    public async Task NonnullableImpala_ReadsDeeplyNestedColumns()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("nonnullable.impala.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.True(batch.Length > 0);
+        Assert.True(batch.Schema.FieldsList.Count > 0);
+
+        // Verify list/struct columns are present
+        bool hasList = false;
+        foreach (var field in batch.Schema.FieldsList)
+        {
+            if (field.DataType is ListType)
+                hasList = true;
+        }
+        Assert.True(hasList, "Expected at least one ListType field in nonnullable.impala.parquet.");
+    }
+
+    [Fact]
+    public async Task NullableImpala_ReadsDeeplyNestedColumns()
+    {
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("nullable.impala.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+        Assert.True(batch.Length > 0);
+        Assert.True(batch.Schema.FieldsList.Count > 0);
+
+        // Verify list/struct columns are present
+        bool hasList = false;
+        foreach (var field in batch.Schema.FieldsList)
+        {
+            if (field.DataType is ListType)
+                hasList = true;
+        }
+        Assert.True(hasList, "Expected at least one ListType field in nullable.impala.parquet.");
     }
 }

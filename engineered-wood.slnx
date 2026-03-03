@@ -1,5 +1,6 @@
 <Solution>
   <Project Path="EngineeredWood.Benchmarks/EngineeredWood.Benchmarks.csproj" />
+  <Project Path="EngineeredWood.Compatibility/EngineeredWood.Compatibility.csproj" />
   <Project Path="EngineeredWood.Tests/EngineeredWood.Tests.csproj" />
   <Project Path="EngineeredWood/EngineeredWood.csproj" />
 </Solution>

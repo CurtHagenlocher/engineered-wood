@@ -233,6 +233,7 @@ internal static class ArrowSchemaConverter
             LogicalType.UuidType => new FixedSizeBinaryType(16),
             LogicalType.Float16Type => HalfFloatType.Default,
             LogicalType.DecimalType dt => MakeDecimalType(dt.Precision, dt.Scale, column.PhysicalType),
+            LogicalType.UnknownLogicalType { ThriftFieldId: 11 } => NullType.Default,
             _ => null, // fall through to ConvertedType or PhysicalType
         };
     }

@@ -81,16 +81,19 @@ internal static class Decompressor
     }
 
     /// <summary>
-    /// Decompresses data using the deprecated Hadoop LZ4 framing format.
-    /// Each frame: 4-byte big-endian decompressed size + 4-byte big-endian compressed size + data.
-    /// Falls back to raw LZ4 if the framing doesn't validate.
+    /// Decompresses data written with the deprecated LZ4 codec (value 5).
+    /// Different writers used different formats: Hadoop framing, LZ4 frame format, or raw blocks.
+    /// Tries each in order until one succeeds.
     /// </summary>
     private static int DecompressHadoopLz4(ReadOnlySpan<byte> source, Span<byte> destination)
     {
         if (TryDecompressHadoopFramed(source, destination, out int written))
             return written;
 
-        // Fallback: treat as raw LZ4 block (some writers label raw LZ4 as Hadoop LZ4)
+        if (TryDecompressLz4Frame(source, destination, out written))
+            return written;
+
+        // Last fallback: treat as raw LZ4 block (some writers label raw LZ4 as Hadoop LZ4)
         return DecompressLz4Raw(source, destination);
     }
 
@@ -133,6 +136,93 @@ internal static class Decompressor
 
             srcOffset += (int)compSize;
             dstOffset += (int)decompSize;
+        }
+
+        bytesWritten = dstOffset;
+        return bytesWritten > 0;
+    }
+
+    /// <summary>
+    /// LZ4 frame format magic number. On disk: 04 22 4D 18; as LE uint32: 0x184D2204.
+    /// Used by some writers (e.g. parquet-go) with the deprecated LZ4 codec.
+    /// </summary>
+    private const uint Lz4FrameMagic = 0x184D2204;
+
+    /// <summary>
+    /// Attempts to decompress LZ4 frame format data (magic 0x04224D18).
+    /// Format: magic (4) + FLG (1) + BD (1) + [content size (8)] + HC (1) + blocks + end mark (4) + [checksum (4)].
+    /// Each block: 4-byte LE size (bit 31 = uncompressed flag) + data.
+    /// </summary>
+    private static bool TryDecompressLz4Frame(
+        ReadOnlySpan<byte> source, Span<byte> destination, out int bytesWritten)
+    {
+        bytesWritten = 0;
+
+        // Minimum: magic(4) + FLG(1) + BD(1) + HC(1) + end_mark(4) = 11
+        if (source.Length < 11)
+            return false;
+
+        // Check magic number
+        if (BinaryPrimitives.ReadUInt32LittleEndian(source) != Lz4FrameMagic)
+            return false;
+
+        int srcOffset = 4;
+        byte flg = source[srcOffset++];
+
+        // Version must be 01 (bits 7-6)
+        if ((flg >> 6) != 1)
+            return false;
+
+        bool hasBlockChecksum = (flg & 0x10) != 0;
+        bool hasContentSize = (flg & 0x08) != 0;
+        bool hasContentChecksum = (flg & 0x04) != 0;
+
+        srcOffset++; // skip BD byte
+        if (hasContentSize)
+            srcOffset += 8; // skip content size
+        srcOffset++; // skip HC (header checksum)
+
+        if (srcOffset >= source.Length)
+            return false;
+
+        int dstOffset = 0;
+
+        // Read blocks until end mark (block size = 0)
+        while (srcOffset + 4 <= source.Length)
+        {
+            uint blockHeader = BinaryPrimitives.ReadUInt32LittleEndian(source.Slice(srcOffset));
+            srcOffset += 4;
+
+            if (blockHeader == 0)
+                break; // end mark
+
+            bool isUncompressed = (blockHeader & 0x80000000) != 0;
+            int blockSize = (int)(blockHeader & 0x7FFFFFFF);
+
+            if (srcOffset + blockSize > source.Length)
+                return false;
+
+            if (isUncompressed)
+            {
+                if (dstOffset + blockSize > destination.Length)
+                    return false;
+                source.Slice(srcOffset, blockSize).CopyTo(destination.Slice(dstOffset));
+                dstOffset += blockSize;
+            }
+            else
+            {
+                int decoded = LZ4Codec.Decode(
+                    source.Slice(srcOffset, blockSize),
+                    destination.Slice(dstOffset));
+                if (decoded < 0)
+                    return false;
+                dstOffset += decoded;
+            }
+
+            srcOffset += blockSize;
+
+            if (hasBlockChecksum)
+                srcOffset += 4; // skip block checksum
         }
 
         bytesWritten = dstOffset;

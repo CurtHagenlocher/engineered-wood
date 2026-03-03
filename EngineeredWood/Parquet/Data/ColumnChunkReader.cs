@@ -48,7 +48,21 @@ internal static class ColumnChunkReader
 
         while (valuesRead < columnMeta.NumValues && pos < data.Length)
         {
-            var pageHeader = PageHeaderDecoder.Decode(data.Slice(pos), out int headerSize);
+            PageHeader pageHeader;
+            int headerSize;
+
+            try
+            {
+                pageHeader = PageHeaderDecoder.Decode(data.Slice(pos), out headerSize);
+            }
+            catch (ParquetFormatException ex)
+            {
+                throw new ParquetFormatException(
+                    $"Column '{string.Join(".", column.Path)}': corrupted page header " +
+                    $"at byte offset {pos} ({valuesRead}/{columnMeta.NumValues} values read).",
+                    ex);
+            }
+
             pos += headerSize;
 
             var pageData = data.Slice(pos, pageHeader.CompressedPageSize);
@@ -74,6 +88,14 @@ internal static class ColumnChunkReader
                     // Skip index pages and unknown page types
                     break;
             }
+        }
+
+        if (valuesRead < columnMeta.NumValues)
+        {
+            throw new ParquetFormatException(
+                $"Column '{string.Join(".", column.Path)}': expected {columnMeta.NumValues} " +
+                $"values but only read {valuesRead}. The column data may be corrupted or " +
+                $"truncated. To skip this column, pass a columnNames list excluding it.");
         }
 
         int[]? defLevels = null;
@@ -167,30 +189,32 @@ internal static class ColumnChunkReader
         try
         {
             int offset = 0;
+            var repEncoding = dataHeader.RepetitionLevelEncoding;
+            var defEncoding = dataHeader.DefinitionLevelEncoding;
 
             // Decode repetition levels
             if (column.MaxRepetitionLevel > 0)
             {
                 var repDest = state.ReserveRepLevels(numValues);
-                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxRepetitionLevel, numValues, repDest);
+                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxRepetitionLevel, numValues, repDest, repEncoding);
             }
             else
             {
                 var repLevels = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
-                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), 0, numValues, repLevels);
+                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), 0, numValues, repLevels, repEncoding);
             }
 
             // Decode definition levels directly into native buffer
             if (column.MaxDefinitionLevel > 0)
             {
                 var defDest = state.ReserveDefLevels(numValues);
-                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxDefinitionLevel, numValues, defDest);
+                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), column.MaxDefinitionLevel, numValues, defDest, defEncoding);
             }
             else
             {
                 // Skip def level decoding — no levels to write
                 var tempDef = numValues <= 1024 ? stackalloc int[numValues] : new int[numValues];
-                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), 0, numValues, tempDef);
+                offset += LevelDecoder.DecodeV1(pageData.Slice(offset), 0, numValues, tempDef, defEncoding);
             }
 
             // Count non-null values

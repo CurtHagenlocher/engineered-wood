@@ -50,6 +50,7 @@ internal static class ArrowArrayBuilder
             Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
                 => BuildDecimalArray(state, arrowType, numValues, dense: true),
             FixedSizeBinaryType fsb => BuildDenseFixedSizeBinaryArray(state, numValues, fsb),
+            NullType => BuildNullArray(numValues),
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for dense array building."),
         };
@@ -281,9 +282,15 @@ internal static class ArrowArrayBuilder
             Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
                 => BuildDecimalArray(state, arrowType, rowCount, dense: false),
             FixedSizeBinaryType fsb => BuildFixedSizeBinaryArray(state, rowCount, fsb),
+            NullType => BuildNullArray(rowCount),
             _ => throw new NotSupportedException(
                 $"Arrow type '{arrowType.Name}' is not supported for array building."),
         };
+    }
+
+    private static IArrowArray BuildNullArray(int length)
+    {
+        return new NullArray(length);
     }
 
     private static IArrowArray BuildFixedArray<T>(ColumnBuildState state, IArrowType arrowType, int rowCount)
@@ -977,20 +984,22 @@ internal sealed class ColumnBuildState : IDisposable
     /// <summary>Gets a typed span over the dense value data (for the build phase).</summary>
     public ReadOnlySpan<T> GetValueSpan<T>() where T : unmanaged
     {
-        var bytes = _valueBuffer!.ByteSpan.Slice(0, _valueByteOffset);
+        if (_valueBuffer == null) return ReadOnlySpan<T>.Empty;
+        var bytes = _valueBuffer.ByteSpan.Slice(0, _valueByteOffset);
         return MemoryMarshal.Cast<byte, T>(bytes);
     }
 
     /// <summary>Gets a span over the raw value bytes (for boolean and fixed-size binary build).</summary>
     public ReadOnlySpan<byte> ValueByteSpan =>
-        _valueBuffer!.ByteSpan.Slice(0, _physicalType == PhysicalType.Boolean
+        _valueBuffer == null ? ReadOnlySpan<byte>.Empty
+        : _valueBuffer.ByteSpan.Slice(0, _physicalType == PhysicalType.Boolean
             ? (_boolBitOffset + 7) / 8
             : _valueByteOffset);
 
     /// <summary>Transfers the value buffer to an ArrowBuffer.</summary>
     public ArrowBuffer BuildValueBuffer()
     {
-        return _valueBuffer!.Build();
+        return _valueBuffer?.Build() ?? ArrowBuffer.Empty;
     }
 
     /// <summary>Disposes the value buffer (after data has been copied elsewhere).</summary>

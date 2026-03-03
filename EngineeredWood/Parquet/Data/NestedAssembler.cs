@@ -181,6 +181,15 @@ internal static class NestedAssembler
         var (offsets, bitmap, nullCount, elementCount) = BuildOffsetsAndBitmap(
             repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
 
+        // Filter phantom entries (outer null/empty list markers) before inner recursive assembly
+        var keepIndices = ComputeKeepIndices(defLevels, emptyDefThreshold, numValues);
+        if (keepIndices != null)
+        {
+            int subtreeLeafEnd = firstLeafIndex + CountLeaves(repeatedChild);
+            FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
+                keepIndices, firstLeafIndex, subtreeLeafEnd);
+        }
+
         // Determine element node and assemble element array
         IArrowArray elementArray;
         Apache.Arrow.Field elementField;
@@ -270,6 +279,15 @@ internal static class NestedAssembler
         // Build offsets FIRST to determine elementCount for inner assembly
         var (offsets, bitmap, nullCount, elementCount) = BuildOffsetsAndBitmap(
             repLevels, defLevels, nullDefThreshold, emptyDefThreshold, parentCount, numValues, repThreshold);
+
+        // Filter phantom entries (outer null/empty map markers) before inner recursive assembly
+        var keepIndices = ComputeKeepIndices(defLevels, emptyDefThreshold, numValues);
+        if (keepIndices != null)
+        {
+            int subtreeLeafEnd = firstLeafIndex + CountLeaves(keyValueGroup);
+            FilterSubtree(ref leafArrays, ref leafDefLevels, ref leafRepLevels,
+                keepIndices, firstLeafIndex, subtreeLeafEnd);
+        }
 
         // Assemble key and value arrays with elementCount as parentCount
         var keyNode = keyValueGroup.Children[0];
@@ -584,6 +602,8 @@ internal static class NestedAssembler
                 return TakeFixedBytes(source, indices, count, 32);
             case FixedSizeBinaryArray fsb:
                 return TakeFixedBytes(source, indices, count, ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth);
+            case NullArray:
+                return new NullArray(count);
             default:
                 throw new NotSupportedException(
                     $"TakeArray not supported for {source.GetType().Name}");
@@ -736,6 +756,82 @@ internal static class NestedAssembler
 
         var data = new ArrayData(arrowType, count, nullCount, 0, buffers);
         return ArrowArrayFactory.BuildArray(data);
+    }
+
+    /// <summary>
+    /// Recursively counts the number of leaf nodes in a schema subtree.
+    /// </summary>
+    private static int CountLeaves(SchemaNode node)
+    {
+        if (node.IsLeaf) return 1;
+        int count = 0;
+        for (int i = 0; i < node.Children.Count; i++)
+            count += CountLeaves(node.Children[i]);
+        return count;
+    }
+
+    /// <summary>
+    /// Returns indices where defLevels[i] >= threshold (entries that belong to actual elements,
+    /// not phantom null/empty markers from an outer list). Returns null if all entries qualify.
+    /// </summary>
+    private static int[]? ComputeKeepIndices(int[]? defLevels, int threshold, int numValues)
+    {
+        if (defLevels == null) return null;
+
+        int keepCount = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] >= threshold)
+                keepCount++;
+        }
+
+        if (keepCount == numValues) return null; // No phantoms
+
+        var indices = new int[keepCount];
+        int idx = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] >= threshold)
+                indices[idx++] = i;
+        }
+        return indices;
+    }
+
+    /// <summary>
+    /// Extracts entries at the given keep positions from a level array.
+    /// </summary>
+    private static int[]? FilterLevelArray(int[]? levels, int[] keepIndices)
+    {
+        if (levels == null) return null;
+
+        var filtered = new int[keepIndices.Length];
+        for (int i = 0; i < keepIndices.Length; i++)
+            filtered[i] = levels[keepIndices[i]];
+        return filtered;
+    }
+
+    /// <summary>
+    /// Filters leaf arrays, def levels, and rep levels for leaves in [startLeaf, endLeaf)
+    /// by removing phantom entries (positions not in keepIndices). Creates shallow clones
+    /// of the arrays so that the caller's originals are not modified.
+    /// </summary>
+    private static void FilterSubtree(
+        ref IArrowArray[] leafArrays,
+        ref int[]?[] leafDefLevels,
+        ref int[]?[] leafRepLevels,
+        int[] keepIndices,
+        int startLeaf, int endLeaf)
+    {
+        leafArrays = (IArrowArray[])leafArrays.Clone();
+        leafDefLevels = (int[]?[])leafDefLevels.Clone();
+        leafRepLevels = (int[]?[])leafRepLevels.Clone();
+
+        for (int i = startLeaf; i < endLeaf; i++)
+        {
+            leafDefLevels[i] = FilterLevelArray(leafDefLevels[i], keepIndices);
+            leafRepLevels[i] = FilterLevelArray(leafRepLevels[i], keepIndices);
+            leafArrays[i] = TakeArray(leafArrays[i], keepIndices, keepIndices.Length);
+        }
     }
 
     /// <summary>
