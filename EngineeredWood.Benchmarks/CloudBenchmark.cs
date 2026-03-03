@@ -163,48 +163,29 @@ public static class CloudBenchmark
     private static void ReadParquetSharpColumn(
         ParquetSharp.ColumnReader col, long numRows)
     {
-        // ParquetSharp's LogicalReader needs the concrete type. We detect from
-        // the physical type + logical annotation and read the most common combos.
-        var descriptor = col.ColumnDescriptor;
-        var physType = descriptor.PhysicalType;
-        var logType = descriptor.LogicalType;
+        // Use the non-generic LogicalReader so ParquetSharp resolves the correct
+        // element type (e.g. DateTimeNanos for TIMESTAMP columns) automatically.
+        using var logicalReader = col.LogicalReader();
+        logicalReader.Apply(new DrainVisitor(numRows));
+    }
 
-        // Determine nullability from schema: max def level > 0 means optional
-        bool nullable = descriptor.MaxDefinitionLevel > 0;
+    /// <summary>
+    /// Visitor that reads all values from a ParquetSharp LogicalColumnReader
+    /// regardless of the element type. This avoids InvalidCastException when
+    /// the column's logical type maps to a ParquetSharp-specific CLR type
+    /// (e.g. DateTimeNanos, TimeSpanNanos).
+    /// </summary>
+    private sealed class DrainVisitor : ParquetSharp.ILogicalColumnReaderVisitor<bool>
+    {
+        private readonly long _numRows;
+        public DrainVisitor(long numRows) => _numRows = numRows;
 
-        switch (physType)
+        public bool OnLogicalColumnReader<TElement>(
+            ParquetSharp.LogicalColumnReader<TElement> columnReader)
         {
-            case ParquetSharp.PhysicalType.Boolean:
-                if (nullable) { using var r = col.LogicalReader<bool?>(); r.ReadBatch(new bool?[numRows]); }
-                else { using var r = col.LogicalReader<bool>(); r.ReadBatch(new bool[numRows]); }
-                break;
-            case ParquetSharp.PhysicalType.Int32:
-                if (nullable) { using var r = col.LogicalReader<int?>(); r.ReadBatch(new int?[numRows]); }
-                else { using var r = col.LogicalReader<int>(); r.ReadBatch(new int[numRows]); }
-                break;
-            case ParquetSharp.PhysicalType.Int64:
-                if (nullable) { using var r = col.LogicalReader<long?>(); r.ReadBatch(new long?[numRows]); }
-                else { using var r = col.LogicalReader<long>(); r.ReadBatch(new long[numRows]); }
-                break;
-            case ParquetSharp.PhysicalType.Int96:
-                // Deprecated timestamp type — read as raw bytes
-                using (var r = col.LogicalReader<ParquetSharp.Int96>())
-                    r.ReadBatch(new ParquetSharp.Int96[numRows]);
-                break;
-            case ParquetSharp.PhysicalType.Float:
-                if (nullable) { using var r = col.LogicalReader<float?>(); r.ReadBatch(new float?[numRows]); }
-                else { using var r = col.LogicalReader<float>(); r.ReadBatch(new float[numRows]); }
-                break;
-            case ParquetSharp.PhysicalType.Double:
-                if (nullable) { using var r = col.LogicalReader<double?>(); r.ReadBatch(new double?[numRows]); }
-                else { using var r = col.LogicalReader<double>(); r.ReadBatch(new double[numRows]); }
-                break;
-            case ParquetSharp.PhysicalType.ByteArray:
-            case ParquetSharp.PhysicalType.FixedLenByteArray:
-                // byte[] is always reference-typed (nullable)
-                using (var r = col.LogicalReader<byte[]>())
-                    r.ReadBatch(new byte[numRows][]);
-                break;
+            var buffer = new TElement[_numRows];
+            columnReader.ReadBatch(buffer);
+            return true;
         }
     }
 
