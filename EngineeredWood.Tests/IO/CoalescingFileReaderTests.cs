@@ -35,13 +35,12 @@ public class CoalescingFileReaderTests
         {
             Assert.Equal(2, results.Count);
 
-            // Inner should have received a single merged request
-            Assert.Equal(1, inner.BatchCallCount);
-            Assert.Single(inner.LastBatchRanges!);
+            // Inner should have received a single merged ReadAsync call
+            Assert.Equal(1, inner.ReadCallCount);
 
-            // Merged range should cover [0, 70)
-            Assert.Equal(0, inner.LastBatchRanges![0].Offset);
-            Assert.Equal(70, inner.LastBatchRanges![0].Length);
+            // Verify the merged range covers [0, 70)
+            Assert.Equal(0, inner.LastReadRange!.Value.Offset);
+            Assert.Equal(70, inner.LastReadRange!.Value.Length);
         }
         finally
         {
@@ -68,10 +67,9 @@ public class CoalescingFileReaderTests
         try
         {
             Assert.Equal(2, results.Count);
-            Assert.Equal(1, inner.BatchCallCount);
 
-            // Should have two separate ranges in the batch
-            Assert.Equal(2, inner.LastBatchRanges!.Count);
+            // Should have two separate ReadAsync calls (not merged)
+            Assert.Equal(2, inner.ReadCallCount);
         }
         finally
         {
@@ -163,8 +161,8 @@ public class CoalescingFileReaderTests
         try
         {
             Assert.Equal(2, results.Count);
-            // Should not be merged due to MaxRequestBytes
-            Assert.Equal(2, inner.LastBatchRanges!.Count);
+            // Should not be merged due to MaxRequestBytes — two separate ReadAsync calls
+            Assert.Equal(2, inner.ReadCallCount);
         }
         finally
         {
@@ -180,10 +178,10 @@ public class CoalescingFileReaderTests
     private sealed class FakeRandomAccessFile : IRandomAccessFile
     {
         private readonly long _length;
+        private int _readCallCount;
 
-        public int ReadCallCount { get; private set; }
-        public int BatchCallCount { get; private set; }
-        public IReadOnlyList<FileRange>? LastBatchRanges { get; private set; }
+        public int ReadCallCount => _readCallCount;
+        public FileRange? LastReadRange { get; private set; }
 
         public FakeRandomAccessFile(long length) => _length = length;
 
@@ -193,16 +191,14 @@ public class CoalescingFileReaderTests
         public ValueTask<IMemoryOwner<byte>> ReadAsync(
             FileRange range, CancellationToken cancellationToken = default)
         {
-            ReadCallCount++;
+            Interlocked.Increment(ref _readCallCount);
+            LastReadRange = range;
             return new(CreateBuffer(range));
         }
 
         public ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
             IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
         {
-            BatchCallCount++;
-            LastBatchRanges = ranges;
-
             var results = new IMemoryOwner<byte>[ranges.Count];
             for (int i = 0; i < ranges.Count; i++)
                 results[i] = CreateBuffer(ranges[i]);

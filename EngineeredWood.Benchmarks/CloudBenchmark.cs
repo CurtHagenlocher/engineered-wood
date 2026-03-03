@@ -87,13 +87,8 @@ public static class CloudBenchmark
         Console.WriteLine($"{"Method",-52} {"Mean",10} {"Min",10} {"Max",10}");
         Console.WriteLine(new string('-', 84));
 
-        // --- EngineeredWood (direct, no coalescing) ---
-        await RunEW("EW (direct)", blobClient, fileSize, rowGroupIndex, iterations,
-            coalesce: false);
-
-        // --- EngineeredWood (with coalescing) ---
-        await RunEW("EW (coalesced)", blobClient, fileSize, rowGroupIndex, iterations,
-            coalesce: true);
+        // --- EngineeredWood ---
+        await RunEW(blobClient, fileSize, rowGroupIndex, iterations);
 
         // --- ParquetSharp (via Azure BlobClient.OpenRead stream) ---
         await RunParquetSharp(blobClient, rowGroupIndex, iterations);
@@ -113,8 +108,8 @@ public static class CloudBenchmark
     }
 
     private static async Task RunEW(
-        string label, BlobClient blobClient, long fileSize,
-        int rowGroupIndex, int iterations, bool coalesce)
+        BlobClient blobClient, long fileSize,
+        int rowGroupIndex, int iterations)
     {
         var times = new double[iterations];
         var sw = new Stopwatch();
@@ -122,11 +117,7 @@ public static class CloudBenchmark
         for (int i = 0; i < iterations; i++)
         {
             sw.Restart();
-            IRandomAccessFile file = new AzureBlobRandomAccessFile(blobClient, fileSize);
-            if (coalesce)
-                file = new CoalescingFileReader(file);
-
-            await using (file)
+            await using IRandomAccessFile file = new AzureBlobRandomAccessFile(blobClient, fileSize);
             using (var reader = new ParquetFileReader(file))
             {
                 using var batch = await reader.ReadRowGroupAsync(rowGroupIndex);
@@ -136,7 +127,7 @@ public static class CloudBenchmark
             Console.Write(".");
         }
 
-        PrintResult(label, times);
+        PrintResult("EngineeredWood", times);
     }
 
     private static async Task RunParquetSharp(

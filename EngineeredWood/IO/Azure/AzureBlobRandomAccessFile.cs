@@ -8,6 +8,7 @@ namespace EngineeredWood.IO.Azure;
 /// <see cref="IRandomAccessFile"/> implementation for Azure Blob Storage.
 /// Uses <see cref="BlobClient.DownloadStreamingAsync"/> with HTTP range requests.
 /// Concurrent requests are throttled via a semaphore.
+/// Multi-range reads automatically coalesce nearby ranges to reduce HTTP round-trips.
 /// </summary>
 public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
 {
@@ -15,17 +16,20 @@ public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
     private readonly BufferAllocator _allocator;
     private readonly SemaphoreSlim _semaphore;
     private readonly bool _ownsSemaphore;
+    private readonly CoalescingOptions _coalescingOptions;
     private long _cachedLength = -1;
 
     public AzureBlobRandomAccessFile(
         BlobClient blobClient,
         BufferAllocator? allocator = null,
-        int maxConcurrency = 16)
+        int maxConcurrency = 16,
+        CoalescingOptions? coalescingOptions = null)
     {
         _blobClient = blobClient;
         _allocator = allocator ?? PooledBufferAllocator.Default;
         _semaphore = new SemaphoreSlim(maxConcurrency, maxConcurrency);
         _ownsSemaphore = true;
+        _coalescingOptions = coalescingOptions ?? new CoalescingOptions();
     }
 
     /// <summary>
@@ -37,8 +41,9 @@ public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
         BlobClient blobClient,
         long knownLength,
         BufferAllocator? allocator = null,
-        int maxConcurrency = 16)
-        : this(blobClient, allocator, maxConcurrency)
+        int maxConcurrency = 16,
+        CoalescingOptions? coalescingOptions = null)
+        : this(blobClient, allocator, maxConcurrency, coalescingOptions)
     {
         _cachedLength = knownLength;
     }
@@ -71,44 +76,13 @@ public sealed class AzureBlobRandomAccessFile : IRandomAccessFile
         }
     }
 
-    public async ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
+    public ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
         IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
     {
-        if (ranges.Count == 0)
-            return [];
-
-        if (ranges.Count == 1)
-        {
-            IMemoryOwner<byte> single = await ReadAsync(ranges[0], cancellationToken)
-                .ConfigureAwait(false);
-            return [single];
-        }
-
-        var buffers = new IMemoryOwner<byte>[ranges.Count];
-        try
-        {
-            var tasks = new Task[ranges.Count];
-            for (int i = 0; i < ranges.Count; i++)
-            {
-                int index = i;
-                FileRange range = ranges[index];
-                tasks[index] = Task.Run(async () =>
-                {
-                    IMemoryOwner<byte> buf = await ReadAsync(range, cancellationToken)
-                        .ConfigureAwait(false);
-                    buffers[index] = buf;
-                }, cancellationToken);
-            }
-
-            await Task.WhenAll(tasks).ConfigureAwait(false);
-            return buffers;
-        }
-        catch
-        {
-            foreach (IMemoryOwner<byte>? buf in buffers)
-                buf?.Dispose();
-            throw;
-        }
+        // Delegate to CoalescingFileReader which merges nearby ranges into fewer
+        // large HTTP requests, then slices the results back out.
+        var coalescer = new CoalescingFileReader(this, _coalescingOptions, _allocator);
+        return coalescer.ReadRangesAsync(ranges, cancellationToken);
     }
 
     private async ValueTask<IMemoryOwner<byte>> DownloadRangeAsync(

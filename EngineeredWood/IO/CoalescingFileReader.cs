@@ -32,8 +32,15 @@ public sealed class CoalescingFileReader : IRandomAccessFile
     public async ValueTask<IReadOnlyList<IMemoryOwner<byte>>> ReadRangesAsync(
         IReadOnlyList<FileRange> ranges, CancellationToken cancellationToken = default)
     {
-        if (ranges.Count <= 1)
-            return await _inner.ReadRangesAsync(ranges, cancellationToken).ConfigureAwait(false);
+        if (ranges.Count == 0)
+            return [];
+
+        if (ranges.Count == 1)
+        {
+            IMemoryOwner<byte> single = await _inner.ReadAsync(ranges[0], cancellationToken)
+                .ConfigureAwait(false);
+            return [single];
+        }
 
         // Build index-sorted pairs so we can sort by offset and restore original order
         var indexed = new (FileRange Range, int OriginalIndex)[ranges.Count];
@@ -45,13 +52,40 @@ public sealed class CoalescingFileReader : IRandomAccessFile
         // Merge ranges that are within the gap threshold
         var mergedGroups = BuildMergedGroups(indexed);
 
-        // Fetch merged ranges
-        var mergedRanges = new FileRange[mergedGroups.Count];
-        for (int i = 0; i < mergedGroups.Count; i++)
-            mergedRanges[i] = mergedGroups[i].MergedRange;
+        // Fetch each merged range individually (in parallel). Using ReadAsync
+        // rather than ReadRangesAsync avoids recursion when this coalescer
+        // is composed inside another IRandomAccessFile implementation.
+        var mergedBuffers = new IMemoryOwner<byte>[mergedGroups.Count];
+        if (mergedGroups.Count == 1)
+        {
+            mergedBuffers[0] = await _inner.ReadAsync(mergedGroups[0].MergedRange, cancellationToken)
+                .ConfigureAwait(false);
+        }
+        else
+        {
+            var tasks = new Task[mergedGroups.Count];
+            for (int i = 0; i < mergedGroups.Count; i++)
+            {
+                int idx = i;
+                tasks[idx] = Task.Run(async () =>
+                {
+                    mergedBuffers[idx] = await _inner
+                        .ReadAsync(mergedGroups[idx].MergedRange, cancellationToken)
+                        .ConfigureAwait(false);
+                }, cancellationToken);
+            }
 
-        IReadOnlyList<IMemoryOwner<byte>> mergedBuffers = await _inner
-            .ReadRangesAsync(mergedRanges, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await Task.WhenAll(tasks).ConfigureAwait(false);
+            }
+            catch
+            {
+                foreach (IMemoryOwner<byte>? buf in mergedBuffers)
+                    buf?.Dispose();
+                throw;
+            }
+        }
 
         // Slice results back into individual buffers in original order
         var results = new IMemoryOwner<byte>[ranges.Count];
