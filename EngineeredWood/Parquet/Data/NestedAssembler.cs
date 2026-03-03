@@ -558,9 +558,15 @@ internal static class NestedAssembler
                 return TakeFixedWidth<float>(a, indices, count, a.Data.DataType);
             case DoubleArray a:
                 return TakeFixedWidth<double>(a, indices, count, a.Data.DataType);
+            case HalfFloatArray a:
+                return TakeFixedWidth<Half>(a, indices, count, a.Data.DataType);
             case Date32Array a:
                 return TakeFixedWidth<int>(a, indices, count, a.Data.DataType);
             case TimestampArray a:
+                return TakeFixedWidth<long>(a, indices, count, a.Data.DataType);
+            case Time32Array a:
+                return TakeFixedWidth<int>(a, indices, count, a.Data.DataType);
+            case Time64Array a:
                 return TakeFixedWidth<long>(a, indices, count, a.Data.DataType);
             case BooleanArray a:
                 return TakeBoolean(a, indices, count);
@@ -568,9 +574,17 @@ internal static class NestedAssembler
                 return TakeVarBinary(a, indices, count, Apache.Arrow.Types.StringType.Default);
             case BinaryArray a:
                 return TakeVarBinary(a, indices, count, BinaryType.Default);
+            case Decimal32Array:
+                return TakeFixedBytes(source, indices, count, 4);
+            case Decimal64Array:
+                return TakeFixedBytes(source, indices, count, 8);
+            case Decimal128Array:
+                return TakeFixedBytes(source, indices, count, 16);
+            case Decimal256Array:
+                return TakeFixedBytes(source, indices, count, 32);
+            case FixedSizeBinaryArray fsb:
+                return TakeFixedBytes(source, indices, count, ((FixedSizeBinaryType)fsb.Data.DataType).ByteWidth);
             default:
-                // Fallback: use ArrowArrayConcatenator or just return as-is
-                // This shouldn't happen for supported types
                 throw new NotSupportedException(
                     $"TakeArray not supported for {source.GetType().Name}");
         }
@@ -608,6 +622,36 @@ internal static class NestedAssembler
             : new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBytes) };
 
         var data = new ArrayData(arrowType, count, nullCount, offset: 0, buffers);
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
+    private static IArrowArray TakeFixedBytes(IArrowArray source, int[] indices, int count, int byteWidth)
+    {
+        var valueBytes = new byte[count * byteWidth];
+        var bitmapBytes = new byte[(count + 7) / 8];
+        int nullCount = 0;
+        var srcSpan = source.Data.Buffers[1].Span;
+
+        for (int i = 0; i < count; i++)
+        {
+            int srcIdx = indices[i];
+            if (!source.IsNull(srcIdx))
+            {
+                srcSpan.Slice(srcIdx * byteWidth, byteWidth)
+                    .CopyTo(valueBytes.AsSpan(i * byteWidth, byteWidth));
+                bitmapBytes[i >> 3] |= (byte)(1 << (i & 7));
+            }
+            else
+            {
+                nullCount++;
+            }
+        }
+
+        var buffers = nullCount > 0
+            ? new[] { new ArrowBuffer(bitmapBytes), new ArrowBuffer(valueBytes) }
+            : new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBytes) };
+
+        var data = new ArrayData(source.Data.DataType, count, nullCount, offset: 0, buffers);
         return ArrowArrayFactory.BuildArray(data);
     }
 
