@@ -145,9 +145,39 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Reads each column sequentially: read I/O buffer, decode, release buffer before the next.
-    /// Only one column's I/O buffer in memory at a time.
+    /// Reads a single row group and returns columns as flat <see cref="ParquetColumn"/> values
+    /// (dense values + definition levels), without assembling Arrow arrays.
+    /// Use this to measure the "Arrow tax" — the scatter/bitmap cost of nullable columns.
+    /// Only flat (non-repeated) schemas are supported.
     /// </summary>
+    public async ValueTask<ParquetColumn[]> ReadRowGroupAsColumnsAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default)
+    {
+        var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
+            .ConfigureAwait(false);
+
+        var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken)
+            .ConfigureAwait(false);
+
+        try
+        {
+            var results = new ParquetColumn[ctx.Count];
+            Parallel.For(0, ctx.Count, i =>
+            {
+                results[i] = ColumnChunkReader.ReadColumnRaw(
+                    buffers[i].Memory.Span, ctx.Columns[i],
+                    ctx.Chunks[i].MetaData!, ctx.RowCount);
+            });
+            return results;
+        }
+        finally
+        {
+            for (int i = 0; i < buffers.Count; i++)
+                buffers[i].Dispose();
+        }
+    }
     internal async ValueTask<RecordBatch> ReadRowGroupIncrementalAsync(
         int rowGroupIndex,
         IReadOnlyList<string>? columnNames = null,

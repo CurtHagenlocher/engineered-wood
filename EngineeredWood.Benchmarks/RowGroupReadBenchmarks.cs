@@ -67,6 +67,14 @@ public class RowGroupReadBenchmarks
         return await reader.ReadRowGroupIncrementalParallelAsync(0).ConfigureAwait(false);
     }
 
+    [Benchmark(Description = "EW_AsColumns (no Arrow)")]
+    public async Task<ParquetColumn[]> EW_AsColumns()
+    {
+        using var file = new LocalRandomAccessFile(FilePath);
+        using var reader = new ParquetFileReader(file);
+        return await reader.ReadRowGroupAsColumnsAsync(0).ConfigureAwait(false);
+    }
+
     [Benchmark(Description = "ParquetSharp")]
     public void ParquetSharp_ReadRowGroup()
     {

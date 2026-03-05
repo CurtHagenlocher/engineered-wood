@@ -1044,6 +1044,64 @@ internal sealed class ColumnBuildState : IDisposable
         _offsetsBuffer?.Dispose();
         _dataBuffer?.Dispose();
     }
+
+    /// <summary>
+    /// Converts accumulated column state into a <see cref="ParquetColumn"/> by copying
+    /// the dense values and definition levels into managed arrays.
+    /// This is the flat "DataColumn-like" format, without the Arrow scatter/bitmap step.
+    /// </summary>
+    public ParquetColumn ToParquetColumn(int rowCount)
+    {
+        int[]? defLevels = IsNullable ? DefLevelSpan.ToArray() : null;
+        int valueCount = _valueCount;
+
+        System.Array data = _physicalType switch
+        {
+            PhysicalType.Int32 => GetValueSpan<int>().ToArray(),
+            PhysicalType.Int64 => GetValueSpan<long>().ToArray(),
+            PhysicalType.Float => GetValueSpan<float>().ToArray(),
+            PhysicalType.Double => GetValueSpan<double>().ToArray(),
+            PhysicalType.Boolean => BuildBoolArray(),
+            PhysicalType.ByteArray => BuildByteArrayArray(),
+            PhysicalType.FixedLenByteArray => BuildFixedLenByteArrayArray(),
+            _ => GetValueSpan<byte>().ToArray(),
+        };
+
+        return new ParquetColumn(data, defLevels, MaxDefLevel, rowCount, valueCount);
+    }
+
+    private bool[] BuildBoolArray()
+    {
+        var result = new bool[_valueCount];
+        var bytes = ValueByteSpan;
+        for (int i = 0; i < _valueCount; i++)
+            result[i] = (bytes[i >> 3] & (1 << (i & 7))) != 0;
+        return result;
+    }
+
+    private byte[][] BuildByteArrayArray()
+    {
+        var result = new byte[_valueCount][];
+        var offsets = GetOffsetsSpan();
+        var data = GetDataSpan();
+        for (int i = 0; i < _valueCount; i++)
+        {
+            int start = offsets[i];
+            int length = offsets[i + 1] - start;
+            result[i] = data.Slice(start, length).ToArray();
+        }
+        return result;
+    }
+
+    private byte[][] BuildFixedLenByteArrayArray()
+    {
+        if (_elementSize == 0 || _valueCount == 0) return [];
+        var result = new byte[_valueCount][];
+        var bytes = GetValueSpan<byte>();
+        for (int i = 0; i < _valueCount; i++)
+            result[i] = bytes.Slice(i * _elementSize, _elementSize).ToArray();
+        return result;
+    }
 }
 
 /// <summary>

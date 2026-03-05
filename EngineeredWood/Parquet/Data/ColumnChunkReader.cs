@@ -121,6 +121,50 @@ internal static class ColumnChunkReader
         return new ColumnResult(array, defLevels, repLevels);
     }
 
+    /// <summary>
+    /// Reads all pages in a column chunk and returns the data as a <see cref="ParquetColumn"/>
+    /// (dense values + optional definition levels), bypassing Arrow array assembly.
+    /// This is used to measure the "Arrow tax" — the cost of scatter/bitmap construction.
+    /// Only flat (non-repeated) columns are supported.
+    /// </summary>
+    internal static ParquetColumn ReadColumnRaw(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        ColumnMetaData columnMeta,
+        int rowCount)
+    {
+        using var state = new ColumnBuildState(
+            column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel,
+            rowCount);
+        DictionaryDecoder? dictionary = null;
+
+        int pos = 0;
+        long valuesRead = 0;
+
+        while (valuesRead < columnMeta.NumValues && pos < data.Length)
+        {
+            var pageHeader = PageHeaderDecoder.Decode(data.Slice(pos), out int headerSize);
+            pos += headerSize;
+            var pageData = data.Slice(pos, pageHeader.CompressedPageSize);
+            pos += pageHeader.CompressedPageSize;
+
+            switch (pageHeader.Type)
+            {
+                case PageType.DictionaryPage:
+                    dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                    break;
+                case PageType.DataPage:
+                    valuesRead += ReadDataPageV1(pageHeader, pageData, column, columnMeta, dictionary, state);
+                    break;
+                case PageType.DataPageV2:
+                    valuesRead += ReadDataPageV2(pageHeader, pageData, column, columnMeta, dictionary, state);
+                    break;
+            }
+        }
+
+        return state.ToParquetColumn(rowCount);
+    }
+
     private static DictionaryDecoder ReadDictionaryPage(
         PageHeader header,
         ReadOnlySpan<byte> compressedData,
