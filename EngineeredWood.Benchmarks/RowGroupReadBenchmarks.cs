@@ -1,5 +1,6 @@
 using BenchmarkDotNet.Attributes;
 using EngineeredWood.IO.Local;
+using EngineeredWood.Parquet;
 using Parquet;
 using Parquet.Schema;
 
