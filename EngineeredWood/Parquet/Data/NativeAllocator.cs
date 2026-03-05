@@ -15,7 +15,7 @@ namespace EngineeredWood.Parquet.Data;
 internal sealed class NativeMemoryManager : MemoryManager<byte>
 {
     private unsafe void* _pointer;
-    private readonly int _length;
+    private int _length;
 
     public unsafe NativeMemoryManager(int length, int alignment, bool zeroFill)
     {
@@ -53,6 +53,16 @@ internal sealed class NativeMemoryManager : MemoryManager<byte>
                 _pointer = null;
             }
         }
+    }
+
+    /// <summary>
+    /// Reallocates the native buffer to <paramref name="newLength"/> bytes in place,
+    /// preserving existing data. Equivalent to <c>_aligned_realloc</c>.
+    /// </summary>
+    public unsafe void Reallocate(int newLength)
+    {
+        _pointer = NativeMemory.AlignedRealloc(_pointer, (nuint)newLength, 64);
+        _length = newLength;
     }
 }
 
@@ -180,10 +190,20 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
 
         // Exponential growth (2x) to amortise repeated grows
         int newBytes = Math.Max(needed, _byteLength * 2);
-        var newOwner = NativeAllocator.Instance.Allocate(newBytes, zeroFill: false);
-        _owner!.Memory.Span.CopyTo(newOwner.Memory.Span);
-        _owner.Dispose();
-        _owner = newOwner;
+
+        if (_owner is NativeMemoryManager mgr)
+        {
+            // In-place realloc: OS can extend the block without a copy if space is available
+            mgr.Reallocate(newBytes);
+        }
+        else
+        {
+            var newOwner = NativeAllocator.Instance.Allocate(newBytes, zeroFill: false);
+            _owner!.Memory.Span.CopyTo(newOwner.Memory.Span);
+            _owner.Dispose();
+            _owner = newOwner;
+        }
+
         _byteLength = newBytes;
         Length = _byteLength / elementSize;
     }

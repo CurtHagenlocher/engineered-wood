@@ -165,6 +165,49 @@ internal static class ColumnChunkReader
         return state.ToParquetColumn(rowCount);
     }
 
+    /// <summary>
+    /// Reads and decodes all pages but produces no output — just returns the value count.
+    /// Used as a benchmark baseline to measure pure I/O + decode cost without any
+    /// output assembly (no scatter, no bitmap, no managed copies).
+    /// </summary>
+    internal static int ReadColumnDecodeOnly(
+        ReadOnlySpan<byte> data,
+        ColumnDescriptor column,
+        ColumnMetaData columnMeta,
+        int rowCount)
+    {
+        using var state = new ColumnBuildState(
+            column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel,
+            rowCount);
+        DictionaryDecoder? dictionary = null;
+
+        int pos = 0;
+        long valuesRead = 0;
+
+        while (valuesRead < columnMeta.NumValues && pos < data.Length)
+        {
+            var pageHeader = PageHeaderDecoder.Decode(data.Slice(pos), out int headerSize);
+            pos += headerSize;
+            var pageData = data.Slice(pos, pageHeader.CompressedPageSize);
+            pos += pageHeader.CompressedPageSize;
+
+            switch (pageHeader.Type)
+            {
+                case PageType.DictionaryPage:
+                    dictionary = ReadDictionaryPage(pageHeader, pageData, column, columnMeta);
+                    break;
+                case PageType.DataPage:
+                    valuesRead += ReadDataPageV1(pageHeader, pageData, column, columnMeta, dictionary, state);
+                    break;
+                case PageType.DataPageV2:
+                    valuesRead += ReadDataPageV2(pageHeader, pageData, column, columnMeta, dictionary, state);
+                    break;
+            }
+        }
+
+        return state.ValueCount;
+    }
+
     private static DictionaryDecoder ReadDictionaryPage(
         PageHeader header,
         ReadOnlySpan<byte> compressedData,

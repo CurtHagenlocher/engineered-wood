@@ -178,6 +178,45 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
                 buffers[i].Dispose();
         }
     }
+
+    /// <summary>
+    /// Reads and decodes all pages but produces no output — returns the total value count
+    /// across all columns. Used to benchmark pure decode cost without any output assembly.
+    /// </summary>
+    internal async ValueTask<int> ReadRowGroupDecodeOnlyAsync(
+        int rowGroupIndex,
+        IReadOnlyList<string>? columnNames = null,
+        CancellationToken cancellationToken = default)
+    {
+        var ctx = await PrepareRowGroupAsync(rowGroupIndex, columnNames, cancellationToken)
+            .ConfigureAwait(false);
+
+        var buffers = await _file.ReadRangesAsync(ctx.Ranges, cancellationToken)
+            .ConfigureAwait(false);
+
+        try
+        {
+            int total = 0;
+            Parallel.For(0, ctx.Count, i =>
+            {
+                int count = ColumnChunkReader.ReadColumnDecodeOnly(
+                    buffers[i].Memory.Span, ctx.Columns[i],
+                    ctx.Chunks[i].MetaData!, ctx.RowCount);
+                Interlocked.Add(ref total, count);
+            });
+            return total;
+        }
+        finally
+        {
+            for (int i = 0; i < buffers.Count; i++)
+                buffers[i].Dispose();
+        }
+    }
+
+    /// <summary>
+    /// Reads each column sequentially: read I/O buffer, decode, release buffer before the next.
+    /// Only one column's I/O buffer in memory at a time.
+    /// </summary>
     internal async ValueTask<RecordBatch> ReadRowGroupIncrementalAsync(
         int rowGroupIndex,
         IReadOnlyList<string>? columnNames = null,

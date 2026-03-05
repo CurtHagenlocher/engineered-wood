@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
@@ -776,12 +777,12 @@ internal sealed class ColumnBuildState : IDisposable
     internal readonly int MaxDefLevel;
     internal readonly int MaxRepLevel;
 
-    // Definition levels (nullable columns only)
-    private NativeBuffer<int>? _defLevels;
+    // Definition levels (nullable columns only) — pooled managed array, never transferred to Arrow
+    private int[]? _defLevels;
     private int _defLevelCount;
 
-    // Repetition levels (repeated columns only)
-    private NativeBuffer<int>? _repLevels;
+    // Repetition levels (repeated columns only) — pooled managed array, never transferred to Arrow
+    private int[]? _repLevels;
     private int _repLevelCount;
 
     // Value buffer: stores dense non-null values for fixed-width types and fixed-len byte arrays
@@ -826,13 +827,13 @@ internal sealed class ColumnBuildState : IDisposable
 
         if (maxDefLevel > 0)
         {
-            _defLevels = new NativeBuffer<int>(capacity, zeroFill: false);
+            _defLevels = ArrayPool<int>.Shared.Rent(capacity);
             _defLevelCount = 0;
         }
 
         if (maxRepLevel > 0)
         {
-            _repLevels = new NativeBuffer<int>(capacity, zeroFill: false);
+            _repLevels = ArrayPool<int>.Shared.Rent(capacity);
             _repLevelCount = 0;
         }
 
@@ -879,13 +880,13 @@ internal sealed class ColumnBuildState : IDisposable
 
     /// <summary>Returns true if the value at position <paramref name="rowIndex"/> is null.</summary>
     public bool IsNull(int rowIndex) =>
-        MaxDefLevel > 0 && _defLevels!.Span[rowIndex] < MaxDefLevel;
+        MaxDefLevel > 0 && _defLevels![rowIndex] < MaxDefLevel;
 
     /// <summary>Gets the definition levels span (for the build phase).</summary>
-    public ReadOnlySpan<int> DefLevelSpan => _defLevels!.Span.Slice(0, _defLevelCount);
+    public ReadOnlySpan<int> DefLevelSpan => _defLevels.AsSpan(0, _defLevelCount);
 
     /// <summary>Gets the repetition levels span (for the build phase).</summary>
-    public ReadOnlySpan<int> RepLevelSpan => _repLevels!.Span.Slice(0, _repLevelCount);
+    public ReadOnlySpan<int> RepLevelSpan => _repLevels.AsSpan(0, _repLevelCount);
 
     /// <summary>
     /// Reserves space for <paramref name="count"/> definition levels and returns a writable span.
@@ -893,7 +894,7 @@ internal sealed class ColumnBuildState : IDisposable
     public Span<int> ReserveDefLevels(int count)
     {
         if (_defLevels == null) return Span<int>.Empty;
-        var span = _defLevels.Span.Slice(_defLevelCount, count);
+        var span = _defLevels.AsSpan(_defLevelCount, count);
         _defLevelCount += count;
         return span;
     }
@@ -904,7 +905,7 @@ internal sealed class ColumnBuildState : IDisposable
     public Span<int> ReserveRepLevels(int count)
     {
         if (_repLevels == null) return Span<int>.Empty;
-        var span = _repLevels.Span.Slice(_repLevelCount, count);
+        var span = _repLevels.AsSpan(_repLevelCount, count);
         _repLevelCount += count;
         return span;
     }
@@ -1038,8 +1039,16 @@ internal sealed class ColumnBuildState : IDisposable
 
     public void Dispose()
     {
-        _defLevels?.Dispose();
-        _repLevels?.Dispose();
+        if (_defLevels != null)
+        {
+            ArrayPool<int>.Shared.Return(_defLevels);
+            _defLevels = null;
+        }
+        if (_repLevels != null)
+        {
+            ArrayPool<int>.Shared.Return(_repLevels);
+            _repLevels = null;
+        }
         _valueBuffer?.Dispose();
         _offsetsBuffer?.Dispose();
         _dataBuffer?.Dispose();
