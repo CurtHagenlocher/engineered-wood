@@ -51,6 +51,8 @@ internal static class ArrowArrayBuilder
             BinaryType => BuildDenseVarBinaryArray(state, arrowType, numValues),
             StringViewType => BuildDenseStringViewArray(state, arrowType, numValues),
             BinaryViewType => BuildDenseStringViewArray(state, arrowType, numValues),
+            LargeStringType => BuildDenseLargeVarBinaryArray(state, arrowType, numValues),
+            LargeBinaryType => BuildDenseLargeVarBinaryArray(state, arrowType, numValues),
             Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
                 => BuildDecimalArray(state, arrowType, numValues, dense: true),
             FixedSizeBinaryType fsb => BuildDenseFixedSizeBinaryArray(state, numValues, fsb),
@@ -74,6 +76,15 @@ internal static class ArrowArrayBuilder
         if (arrowType is StringType or BinaryType)
         {
             var offsetsBuffer = state.BuildOffsetsBuffer();
+            var dataBuffer = state.BuildDataBuffer();
+            var arrayData = new ArrayData(arrowType, numValues, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, offsetsBuffer, dataBuffer });
+            return ArrowArrayFactory.BuildArray(arrayData);
+        }
+
+        if (arrowType is LargeStringType or LargeBinaryType)
+        {
+            var offsetsBuffer = state.BuildLargeOffsetsBuffer();
             var dataBuffer = state.BuildDataBuffer();
             var arrayData = new ArrayData(arrowType, numValues, nullCount: 0, offset: 0,
                 new[] { ArrowBuffer.Empty, offsetsBuffer, dataBuffer });
@@ -294,6 +305,8 @@ internal static class ArrowArrayBuilder
             BinaryType => BuildBinaryArray(state, rowCount),
             StringViewType => BuildStringViewArray(state, rowCount),
             BinaryViewType => BuildBinaryViewArray(state, rowCount),
+            LargeStringType => BuildLargeStringArray(state, rowCount),
+            LargeBinaryType => BuildLargeBinaryArray(state, rowCount),
             Decimal32Type or Decimal64Type or Decimal128Type or Decimal256Type
                 => BuildDecimalArray(state, arrowType, rowCount, dense: false),
             FixedSizeBinaryType fsb => BuildFixedSizeBinaryArray(state, rowCount, fsb),
@@ -643,6 +656,107 @@ internal static class ArrowArrayBuilder
         return ArrowArrayFactory.BuildArray(data);
     }
 
+    private static IArrowArray BuildLargeStringArray(ColumnBuildState state, int rowCount) =>
+        BuildLargeVarBinaryArray(state, LargeStringType.Default, rowCount);
+
+    private static IArrowArray BuildLargeBinaryArray(ColumnBuildState state, int rowCount) =>
+        BuildLargeVarBinaryArray(state, LargeBinaryType.Default, rowCount);
+
+    private static IArrowArray BuildLargeVarBinaryArray(ColumnBuildState state, IArrowType arrowType, int rowCount)
+    {
+        if (!state.IsNullable)
+        {
+            var offsetsBuffer = state.BuildLargeOffsetsBuffer();
+            var dataBuffer = state.BuildDataBuffer();
+            var arrayData = new ArrayData(arrowType, rowCount, nullCount: 0, offset: 0,
+                new[] { ArrowBuffer.Empty, offsetsBuffer, dataBuffer });
+            return ArrowArrayFactory.BuildArray(arrayData);
+        }
+
+        return BuildNullableLargeVarBinaryArray(state, arrowType, rowCount);
+    }
+
+    private static IArrowArray BuildNullableLargeVarBinaryArray(
+        ColumnBuildState state, IArrowType arrowType, int rowCount)
+    {
+        int nonNullCount = state.ValueCount;
+        int nullCount = rowCount - nonNullCount;
+        var defLevels = state.DefLevelSpan;
+        var denseOffsets = state.GetLargeOffsetsSpan();
+        var denseData = state.GetDataSpan();
+
+        using var scatteredOffsets = new NativeBuffer<long>(rowCount + 1, zeroFill: false);
+        using var bitmapBuf = new NativeBuffer<byte>((rowCount + 7) / 8);
+
+        var offsets = scatteredOffsets.Span;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < rowCount; i++)
+        {
+            if (defLevels[i] == state.MaxDefLevel)
+            {
+                offsets[i] = denseOffsets[valueIdx];
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                valueIdx++;
+            }
+            else
+            {
+                offsets[i] = valueIdx < denseOffsets.Length ? denseOffsets[valueIdx] : (nonNullCount > 0 ? denseOffsets[nonNullCount] : 0L);
+            }
+        }
+        offsets[rowCount] = nonNullCount > 0 ? denseOffsets[nonNullCount] : 0L;
+
+        var offsetsArrow = scatteredOffsets.Build();
+        var bitmapArrow = bitmapBuf.Build();
+        var dataArrow = state.BuildDataBuffer();
+        state.DisposeLargeOffsetsBuffer();
+
+        var data = new ArrayData(arrowType, rowCount, nullCount, offset: 0,
+            new[] { bitmapArrow, offsetsArrow, dataArrow });
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
+    private static IArrowArray BuildDenseLargeVarBinaryArray(
+        ColumnBuildState state, IArrowType arrowType, int numValues)
+    {
+        var defLevels = state.DefLevelSpan;
+        var denseOffsets = state.GetLargeOffsetsSpan();
+        int nonNullCount = state.ValueCount;
+        int nullCount = numValues - nonNullCount;
+
+        using var scatteredOffsets = new NativeBuffer<long>(numValues + 1, zeroFill: false);
+        using var bitmapBuf = new NativeBuffer<byte>((numValues + 7) / 8);
+
+        var offsets = scatteredOffsets.Span;
+        var bitmap = bitmapBuf.ByteSpan;
+
+        int valueIdx = 0;
+        for (int i = 0; i < numValues; i++)
+        {
+            if (defLevels[i] == state.MaxDefLevel)
+            {
+                offsets[i] = denseOffsets[valueIdx];
+                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                valueIdx++;
+            }
+            else
+            {
+                offsets[i] = valueIdx < denseOffsets.Length ? denseOffsets[valueIdx] : (nonNullCount > 0 ? denseOffsets[nonNullCount] : 0L);
+            }
+        }
+        offsets[numValues] = nonNullCount > 0 ? denseOffsets[nonNullCount] : 0L;
+
+        var offsetsArrow = scatteredOffsets.Build();
+        var bitmapArrow = bitmapBuf.Build();
+        var dataArrow = state.BuildDataBuffer();
+        state.DisposeLargeOffsetsBuffer();
+
+        var data = new ArrayData(arrowType, numValues, nullCount, offset: 0,
+            new[] { bitmapArrow, offsetsArrow, dataArrow });
+        return ArrowArrayFactory.BuildArray(data);
+    }
+
     private static IArrowArray BuildFixedSizeBinaryArray(
         ColumnBuildState state, int rowCount, FixedSizeBinaryType fixedType)
     {
@@ -920,12 +1034,13 @@ internal sealed class ColumnBuildState : IDisposable
 
     // For ByteArray/String (offset mode): separate offsets and data buffers
     private NativeBuffer<int>? _offsetsBuffer;
+    private NativeBuffer<long>? _largeOffsetsBuffer; // used when ByteArrayOutput == LargeOffsets
     private int _offsetsCount; // number of offset entries written (= _valueCount + 1 after first page)
     private NativeBuffer<byte>? _dataBuffer;
     private int _dataByteOffset;
 
     // For ByteArray/String (view mode): 16-byte views buffer + overflow data buffer
-    private readonly bool _useViewTypes;
+    private readonly ByteArrayOutputKind _byteArrayOutput;
     private NativeBuffer<byte>? _viewsBuffer;   // 16 bytes per non-null value (dense)
     private int _viewsCount;
 
@@ -949,7 +1064,7 @@ internal sealed class ColumnBuildState : IDisposable
     public int ValueCount => _valueCount;
 
     /// <summary>Whether this column is in view mode (produces StringViewArray/BinaryViewArray).</summary>
-    public bool IsViewMode => _useViewTypes;
+    public bool IsViewMode => _byteArrayOutput == ByteArrayOutputKind.ViewType;
 
     /// <summary>
     /// Creates a new column build state.
@@ -958,16 +1073,15 @@ internal sealed class ColumnBuildState : IDisposable
     /// <param name="maxDefLevel">Maximum definition level.</param>
     /// <param name="maxRepLevel">Maximum repetition level (0 for flat/struct-only columns).</param>
     /// <param name="capacity">Buffer capacity: rowCount for flat columns, numValues for repeated.</param>
-    /// <param name="useViewTypes">If true, ByteArray columns accumulate 16-byte view entries
-    /// instead of offset/data pairs, producing StringViewArray or BinaryViewArray output.</param>
+    /// <param name="byteArrayOutput">Controls the Arrow output type for BYTE_ARRAY columns.</param>
     public ColumnBuildState(PhysicalType physicalType, int maxDefLevel, int maxRepLevel, int capacity,
-        bool useViewTypes = false)
+        ByteArrayOutputKind byteArrayOutput = ByteArrayOutputKind.Default)
     {
         _physicalType = physicalType;
         MaxDefLevel = maxDefLevel;
         MaxRepLevel = maxRepLevel;
         _capacity = capacity;
-        _useViewTypes = useViewTypes;
+        _byteArrayOutput = byteArrayOutput;
 
         if (maxDefLevel > 0)
         {
@@ -1014,10 +1128,17 @@ internal sealed class ColumnBuildState : IDisposable
                 break;
             case PhysicalType.ByteArray:
                 _elementSize = 0;
-                if (useViewTypes)
+                if (byteArrayOutput == ByteArrayOutputKind.ViewType)
                 {
                     _viewsBuffer = new NativeBuffer<byte>(capacity * ViewEntrySize, zeroFill: false);
                     _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false); // overflow
+                }
+                else if (byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
+                {
+                    _largeOffsetsBuffer = new NativeBuffer<long>(capacity + 1, zeroFill: false);
+                    _largeOffsetsBuffer.Span[0] = 0;
+                    _offsetsCount = 1;
+                    _dataBuffer = new NativeBuffer<byte>(capacity * 32, zeroFill: false);
                 }
                 else
                 {
@@ -1110,11 +1231,11 @@ internal sealed class ColumnBuildState : IDisposable
 
     /// <summary>
     /// Adds BYTE_ARRAY values: writes offsets and copies data into native buffers,
-    /// or writes view entries when in view mode.
+    /// or writes view/large-offset entries when in the appropriate mode.
     /// </summary>
     public void AddByteArrayValues(ReadOnlySpan<int> sourceOffsets, ReadOnlySpan<byte> sourceData, int count)
     {
-        if (_useViewTypes)
+        if (_byteArrayOutput == ByteArrayOutputKind.ViewType)
         {
             for (int i = 0; i < count; i++)
             {
@@ -1135,10 +1256,17 @@ internal sealed class ColumnBuildState : IDisposable
         sourceData.CopyTo(_dataBuffer.ByteSpan.Slice(_dataByteOffset));
 
         // Write offsets (shifted by current data offset)
-        var offsets = _offsetsBuffer!.Span;
-        for (int i = 0; i < count; i++)
+        if (_byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
         {
-            offsets[_offsetsCount + i] = _dataByteOffset + sourceOffsets[i + 1];
+            var largeOffsets = _largeOffsetsBuffer!.Span;
+            for (int i = 0; i < count; i++)
+                largeOffsets[_offsetsCount + i] = _dataByteOffset + sourceOffsets[i + 1];
+        }
+        else
+        {
+            var offsets = _offsetsBuffer!.Span;
+            for (int i = 0; i < count; i++)
+                offsets[_offsetsCount + i] = _dataByteOffset + sourceOffsets[i + 1];
         }
         _offsetsCount += count;
         _dataByteOffset += sourceData.Length;
@@ -1165,9 +1293,18 @@ internal sealed class ColumnBuildState : IDisposable
     /// </summary>
     internal void CommitByteArrayData(ReadOnlySpan<int> valueOffsets, int count, int byteCount)
     {
-        var offsets = _offsetsBuffer!.Span;
-        for (int i = 0; i < count; i++)
-            offsets[_offsetsCount + i] = _dataByteOffset + valueOffsets[i + 1];
+        if (_byteArrayOutput == ByteArrayOutputKind.LargeOffsets)
+        {
+            var largeOffsets = _largeOffsetsBuffer!.Span;
+            for (int i = 0; i < count; i++)
+                largeOffsets[_offsetsCount + i] = _dataByteOffset + valueOffsets[i + 1];
+        }
+        else
+        {
+            var offsets = _offsetsBuffer!.Span;
+            for (int i = 0; i < count; i++)
+                offsets[_offsetsCount + i] = _dataByteOffset + valueOffsets[i + 1];
+        }
         _offsetsCount += count;
         _dataByteOffset += byteCount;
         _valueCount += count;
@@ -1266,6 +1403,10 @@ internal sealed class ColumnBuildState : IDisposable
     public ReadOnlySpan<int> GetOffsetsSpan() =>
         _offsetsBuffer!.Span.Slice(0, _offsetsCount);
 
+    /// <summary>Gets the large offsets span (for large byte array build).</summary>
+    public ReadOnlySpan<long> GetLargeOffsetsSpan() =>
+        _largeOffsetsBuffer!.Span.Slice(0, _offsetsCount);
+
     /// <summary>Gets the data span (for byte array build).</summary>
     public ReadOnlySpan<byte> GetDataSpan() =>
         _dataBuffer!.ByteSpan.Slice(0, _dataByteOffset);
@@ -1281,6 +1422,19 @@ internal sealed class ColumnBuildState : IDisposable
     {
         _offsetsBuffer?.Dispose();
         _offsetsBuffer = null;
+    }
+
+    /// <summary>Transfers the large offsets buffer to an ArrowBuffer.</summary>
+    public ArrowBuffer BuildLargeOffsetsBuffer()
+    {
+        return _largeOffsetsBuffer!.Build();
+    }
+
+    /// <summary>Disposes the large offsets buffer.</summary>
+    public void DisposeLargeOffsetsBuffer()
+    {
+        _largeOffsetsBuffer?.Dispose();
+        _largeOffsetsBuffer = null;
     }
 
     /// <summary>Transfers the data buffer to an ArrowBuffer.</summary>
@@ -1303,6 +1457,7 @@ internal sealed class ColumnBuildState : IDisposable
         }
         _valueBuffer?.Dispose();
         _offsetsBuffer?.Dispose();
+        _largeOffsetsBuffer?.Dispose();
         _viewsBuffer?.Dispose();
         _dataBuffer?.Dispose();
     }
@@ -1337,6 +1492,8 @@ file static class ArrowArrayFactory
             BinaryType => new BinaryArray(data),
             StringViewType => new StringViewArray(data),
             BinaryViewType => new BinaryViewArray(data),
+            LargeStringType => new LargeStringArray(data),
+            LargeBinaryType => new LargeBinaryArray(data),
             Decimal32Type => new Decimal32Array(data),
             Decimal64Type => new Decimal64Array(data),
             Decimal128Type => new Decimal128Array(data),

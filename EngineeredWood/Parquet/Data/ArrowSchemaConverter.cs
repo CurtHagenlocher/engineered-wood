@@ -16,8 +16,7 @@ internal static class ArrowSchemaConverter
     {
         bool nullable = column.MaxDefinitionLevel > 0;
         var arrowType = ToArrowType(column);
-        if (options?.UseViewTypes == true)
-            arrowType = ApplyViewTypes(arrowType);
+        arrowType = ApplyOutputKind(arrowType, options?.ByteArrayOutput ?? ByteArrayOutputKind.Default);
         return new Apache.Arrow.Field(column.DottedPath, arrowType, nullable);
     }
 
@@ -34,17 +33,26 @@ internal static class ArrowSchemaConverter
     }
 
     /// <summary>
-    /// Remaps <see cref="StringType"/> → <see cref="StringViewType"/> and
-    /// <see cref="BinaryType"/> → <see cref="BinaryViewType"/> when
-    /// <see cref="ParquetReadOptions.UseViewTypes"/> is enabled.
+    /// Remaps <see cref="StringType"/>/<see cref="BinaryType"/> to the requested output kind.
     /// All other types are returned unchanged.
     /// </summary>
-    private static IArrowType ApplyViewTypes(IArrowType type) => type switch
-    {
-        Apache.Arrow.Types.StringType => StringViewType.Default,
-        BinaryType => BinaryViewType.Default,
-        _ => type,
-    };
+    private static IArrowType ApplyOutputKind(IArrowType type, ByteArrayOutputKind kind) =>
+        kind switch
+        {
+            ByteArrayOutputKind.ViewType => type switch
+            {
+                Apache.Arrow.Types.StringType => StringViewType.Default,
+                BinaryType => BinaryViewType.Default,
+                _ => type,
+            },
+            ByteArrayOutputKind.LargeOffsets => type switch
+            {
+                Apache.Arrow.Types.StringType => LargeStringType.Default,
+                BinaryType => LargeBinaryType.Default,
+                _ => type,
+            },
+            _ => type,
+        };
 
     private static Apache.Arrow.Field NodeToArrowField(SchemaNode node, ParquetReadOptions? options = null)
     {
@@ -151,6 +159,7 @@ internal static class ArrowSchemaConverter
     private static IArrowType LeafToArrowType(SchemaNode node, ParquetReadOptions? options = null)
     {
         var element = node.Element;
+        var kind = options?.ByteArrayOutput ?? ByteArrayOutputKind.Default;
 
         // LogicalType → ConvertedType → PhysicalType fallthrough
         if (element.LogicalType != null)
@@ -159,7 +168,7 @@ internal static class ArrowSchemaConverter
             var desc = BuildTempDescriptor(node);
             var result = FromLogicalType(element.LogicalType, desc);
             if (result != null)
-                return options?.UseViewTypes == true ? ApplyViewTypes(result) : result;
+                return ApplyOutputKind(result, kind);
         }
 
         if (element.ConvertedType.HasValue)
@@ -167,11 +176,11 @@ internal static class ArrowSchemaConverter
             var desc = BuildTempDescriptor(node);
             var result = FromConvertedType(element.ConvertedType.Value, desc);
             if (result != null)
-                return options?.UseViewTypes == true ? ApplyViewTypes(result) : result;
+                return ApplyOutputKind(result, kind);
         }
 
         var physical = FromPhysicalType(BuildTempDescriptor(node));
-        return options?.UseViewTypes == true ? ApplyViewTypes(physical) : physical;
+        return ApplyOutputKind(physical, kind);
     }
 
     private static ColumnDescriptor BuildTempDescriptor(SchemaNode node) => new()

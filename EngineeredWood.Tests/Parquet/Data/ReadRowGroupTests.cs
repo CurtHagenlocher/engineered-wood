@@ -1807,4 +1807,107 @@ public class ReadRowGroupTests
         Assert.IsType<Int32Array>(batch.Column(1));
         Assert.IsType<DoubleArray>(batch.Column(2));
     }
+
+    // ─── LargeOffsets option tests ──────────────────────────────────────────────
+
+    [Fact]
+    public async Task LargeOffsets_SchemaHasLargeStringType()
+    {
+        var options = new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.LargeOffsets };
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("delta_encoding_optional_column.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false, options);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        bool hasLargeString = batch.Schema.FieldsList.Any(f => f.DataType is LargeStringType);
+        Assert.True(hasLargeString, "Expected at least one LargeStringType field.");
+    }
+
+    [Fact]
+    public async Task LargeOffsets_ProducesLargeStringArray()
+    {
+        var options = new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.LargeOffsets };
+        await using var file = new LocalRandomAccessFile(
+            TestData.GetPath("lz4_raw_compressed_larger.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false, options);
+
+        var batch = await reader.ReadRowGroupAsync(0);
+
+        Assert.IsType<LargeStringType>(batch.Schema.FieldsList[0].DataType);
+        Assert.IsType<LargeStringArray>(batch.Column(0));
+    }
+
+    [Fact]
+    public async Task LargeOffsets_StringValuesMatchDefault()
+    {
+        await using var file1 = new LocalRandomAccessFile(
+            TestData.GetPath("lz4_raw_compressed_larger.parquet"));
+        using var readerDefault = new ParquetFileReader(file1, ownsFile: false);
+        var batchDefault = await readerDefault.ReadRowGroupAsync(0);
+
+        await using var file2 = new LocalRandomAccessFile(
+            TestData.GetPath("lz4_raw_compressed_larger.parquet"));
+        using var readerLarge = new ParquetFileReader(file2, ownsFile: false,
+            new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.LargeOffsets });
+        var batchLarge = await readerLarge.ReadRowGroupAsync(0);
+
+        var defaultArr = (StringArray)batchDefault.Column(0);
+        var largeArr = (LargeStringArray)batchLarge.Column(0);
+
+        Assert.Equal(defaultArr.Length, largeArr.Length);
+        for (int i = 0; i < defaultArr.Length; i++)
+            Assert.Equal(defaultArr.GetString(i), largeArr.GetString(i));
+    }
+
+    [Fact]
+    public async Task LargeOffsets_DictionaryEncoded_ValuesMatch()
+    {
+        await using var file1 = new LocalRandomAccessFile(
+            TestData.GetPath("alltypes_dictionary.parquet"));
+        using var readerDefault = new ParquetFileReader(file1, ownsFile: false);
+        var batchDefault = await readerDefault.ReadRowGroupAsync(0, ["string_col"]);
+
+        await using var file2 = new LocalRandomAccessFile(
+            TestData.GetPath("alltypes_dictionary.parquet"));
+        using var readerLarge = new ParquetFileReader(file2, ownsFile: false,
+            new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.LargeOffsets });
+        var batchLarge = await readerLarge.ReadRowGroupAsync(0, ["string_col"]);
+
+        var defaultArr = (BinaryArray)batchDefault.Column(0);
+        var largeArr = (LargeBinaryArray)batchLarge.Column(0);
+
+        Assert.Equal(defaultArr.Length, largeArr.Length);
+        for (int i = 0; i < defaultArr.Length; i++)
+            Assert.Equal(defaultArr.GetBytes(i).ToArray(), largeArr.GetBytes(i).ToArray());
+    }
+
+    [Fact]
+    public async Task LargeOffsets_NullableColumn_NullsPreserved()
+    {
+        await using var file1 = new LocalRandomAccessFile(
+            TestData.GetPath("delta_encoding_optional_column.parquet"));
+        using var readerDefault = new ParquetFileReader(file1, ownsFile: false);
+        var batchDefault = await readerDefault.ReadRowGroupAsync(0);
+
+        await using var file2 = new LocalRandomAccessFile(
+            TestData.GetPath("delta_encoding_optional_column.parquet"));
+        using var readerLarge = new ParquetFileReader(file2, ownsFile: false,
+            new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.LargeOffsets });
+        var batchLarge = await readerLarge.ReadRowGroupAsync(0);
+
+        for (int c = 9; c < batchDefault.Schema.FieldsList.Count; c++)
+        {
+            var defaultCol = (StringArray)batchDefault.Column(c);
+            var largeCol = (LargeStringArray)batchLarge.Column(c);
+
+            Assert.Equal(defaultCol.Length, largeCol.Length);
+            for (int i = 0; i < defaultCol.Length; i++)
+            {
+                Assert.Equal(defaultCol.IsNull(i), largeCol.IsNull(i));
+                if (!defaultCol.IsNull(i))
+                    Assert.Equal(defaultCol.GetString(i), largeCol.GetString(i));
+            }
+        }
+    }
 }

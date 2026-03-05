@@ -51,6 +51,14 @@ public class RowGroupReadBenchmarks
         return await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
     }
 
+    [Benchmark(Description = "EW_ReadAll_LargeOffsets")]
+    public async Task<Apache.Arrow.RecordBatch> EW_ReadAll_LargeOffsets()
+    {
+        using var file = new LocalRandomAccessFile(FilePath);
+        using var reader = new ParquetFileReader(file, options: new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.LargeOffsets });
+        return await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
+    }
+
     [Benchmark(Description = "EW_Incremental_Seq")]
     public async Task<Apache.Arrow.RecordBatch> EW_Incremental_Seq()
     {

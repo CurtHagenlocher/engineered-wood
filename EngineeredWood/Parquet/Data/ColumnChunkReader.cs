@@ -39,11 +39,16 @@ internal static class ColumnChunkReader
     {
         bool isRepeated = column.MaxRepetitionLevel > 0;
         int capacity = isRepeated ? checked((int)columnMeta.NumValues) : rowCount;
-        bool useViewTypes = arrowField.DataType is StringViewType or BinaryViewType;
+        var byteArrayOutput = arrowField.DataType switch
+        {
+            StringViewType or BinaryViewType => ByteArrayOutputKind.ViewType,
+            LargeStringType or LargeBinaryType => ByteArrayOutputKind.LargeOffsets,
+            _ => ByteArrayOutputKind.Default,
+        };
 
         using var state = new ColumnBuildState(
             column.PhysicalType, column.MaxDefinitionLevel, column.MaxRepetitionLevel, capacity,
-            useViewTypes);
+            byteArrayOutput);
         DictionaryDecoder? dictionary = null;
 
         int pos = 0;
