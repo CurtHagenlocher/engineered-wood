@@ -138,4 +138,48 @@ internal static class PlainDecoder
 
         return pos;
     }
+
+    /// <summary>
+    /// First-pass scan of <paramref name="count"/> PLAIN-encoded BYTE_ARRAY values.
+    /// Fills <paramref name="offsets"/> with cumulative output lengths (offsets[0]=0,
+    /// offsets[i+1]=offsets[i]+len_i) and returns the total output data size.
+    /// Use <see cref="CopyByteArrayData"/> as the second pass to write data into a
+    /// pre-allocated buffer.
+    /// </summary>
+    public static int MeasureByteArrays(ReadOnlySpan<byte> data, Span<int> offsets, int count)
+    {
+        int srcPos = 0;
+        int totalDataSize = 0;
+        offsets[0] = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (srcPos + 4 > data.Length)
+                throw new ParquetFormatException("Unexpected end of PLAIN ByteArray data.");
+            int len = BinaryPrimitives.ReadInt32LittleEndian(data.Slice(srcPos));
+            srcPos += 4 + len;
+            totalDataSize += len;
+            offsets[i + 1] = totalDataSize;
+        }
+        return totalDataSize;
+    }
+
+    /// <summary>
+    /// Second-pass copy for PLAIN-encoded BYTE_ARRAY values. Uses the offsets filled by
+    /// <see cref="MeasureByteArrays"/> to copy each value's bytes into <paramref name="dest"/>.
+    /// Source position for value i is derived as <c>4*(i+1) + offsets[i]</c>.
+    /// </summary>
+    public static void CopyByteArrayData(
+        ReadOnlySpan<byte> data,
+        ReadOnlySpan<int> offsets,
+        Span<byte> dest,
+        int count)
+    {
+        for (int i = 0; i < count; i++)
+        {
+            int destOffset = offsets[i];
+            int len = offsets[i + 1] - destOffset;
+            // Source layout: [H0 4B][D0][H1 4B][D1]... → Di starts at 4*(i+1) + offsets[i]
+            data.Slice(4 * (i + 1) + destOffset, len).CopyTo(dest.Slice(destOffset));
+        }
+    }
 }

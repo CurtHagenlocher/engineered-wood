@@ -414,8 +414,10 @@ internal static class ColumnChunkReader
                 var offsets = ArrayPool<int>.Shared.Rent(count + 1);
                 try
                 {
-                    PlainDecoder.DecodeByteArrays(data, offsets, out byte[] valueData, count);
-                    state.AddByteArrayValues(offsets.AsSpan(0, count + 1), valueData, count);
+                    int totalLen = PlainDecoder.MeasureByteArrays(data, offsets, count);
+                    Span<byte> dest = state.ReserveByteArrayData(totalLen);
+                    PlainDecoder.CopyByteArrayData(data, offsets, dest, count);
+                    state.CommitByteArrayData(offsets.AsSpan(0, count + 1), count, totalLen);
                 }
                 finally
                 {
@@ -639,11 +641,10 @@ internal static class ColumnChunkReader
                 }
                 case PhysicalType.ByteArray:
                 {
-                    // Single-pass: compute lengths then copy
                     var offsets = ArrayPool<int>.Shared.Rent(count + 1);
                     try
                     {
-                        // Cache lengths to avoid double dictionary lookup
+                        // First pass: compute individual lengths and total size
                         Span<int> lengths = count <= 512 ? stackalloc int[count] : new int[count];
                         int totalLen = 0;
                         for (int i = 0; i < count; i++)
@@ -653,18 +654,18 @@ internal static class ColumnChunkReader
                             totalLen += len;
                         }
 
-                        var valueData = new byte[totalLen];
+                        // Reserve space directly in native buffer — no intermediate byte[] allocation
+                        Span<byte> dest = state.ReserveByteArrayData(totalLen);
                         int pos = 0;
                         offsets[0] = 0;
                         for (int i = 0; i < count; i++)
                         {
                             int len = lengths[i];
-                            dictionary.GetByteArray(indices[i]).CopyTo(valueData.AsSpan(pos));
+                            dictionary.GetByteArray(indices[i]).CopyTo(dest.Slice(pos));
                             pos += len;
                             offsets[i + 1] = pos;
                         }
-
-                        state.AddByteArrayValues(offsets.AsSpan(0, count + 1), valueData, count);
+                        state.CommitByteArrayData(offsets.AsSpan(0, count + 1), count, totalLen);
                     }
                     finally
                     {

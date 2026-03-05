@@ -1000,6 +1000,34 @@ internal sealed class ColumnBuildState : IDisposable
         _valueCount += count;
     }
 
+    /// <summary>
+    /// Reserves <paramref name="byteCount"/> bytes in the data buffer and returns a writable
+    /// span for the caller to fill directly. Must be followed by
+    /// <see cref="CommitByteArrayData"/> to write offsets and advance counters.
+    /// </summary>
+    internal Span<byte> ReserveByteArrayData(int byteCount)
+    {
+        int needed = _dataByteOffset + byteCount;
+        if (needed > _dataBuffer!.ByteSpan.Length)
+            _dataBuffer.Grow(needed);
+        return _dataBuffer.ByteSpan.Slice(_dataByteOffset, byteCount);
+    }
+
+    /// <summary>
+    /// Commits <paramref name="count"/> byte-array offsets and advances the data write
+    /// position by <paramref name="byteCount"/>. Call after filling the span returned
+    /// by <see cref="ReserveByteArrayData"/>.
+    /// </summary>
+    internal void CommitByteArrayData(ReadOnlySpan<int> valueOffsets, int count, int byteCount)
+    {
+        var offsets = _offsetsBuffer!.Span;
+        for (int i = 0; i < count; i++)
+            offsets[_offsetsCount + i] = _dataByteOffset + valueOffsets[i + 1];
+        _offsetsCount += count;
+        _dataByteOffset += byteCount;
+        _valueCount += count;
+    }
+
     // --- Build methods: transfer ownership to ArrowBuffer ---
 
     /// <summary>Gets a typed span over the dense value data (for the build phase).</summary>
