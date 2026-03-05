@@ -164,7 +164,10 @@ public class RowGroupReadBenchmarks
 
         foreach (DataField field in reader.Schema.GetDataFields())
         {
-            await rowGroupReader.ReadColumnAsync(field).ConfigureAwait(false);
+            var column = await rowGroupReader.ReadColumnAsync(field).ConfigureAwait(false);
+            // Touch .Data to force the lazy scatter/unpack of definition levels into
+            // a materialized nullable array — equivalent work to what EW does eagerly.
+            _ = column.Data.Length;
         }
     }
 }
