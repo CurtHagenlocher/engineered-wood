@@ -116,3 +116,22 @@ public enum DataPageVersion
     /// <summary>V2: levels uncompressed prefix, only values compressed.</summary>
     V2 = 2,
 }
+
+/// <summary>
+/// Named encoding strategies for automatic encoding selection.
+/// </summary>
+public enum EncodingStrategy
+{
+    /// <summary>Use the explicitly specified encoding (no automatic selection).</summary>
+    None = 0,
+    /// <summary>
+    /// Adaptive: try dictionary first, fall back to type-appropriate encoding
+    /// (DeltaBinaryPacked for integers, ByteStreamSplit for floats, DeltaLengthByteArray for strings).
+    /// </summary>
+    Adaptive = 1,
+    /// <summary>
+    /// Aggressive: same as Adaptive, but also checks dictionary compression effectiveness
+    /// and abandons dictionary sooner if it's not providing good compression.
+    /// </summary>
+    Aggressive = 2,
+}

@@ -19,6 +19,7 @@ internal sealed class ColumnWriter
     private readonly int _targetPageSize;
     private readonly int _maxDictionarySize;
     private readonly DataPageVersion _pageVersion;
+    private readonly EncodingStrategy _strategy;
 
     public ColumnWriter(
         ColumnDescriptor column,
@@ -26,13 +27,17 @@ internal sealed class ColumnWriter
         Encoding encoding = Encoding.Plain,
         int targetPageSize = 1 * 1024 * 1024,
         int maxDictionarySize = 1 * 1024 * 1024,
-        DataPageVersion pageVersion = DataPageVersion.V1)
+        DataPageVersion pageVersion = DataPageVersion.V1,
+        EncodingStrategy strategy = EncodingStrategy.None)
     {
         _column = column;
         _codec = codec;
-        _encoding = encoding;
+        _strategy = strategy;
+        _encoding = strategy != EncodingStrategy.None
+            ? EncodingStrategyResolver.Resolve(strategy, encoding, column.PhysicalType)
+            : encoding;
         _targetPageSize = targetPageSize;
-        _maxDictionarySize = maxDictionarySize;
+        _maxDictionarySize = EncodingStrategyResolver.GetMaxDictionarySize(strategy, maxDictionarySize);
         _pageVersion = pageVersion;
     }
 
@@ -86,8 +91,9 @@ internal sealed class ColumnWriter
             }
             else
             {
-                // Dictionary too large — fall back to plain
-                WritePlainPages(decomposed, numValues, output, encodingsUsed,
+                // Dictionary too large — fall back to strategy-appropriate encoding
+                var fallback = EncodingStrategyResolver.GetFallbackEncoding(_strategy, _column.PhysicalType);
+                WriteEncodedPagesCore(decomposed, numValues, fallback, output, encodingsUsed,
                     ref totalUncompressedSize, ref totalCompressedSize);
             }
         }
@@ -99,6 +105,9 @@ internal sealed class ColumnWriter
         }
 
         var data = output.ToArray();
+
+        // Compute statistics
+        var statistics = StatisticsCollector.Collect(decomposed, _column.PhysicalType, numValues);
 
         var metadata = new Metadata.ColumnMetaData
         {
@@ -113,6 +122,7 @@ internal sealed class ColumnWriter
                 ? output.Length - data.Length + GetDictionaryPageSize(data)
                 : 0,
             DictionaryPageOffset = dictionaryPageOffset,
+            Statistics = statistics,
         };
 
         return new ColumnWriteResult(data, metadata);
