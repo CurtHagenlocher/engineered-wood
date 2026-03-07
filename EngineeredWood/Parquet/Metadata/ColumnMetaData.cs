@@ -36,7 +36,7 @@ public sealed class ColumnMetaData
     public long? DictionaryPageOffset { get; init; }
 
     /// <summary>Column chunk statistics.</summary>
-    public Statistics? Statistics { get; init; }
+    public Statistics? Statistics { get; set; }
 
     /// <summary>Encoding statistics per page type.</summary>
     public IReadOnlyList<KeyValue>? KeyValueMetadata { get; init; }

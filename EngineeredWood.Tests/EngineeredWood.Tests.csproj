@@ -9,6 +9,7 @@
 
   <ItemGroup>
     <PackageReference Include="Apache.Arrow" Version="18.*" />
+    <PackageReference Include="Azure.Storage.Blobs" Version="12.*" />
     <PackageReference Include="coverlet.collector" Version="6.0.4" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="ParquetSharp" Version="21.0.0" />
