@@ -1,5 +1,7 @@
+using System.Buffers;
 using System.Buffers.Binary;
 using Apache.Arrow;
+using EngineeredWood.IO;
 using EngineeredWood.Parquet.Compression;
 using EngineeredWood.Parquet.Data.Encoders;
 using EngineeredWood.Parquet.Schema;
@@ -8,8 +10,8 @@ namespace EngineeredWood.Parquet.Data;
 
 /// <summary>
 /// Writes a single column chunk: decomposes an Arrow array into Parquet-encoded data pages
-/// with optional dictionary page. Returns the raw bytes (page headers + page data) plus
-/// the column chunk metadata.
+/// with optional dictionary page. Streams pages directly to an <see cref="IOutputFile"/>
+/// to avoid intermediate buffering.
 /// </summary>
 internal sealed class ColumnWriter
 {
@@ -42,7 +44,7 @@ internal sealed class ColumnWriter
     }
 
     /// <summary>
-    /// Result of writing a column chunk.
+    /// Result of writing a column chunk (sync API).
     /// </summary>
     public readonly struct ColumnWriteResult
     {
@@ -60,104 +62,131 @@ internal sealed class ColumnWriter
     }
 
     /// <summary>
-    /// Writes an Arrow array as a column chunk. Returns the serialized bytes and metadata.
+    /// Writes an Arrow array as a column chunk to the given output, streaming pages directly.
+    /// Returns metadata with offsets absolute to the output's position space.
     /// </summary>
-    public ColumnWriteResult Write(IArrowArray array)
+    public async ValueTask<Metadata.ColumnMetaData> WriteAsync(
+        IArrowArray array, IOutputFile output, CancellationToken ct = default)
     {
         int typeLength = _column.TypeLength ?? 0;
         var decomposed = ArrowArrayDecomposer.Decompose(
             array, _column.PhysicalType, _column.MaxDefinitionLevel, typeLength);
 
-        var output = new MemoryStream();
-        var encodingsUsed = new HashSet<Encoding>();
-        long totalUncompressedSize = 0;
-        long totalCompressedSize = 0;
-        long? dictionaryPageOffset = null;
+        var state = new WriteState();
         int numValues = array.Length;
 
-        // Try dictionary encoding if requested
         if (_encoding == Encoding.RleDictionary || _encoding == Encoding.PlainDictionary)
         {
-            var dictResult = TryWriteDictionary(decomposed, output, encodingsUsed,
-                ref totalUncompressedSize, ref totalCompressedSize);
+            var dictResult = TryBuildDictionary(decomposed);
 
             if (dictResult.HasValue)
             {
-                dictionaryPageOffset = 0;
-                // Write RLE-encoded index pages
-                WriteIndexPages(dictResult.Value.indexData, dictResult.Value.indexBitWidth,
-                    decomposed, numValues, output, encodingsUsed,
-                    ref totalUncompressedSize, ref totalCompressedSize);
+                state.DictionaryPageOffset = output.Position;
+                byte[] dictPage = dictResult.Value.encoder.EncodeDictionaryPage();
+                await WritePageAsync(output, PageType.DictionaryPage, dictPage, dictPage.Length,
+                    state, ct,
+                    dictPageHeader: new DictionaryPageHeader
+                    {
+                        NumValues = dictResult.Value.encoder.DictionarySize,
+                        Encoding = Encoding.PlainDictionary,
+                    }).ConfigureAwait(false);
+                state.Encodings.Add(Encoding.PlainDictionary);
+
+                byte[] indexData = dictResult.Value.encoder.EncodeIndices();
+                int indexBitWidth = dictResult.Value.encoder.GetIndexBitWidth();
+                state.DataPageOffset = output.Position;
+                await WriteIndexPagesAsync(indexData, indexBitWidth, decomposed, numValues,
+                    output, state, ct).ConfigureAwait(false);
             }
             else
             {
-                // Dictionary too large — fall back to strategy-appropriate encoding
                 var fallback = EncodingStrategyResolver.GetFallbackEncoding(_strategy, _column.PhysicalType);
-                WriteEncodedPagesCore(decomposed, numValues, fallback, output, encodingsUsed,
-                    ref totalUncompressedSize, ref totalCompressedSize);
+                state.DataPageOffset = output.Position;
+                await WriteEncodedPagesAsync(decomposed, numValues, fallback,
+                    output, state, ct).ConfigureAwait(false);
             }
         }
         else
         {
-            // Direct encoding (Plain, DeltaBinaryPacked, etc.)
-            WriteEncodedPages(decomposed, numValues, output, encodingsUsed,
-                ref totalUncompressedSize, ref totalCompressedSize);
+            state.DataPageOffset = output.Position;
+            await WriteEncodedPagesAsync(decomposed, numValues, _encoding,
+                output, state, ct).ConfigureAwait(false);
         }
 
-        var data = output.ToArray();
-
-        // Compute statistics
         var statistics = StatisticsCollector.Collect(decomposed, _column.PhysicalType, numValues);
 
-        var metadata = new Metadata.ColumnMetaData
+        return new Metadata.ColumnMetaData
         {
             Type = _column.PhysicalType,
-            Encodings = encodingsUsed.ToList(),
+            Encodings = state.Encodings.ToList(),
             PathInSchema = _column.Path.ToList(),
             Codec = _codec,
             NumValues = numValues,
-            TotalUncompressedSize = totalUncompressedSize,
-            TotalCompressedSize = totalCompressedSize,
-            DataPageOffset = dictionaryPageOffset.HasValue
-                ? output.Length - data.Length + GetDictionaryPageSize(data)
-                : 0,
-            DictionaryPageOffset = dictionaryPageOffset,
+            TotalUncompressedSize = state.TotalUncompressedSize,
+            TotalCompressedSize = state.TotalCompressedSize,
+            DataPageOffset = state.DataPageOffset,
+            DictionaryPageOffset = state.DictionaryPageOffset,
             Statistics = statistics,
         };
+    }
 
+    /// <summary>
+    /// Sync convenience wrapper: writes to an in-memory buffer and returns the bytes.
+    /// Kept for backward compatibility with unit tests.
+    /// </summary>
+    public ColumnWriteResult Write(IArrowArray array)
+    {
+        var ms = new MemoryStream();
+        var adapter = new MemoryOutputAdapter(ms);
+        var metadata = WriteAsync(array, adapter).AsTask().GetAwaiter().GetResult();
+        ms.TryGetBuffer(out var segment);
+        // Copy to exact-sized array for backward compatibility with readers that use array.Length
+        var data = segment.Count == segment.Array!.Length
+            ? segment.Array
+            : segment.AsSpan().ToArray();
         return new ColumnWriteResult(data, metadata);
     }
 
-    private static long GetDictionaryPageSize(byte[] data)
+    // Tracks accumulated state during streaming writes
+    private sealed class WriteState
     {
-        // Read the first page header to find where data pages start
-        PageHeaderDecoder.Decode(data, out int headerSize);
-        var header = PageHeaderDecoder.Decode(data, out _);
-        return headerSize + header.CompressedPageSize;
+        public readonly HashSet<Encoding> Encodings = new();
+        public long TotalUncompressedSize;
+        public long TotalCompressedSize;
+        public long DataPageOffset;
+        public long? DictionaryPageOffset;
     }
 
-    private readonly struct DictResult
+    // Minimal IOutputFile adapter for MemoryStream (sync Write() wrapper)
+    private sealed class MemoryOutputAdapter : IOutputFile
     {
-        public readonly byte[] indexData;
-        public readonly int indexBitWidth;
-
-        public DictResult(byte[] indexData, int indexBitWidth)
+        private readonly MemoryStream _ms;
+        public MemoryOutputAdapter(MemoryStream ms) => _ms = ms;
+        public long Position => _ms.Position;
+        public ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken ct = default)
         {
-            this.indexData = indexData;
-            this.indexBitWidth = indexBitWidth;
+            _ms.Write(data.Span);
+            return default;
         }
+        public ValueTask FlushAsync(CancellationToken ct = default) => default;
+        public void Dispose() { }
+        public ValueTask DisposeAsync() => default;
     }
 
-    private DictResult? TryWriteDictionary(
-        ArrowArrayDecomposer.DecomposedColumn decomposed,
-        MemoryStream output,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize)
+    private readonly struct DictBuildResult
+    {
+        public readonly DictionaryEncoder encoder;
+        public DictBuildResult(DictionaryEncoder encoder) => this.encoder = encoder;
+    }
+
+    /// <summary>
+    /// Builds a dictionary from the decomposed values without writing anything.
+    /// Returns null if the dictionary exceeds the size limit.
+    /// </summary>
+    private DictBuildResult? TryBuildDictionary(ArrowArrayDecomposer.DecomposedColumn decomposed)
     {
         var dictEncoder = new DictionaryEncoder(_column.PhysicalType);
 
-        // Add values to dictionary
         if (_column.PhysicalType == PhysicalType.Boolean && decomposed.BoolValues != null)
         {
             foreach (bool v in decomposed.BoolValues)
@@ -177,23 +206,10 @@ internal sealed class ColumnWriter
             }
         }
 
-        // Check if dictionary is too large
         if (dictEncoder.DictionaryByteSize > _maxDictionarySize)
             return null;
 
-        // Write dictionary page
-        byte[] dictPage = dictEncoder.EncodeDictionaryPage();
-        WritePage(output, PageType.DictionaryPage, dictPage, dictPage.Length,
-            encodingsUsed, ref totalUncompressedSize, ref totalCompressedSize,
-            dictPageHeader: new DictionaryPageHeader
-            {
-                NumValues = dictEncoder.DictionarySize,
-                Encoding = Encoding.PlainDictionary,
-            });
-
-        encodingsUsed.Add(Encoding.PlainDictionary);
-
-        return new DictResult(dictEncoder.EncodeIndices(), dictEncoder.GetIndexBitWidth());
+        return new DictBuildResult(dictEncoder);
     }
 
     private static void AddFixedWidthToDictionary(
@@ -227,108 +243,92 @@ internal sealed class ColumnWriter
         }
     }
 
-    private void WriteIndexPages(
+    private async ValueTask WriteIndexPagesAsync(
         byte[] indexData,
         int indexBitWidth,
         ArrowArrayDecomposer.DecomposedColumn decomposed,
         int numValues,
-        MemoryStream output,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize)
+        IOutputFile output,
+        WriteState state,
+        CancellationToken ct)
     {
-        encodingsUsed.Add(Encoding.RleDictionary);
+        state.Encodings.Add(Encoding.RleDictionary);
 
         if (_pageVersion == DataPageVersion.V2)
         {
-            WriteIndexPagesV2(indexData, indexBitWidth, decomposed, numValues,
-                output, encodingsUsed, ref totalUncompressedSize, ref totalCompressedSize);
+            await WriteIndexPagesV2Async(indexData, indexBitWidth, decomposed, numValues,
+                output, state, ct).ConfigureAwait(false);
             return;
         }
 
-        // V1: def levels + RLE indices go together, then compress everything
         byte[] defLevelBytes = decomposed.DefLevels != null
             ? LevelEncoder.EncodeV1(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
 
-        // Build uncompressed page data: def levels + [bit width byte] + index data
-        byte[] pageData = new byte[defLevelBytes.Length + 1 + indexData.Length];
-        defLevelBytes.CopyTo(pageData.AsSpan());
-        pageData[defLevelBytes.Length] = (byte)indexBitWidth;
-        indexData.CopyTo(pageData.AsSpan(defLevelBytes.Length + 1));
+        int pageDataLen = defLevelBytes.Length + 1 + indexData.Length;
+        byte[] pageData = ArrayPool<byte>.Shared.Rent(pageDataLen);
+        try
+        {
+            defLevelBytes.CopyTo(pageData.AsSpan());
+            pageData[defLevelBytes.Length] = (byte)indexBitWidth;
+            indexData.CopyTo(pageData.AsSpan(defLevelBytes.Length + 1));
 
-        WritePage(output, PageType.DataPage, pageData, pageData.Length,
-            encodingsUsed, ref totalUncompressedSize, ref totalCompressedSize,
-            dataPageHeader: new DataPageHeader
-            {
-                NumValues = numValues,
-                Encoding = Encoding.RleDictionary,
-                DefinitionLevelEncoding = Encoding.Rle,
-                RepetitionLevelEncoding = Encoding.Rle,
-            });
+            await WritePageAsync(output, PageType.DataPage, pageData, pageDataLen,
+                state, ct,
+                dataPageHeader: new DataPageHeader
+                {
+                    NumValues = numValues,
+                    Encoding = Encoding.RleDictionary,
+                    DefinitionLevelEncoding = Encoding.Rle,
+                    RepetitionLevelEncoding = Encoding.Rle,
+                }).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(pageData);
+        }
     }
 
-    private void WriteIndexPagesV2(
+    private async ValueTask WriteIndexPagesV2Async(
         byte[] indexData,
         int indexBitWidth,
         ArrowArrayDecomposer.DecomposedColumn decomposed,
         int numValues,
-        MemoryStream output,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize)
+        IOutputFile output,
+        WriteState state,
+        CancellationToken ct)
     {
         byte[] defLevelBytes = decomposed.DefLevels != null
             ? LevelEncoder.EncodeV2(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
 
-        // Values = [bit width byte] + index data
-        byte[] valuesData = new byte[1 + indexData.Length];
-        valuesData[0] = (byte)indexBitWidth;
-        indexData.CopyTo(valuesData.AsSpan(1));
+        int valuesLen = 1 + indexData.Length;
+        byte[] valuesData = ArrayPool<byte>.Shared.Rent(valuesLen);
+        try
+        {
+            valuesData[0] = (byte)indexBitWidth;
+            indexData.CopyTo(valuesData.AsSpan(1));
 
-        int numNulls = numValues - decomposed.NonNullCount;
-
-        WriteV2Page(output, defLevelBytes, [], valuesData,
-            numValues, numNulls, numValues,
-            Encoding.RleDictionary, encodingsUsed,
-            ref totalUncompressedSize, ref totalCompressedSize);
+            int numNulls = numValues - decomposed.NonNullCount;
+            await WriteV2PageAsync(output, defLevelBytes, [], valuesData, valuesLen,
+                numValues, numNulls, numValues,
+                Encoding.RleDictionary, state, ct).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(valuesData);
+        }
     }
 
-    private void WritePlainPages(
-        ArrowArrayDecomposer.DecomposedColumn decomposed,
-        int numValues,
-        MemoryStream output,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize)
-    {
-        WriteEncodedPagesCore(decomposed, numValues, Encoding.Plain, output, encodingsUsed,
-            ref totalUncompressedSize, ref totalCompressedSize);
-    }
-
-    private void WriteEncodedPages(
-        ArrowArrayDecomposer.DecomposedColumn decomposed,
-        int numValues,
-        MemoryStream output,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize)
-    {
-        WriteEncodedPagesCore(decomposed, numValues, _encoding, output, encodingsUsed,
-            ref totalUncompressedSize, ref totalCompressedSize);
-    }
-
-    private void WriteEncodedPagesCore(
+    private async ValueTask WriteEncodedPagesAsync(
         ArrowArrayDecomposer.DecomposedColumn decomposed,
         int numValues,
         Encoding encoding,
-        MemoryStream output,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize)
+        IOutputFile output,
+        WriteState state,
+        CancellationToken ct)
     {
-        encodingsUsed.Add(encoding);
+        state.Encodings.Add(encoding);
         byte[] encodedValues = EncodeValues(decomposed, encoding);
 
         if (_pageVersion == DataPageVersion.V2)
@@ -338,11 +338,9 @@ internal sealed class ColumnWriter
                 : [];
 
             int numNulls = numValues - decomposed.NonNullCount;
-
-            WriteV2Page(output, defLevelBytes, [], encodedValues,
+            await WriteV2PageAsync(output, defLevelBytes, [], encodedValues, encodedValues.Length,
                 numValues, numNulls, numValues,
-                encoding, encodingsUsed,
-                ref totalUncompressedSize, ref totalCompressedSize);
+                encoding, state, ct).ConfigureAwait(false);
             return;
         }
 
@@ -351,19 +349,27 @@ internal sealed class ColumnWriter
             ? LevelEncoder.EncodeV1(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
 
-        byte[] pageData = new byte[v1DefLevelBytes.Length + encodedValues.Length];
-        v1DefLevelBytes.CopyTo(pageData.AsSpan());
-        encodedValues.CopyTo(pageData.AsSpan(v1DefLevelBytes.Length));
+        int pageDataLen = v1DefLevelBytes.Length + encodedValues.Length;
+        byte[] pageData = ArrayPool<byte>.Shared.Rent(pageDataLen);
+        try
+        {
+            v1DefLevelBytes.CopyTo(pageData.AsSpan());
+            encodedValues.CopyTo(pageData.AsSpan(v1DefLevelBytes.Length));
 
-        WritePage(output, PageType.DataPage, pageData, pageData.Length,
-            encodingsUsed, ref totalUncompressedSize, ref totalCompressedSize,
-            dataPageHeader: new DataPageHeader
-            {
-                NumValues = numValues,
-                Encoding = encoding,
-                DefinitionLevelEncoding = Encoding.Rle,
-                RepetitionLevelEncoding = Encoding.Rle,
-            });
+            await WritePageAsync(output, PageType.DataPage, pageData, pageDataLen,
+                state, ct,
+                dataPageHeader: new DataPageHeader
+                {
+                    NumValues = numValues,
+                    Encoding = encoding,
+                    DefinitionLevelEncoding = Encoding.Rle,
+                    RepetitionLevelEncoding = Encoding.Rle,
+                }).ConfigureAwait(false);
+        }
+        finally
+        {
+            ArrayPool<byte>.Shared.Return(pageData);
+        }
     }
 
     private byte[] EncodeValues(ArrowArrayDecomposer.DecomposedColumn decomposed, Encoding encoding)
@@ -375,7 +381,7 @@ internal sealed class ColumnWriter
             Encoding.DeltaLengthByteArray => EncodeDeltaLengthByteArray(decomposed),
             Encoding.DeltaByteArray => EncodeDeltaByteArray(decomposed),
             Encoding.ByteStreamSplit => EncodeByteStreamSplit(decomposed),
-            _ => EncodePlain(decomposed), // fallback to plain
+            _ => EncodePlain(decomposed),
         };
     }
 
@@ -409,7 +415,7 @@ internal sealed class ColumnWriter
                 foreach (long v in int64s) encoder.AddValue(v);
                 break;
             default:
-                return EncodePlain(decomposed); // fallback
+                return EncodePlain(decomposed);
         }
         return encoder.Finish();
     }
@@ -455,121 +461,140 @@ internal sealed class ColumnWriter
     /// <summary>
     /// Writes a V2 data page: levels uncompressed prefix, values optionally compressed.
     /// </summary>
-    private void WriteV2Page(
-        MemoryStream output,
+    private async ValueTask WriteV2PageAsync(
+        IOutputFile output,
         byte[] defLevelBytes,
         byte[] repLevelBytes,
         byte[] valuesData,
+        int valuesDataLen,
         int numValues,
         int numNulls,
         int numRows,
         Encoding encoding,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize)
+        WriteState state,
+        CancellationToken ct)
     {
-        int uncompressedValuesSize = valuesData.Length;
-        byte[] compressedValues;
+        int uncompressedValuesSize = valuesDataLen;
         int compressedValuesSize;
         bool isCompressed;
+        byte[]? rentedBuf = null;
+        ReadOnlyMemory<byte> compressedValues;
 
         if (_codec == CompressionCodec.Uncompressed)
         {
-            compressedValues = valuesData;
+            compressedValues = valuesData.AsMemory(0, valuesDataLen);
             compressedValuesSize = uncompressedValuesSize;
             isCompressed = false;
         }
         else
         {
             int maxLen = Compressor.GetMaxCompressedLength(_codec, uncompressedValuesSize);
-            compressedValues = new byte[maxLen];
-            compressedValuesSize = Compressor.Compress(_codec, valuesData, compressedValues);
+            rentedBuf = ArrayPool<byte>.Shared.Rent(maxLen);
+            compressedValuesSize = Compressor.Compress(
+                _codec, valuesData.AsSpan(0, valuesDataLen), rentedBuf);
+            compressedValues = rentedBuf.AsMemory(0, compressedValuesSize);
             isCompressed = true;
         }
 
-        // Total page sizes: levels (uncompressed) + values (compressed or not)
-        int totalUncompressed = repLevelBytes.Length + defLevelBytes.Length + uncompressedValuesSize;
-        int totalCompressed = repLevelBytes.Length + defLevelBytes.Length + compressedValuesSize;
-
-        var pageHeader = new PageHeader
+        try
         {
-            Type = PageType.DataPageV2,
-            UncompressedPageSize = totalUncompressed,
-            CompressedPageSize = totalCompressed,
-            DataPageHeaderV2 = new DataPageHeaderV2
+            int totalUncompressed = repLevelBytes.Length + defLevelBytes.Length + uncompressedValuesSize;
+            int totalCompressed = repLevelBytes.Length + defLevelBytes.Length + compressedValuesSize;
+
+            var pageHeader = new PageHeader
             {
-                NumValues = numValues,
-                NumNulls = numNulls,
-                NumRows = numRows,
-                Encoding = encoding,
-                DefinitionLevelsByteLength = defLevelBytes.Length,
-                RepetitionLevelsByteLength = repLevelBytes.Length,
-                IsCompressed = isCompressed,
-            }
-        };
+                Type = PageType.DataPageV2,
+                UncompressedPageSize = totalUncompressed,
+                CompressedPageSize = totalCompressed,
+                DataPageHeaderV2 = new DataPageHeaderV2
+                {
+                    NumValues = numValues,
+                    NumNulls = numNulls,
+                    NumRows = numRows,
+                    Encoding = encoding,
+                    DefinitionLevelsByteLength = defLevelBytes.Length,
+                    RepetitionLevelsByteLength = repLevelBytes.Length,
+                    IsCompressed = isCompressed,
+                }
+            };
 
-        byte[] headerBytes = PageHeaderEncoder.Encode(pageHeader);
+            byte[] headerBytes = PageHeaderEncoder.Encode(pageHeader);
 
-        output.Write(headerBytes);
-        if (repLevelBytes.Length > 0) output.Write(repLevelBytes);
-        if (defLevelBytes.Length > 0) output.Write(defLevelBytes);
-        output.Write(compressedValues, 0, compressedValuesSize);
+            await output.WriteAsync(headerBytes, ct).ConfigureAwait(false);
+            if (repLevelBytes.Length > 0)
+                await output.WriteAsync(repLevelBytes, ct).ConfigureAwait(false);
+            if (defLevelBytes.Length > 0)
+                await output.WriteAsync(defLevelBytes, ct).ConfigureAwait(false);
+            await output.WriteAsync(compressedValues, ct).ConfigureAwait(false);
 
-        totalUncompressedSize += headerBytes.Length + totalUncompressed;
-        totalCompressedSize += headerBytes.Length + totalCompressed;
+            state.TotalUncompressedSize += headerBytes.Length + totalUncompressed;
+            state.TotalCompressedSize += headerBytes.Length + totalCompressed;
 
-        if (_column.MaxDefinitionLevel > 0)
-            encodingsUsed.Add(Encoding.Rle);
+            if (_column.MaxDefinitionLevel > 0)
+                state.Encodings.Add(Encoding.Rle);
+        }
+        finally
+        {
+            if (rentedBuf != null)
+                ArrayPool<byte>.Shared.Return(rentedBuf);
+        }
     }
 
-    private void WritePage(
-        MemoryStream output,
+    private async ValueTask WritePageAsync(
+        IOutputFile output,
         PageType pageType,
         byte[] uncompressedData,
         int uncompressedSize,
-        HashSet<Encoding> encodingsUsed,
-        ref long totalUncompressedSize,
-        ref long totalCompressedSize,
+        WriteState state,
+        CancellationToken ct,
         DataPageHeader? dataPageHeader = null,
         DictionaryPageHeader? dictPageHeader = null)
     {
-        // Compress
-        byte[] compressedData;
         int compressedSize;
+        byte[]? rentedBuf = null;
+        ReadOnlyMemory<byte> compressedData;
 
         if (_codec == CompressionCodec.Uncompressed)
         {
-            compressedData = uncompressedData;
+            compressedData = uncompressedData.AsMemory(0, uncompressedSize);
             compressedSize = uncompressedSize;
         }
         else
         {
             int maxLen = Compressor.GetMaxCompressedLength(_codec, uncompressedSize);
-            compressedData = new byte[maxLen];
-            compressedSize = Compressor.Compress(_codec, uncompressedData, compressedData);
+            rentedBuf = ArrayPool<byte>.Shared.Rent(maxLen);
+            compressedSize = Compressor.Compress(
+                _codec, uncompressedData.AsSpan(0, uncompressedSize), rentedBuf);
+            compressedData = rentedBuf.AsMemory(0, compressedSize);
         }
 
-        // Build page header
-        var pageHeader = new PageHeader
+        try
         {
-            Type = pageType,
-            UncompressedPageSize = uncompressedSize,
-            CompressedPageSize = compressedSize,
-            DataPageHeader = dataPageHeader,
-            DictionaryPageHeader = dictPageHeader,
-        };
+            var pageHeader = new PageHeader
+            {
+                Type = pageType,
+                UncompressedPageSize = uncompressedSize,
+                CompressedPageSize = compressedSize,
+                DataPageHeader = dataPageHeader,
+                DictionaryPageHeader = dictPageHeader,
+            };
 
-        byte[] headerBytes = PageHeaderEncoder.Encode(pageHeader);
+            byte[] headerBytes = PageHeaderEncoder.Encode(pageHeader);
 
-        // Write header + compressed data
-        output.Write(headerBytes);
-        output.Write(compressedData, 0, compressedSize);
+            await output.WriteAsync(headerBytes, ct).ConfigureAwait(false);
+            await output.WriteAsync(compressedData, ct).ConfigureAwait(false);
 
-        totalUncompressedSize += headerBytes.Length + uncompressedSize;
-        totalCompressedSize += headerBytes.Length + compressedSize;
+            state.TotalUncompressedSize += headerBytes.Length + uncompressedSize;
+            state.TotalCompressedSize += headerBytes.Length + compressedSize;
 
-        if (_column.MaxDefinitionLevel > 0)
-            encodingsUsed.Add(Encoding.Rle);
+            if (_column.MaxDefinitionLevel > 0)
+                state.Encodings.Add(Encoding.Rle);
+        }
+        finally
+        {
+            if (rentedBuf != null)
+                ArrayPool<byte>.Shared.Return(rentedBuf);
+        }
     }
 
     private static int GetElementSize(PhysicalType type) => type switch

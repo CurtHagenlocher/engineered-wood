@@ -102,35 +102,13 @@ public sealed class ParquetFileWriter : IAsyncDisposable
                 strategy: _options.EncodingStrategy);
 
             var array = batch.Column(i);
-            var writeResult = colWriter.Write(array);
-
             long columnOffset = _output.Position;
-            await _output.WriteAsync(writeResult.Data, ct).ConfigureAwait(false);
-
-            // Fix up offsets relative to file position
-            var meta = writeResult.Metadata;
-            var adjustedMeta = new ColumnMetaData
-            {
-                Type = meta.Type,
-                Encodings = meta.Encodings,
-                PathInSchema = meta.PathInSchema,
-                Codec = meta.Codec,
-                NumValues = meta.NumValues,
-                TotalUncompressedSize = meta.TotalUncompressedSize,
-                TotalCompressedSize = meta.TotalCompressedSize,
-                DataPageOffset = columnOffset + (meta.DictionaryPageOffset.HasValue
-                    ? GetFirstDataPageOffset(writeResult.Data)
-                    : 0),
-                DictionaryPageOffset = meta.DictionaryPageOffset.HasValue
-                    ? columnOffset
-                    : null,
-                Statistics = meta.Statistics,
-            };
+            var meta = await colWriter.WriteAsync(array, _output, ct).ConfigureAwait(false);
 
             columns.Add(new ColumnChunk
             {
                 FileOffset = columnOffset,
-                MetaData = adjustedMeta,
+                MetaData = meta,
             });
 
             totalByteSize += meta.TotalUncompressedSize;
@@ -147,13 +125,6 @@ public sealed class ParquetFileWriter : IAsyncDisposable
         });
 
         _totalRows += batch.Length;
-    }
-
-    private static long GetFirstDataPageOffset(byte[] data)
-    {
-        // Skip the dictionary page header + data to find where data pages start
-        var header = PageHeaderDecoder.Decode(data, out int headerSize);
-        return headerSize + header.CompressedPageSize;
     }
 
     private async ValueTask WriteFooterAsync(CancellationToken ct)
