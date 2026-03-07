@@ -11,6 +11,7 @@ BenchmarkSwitcher.FromTypes([
     typeof(MetadataReadBenchmarks),
     typeof(RowGroupReadBenchmarks),
     typeof(RowGroupWriteBenchmarks),
+    typeof(DefaultSettingsBenchmarks),
     typeof(DeltaBinaryPackedBenchmarks),
     typeof(DeltaByteArrayBenchmarks),
     typeof(ByteStreamSplitBenchmarks),
