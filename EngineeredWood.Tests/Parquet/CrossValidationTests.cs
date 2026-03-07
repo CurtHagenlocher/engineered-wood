@@ -803,6 +803,174 @@ public class CrossValidationTests : IDisposable
     }
 
     // ────────────────────────────────────────────────────────────────────
+    //  Row group auto-splitting
+    // ────────────────────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task AutoSplit_SplitsByRowGroupMaxRows()
+    {
+        var path = TempPath("auto-split.parquet");
+        int totalRows = 2500;
+        int maxRowsPerGroup = 1000;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", Int32Type.Default, nullable: false))
+            .Build();
+
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < totalRows; i++) builder.Append(i);
+        var batch = new RecordBatch(schema, [builder.Build()], totalRows);
+
+        var options = new ParquetWriteOptions { RowGroupMaxRows = maxRowsPerGroup };
+        await WriteEW(path, batch, options);
+
+        // Should produce 3 row groups: 1000, 1000, 500
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+
+        Assert.Equal(totalRows, meta.NumRows);
+        Assert.Equal(3, meta.RowGroups.Count);
+        Assert.Equal(1000, meta.RowGroups[0].NumRows);
+        Assert.Equal(1000, meta.RowGroups[1].NumRows);
+        Assert.Equal(500, meta.RowGroups[2].NumRows);
+
+        // Verify all values are correct across row groups
+        for (int rg = 0; rg < 3; rg++)
+        {
+            var readBatch = await reader.ReadRowGroupAsync(rg);
+            var arr = (Int32Array)readBatch.Column(0);
+            int expectedStart = rg * 1000;
+            for (int i = 0; i < readBatch.Length; i++)
+                Assert.Equal(expectedStart + i, arr.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task AutoSplit_ExactMultipleProducesEvenGroups()
+    {
+        var path = TempPath("auto-split-exact.parquet");
+        int totalRows = 3000;
+        int maxRowsPerGroup = 1000;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", Int32Type.Default, nullable: false))
+            .Build();
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < totalRows; i++) builder.Append(i);
+        var batch = new RecordBatch(schema, [builder.Build()], totalRows);
+
+        await WriteEW(path, batch, new ParquetWriteOptions { RowGroupMaxRows = maxRowsPerGroup });
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+
+        Assert.Equal(3, meta.RowGroups.Count);
+        Assert.All(meta.RowGroups, rg => Assert.Equal(1000, rg.NumRows));
+    }
+
+    [Fact]
+    public async Task AutoSplit_SmallBatchNoSplit()
+    {
+        var path = TempPath("auto-split-nosplit.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", Int32Type.Default, nullable: false))
+            .Build();
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < 500; i++) builder.Append(i);
+        var batch = new RecordBatch(schema, [builder.Build()], 500);
+
+        await WriteEW(path, batch, new ParquetWriteOptions { RowGroupMaxRows = 1000 });
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+
+        Assert.Single(meta.RowGroups);
+        Assert.Equal(500, meta.RowGroups[0].NumRows);
+    }
+
+    [Fact]
+    public async Task AutoSplit_WithNullableAndStringColumns()
+    {
+        var path = TempPath("auto-split-mixed.parquet");
+        int totalRows = 250;
+        int maxRows = 100;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, nullable: false))
+            .Field(new Field("name", StringType.Default, nullable: true))
+            .Build();
+
+        var idBuilder = new Int32Array.Builder();
+        var nameBuilder = new StringArray.Builder();
+        for (int i = 0; i < totalRows; i++)
+        {
+            idBuilder.Append(i);
+            if (i % 3 == 0) nameBuilder.AppendNull();
+            else nameBuilder.Append($"item-{i}");
+        }
+        var batch = new RecordBatch(schema,
+            [idBuilder.Build(), nameBuilder.Build()], totalRows);
+
+        await WriteEW(path, batch, new ParquetWriteOptions { RowGroupMaxRows = maxRows });
+
+        await using var file = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(file, ownsFile: false);
+        var meta = await reader.ReadMetadataAsync();
+
+        Assert.Equal(totalRows, meta.NumRows);
+        Assert.Equal(3, meta.RowGroups.Count); // 100, 100, 50
+
+        // Verify data integrity across splits
+        var rg0 = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(100, rg0.Length);
+        Assert.Equal(0, ((Int32Array)rg0.Column(0)).GetValue(0));
+        Assert.Equal(99, ((Int32Array)rg0.Column(0)).GetValue(99));
+
+        var rg2 = await reader.ReadRowGroupAsync(2);
+        Assert.Equal(50, rg2.Length);
+        Assert.Equal(200, ((Int32Array)rg2.Column(0)).GetValue(0));
+    }
+
+    [Fact]
+    public async Task AutoSplit_PSRead_VerifiesAllRowGroups()
+    {
+        var path = TempPath("auto-split-ps.parquet");
+        int totalRows = 500;
+        int maxRows = 200;
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("val", Int32Type.Default, nullable: false))
+            .Build();
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < totalRows; i++) builder.Append(i * 10);
+        var batch = new RecordBatch(schema, [builder.Build()], totalRows);
+
+        await WriteEW(path, batch, new ParquetWriteOptions { RowGroupMaxRows = maxRows });
+
+        // Verify with ParquetSharp
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        Assert.Equal(3, psReader.FileMetaData.NumRowGroups); // 200, 200, 100
+        Assert.Equal(totalRows, psReader.FileMetaData.NumRows);
+
+        int rowOffset = 0;
+        for (int rg = 0; rg < 3; rg++)
+        {
+            using var group = psReader.RowGroup(rg);
+            int numRows = checked((int)group.MetaData.NumRows);
+            using var col = group.Column(0).LogicalReader<int>();
+            var buffer = new int[numRows];
+            col.ReadBatch(buffer);
+            for (int i = 0; i < numRows; i++)
+                Assert.Equal((rowOffset + i) * 10, buffer[i]);
+            rowOffset += numRows;
+        }
+    }
+
+    // ────────────────────────────────────────────────────────────────────
     //  Decimal types
     // ────────────────────────────────────────────────────────────────────
 

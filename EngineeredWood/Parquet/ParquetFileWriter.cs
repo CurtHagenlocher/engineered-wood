@@ -39,6 +39,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     /// <summary>
     /// Writes a row group from the given <see cref="RecordBatch"/>.
     /// The schema is inferred from the first batch; subsequent batches must have the same schema.
+    /// If the batch exceeds <see cref="ParquetWriteOptions.RowGroupMaxRows"/>, it is automatically
+    /// split into multiple row groups.
     /// </summary>
     public async ValueTask WriteRowGroupAsync(
         RecordBatch batch,
@@ -59,6 +61,28 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             _headerWritten = true;
         }
 
+        // Auto-split large batches into multiple row groups
+        int maxRows = _options.RowGroupMaxRows;
+        if (batch.Length > maxRows)
+        {
+            int offset = 0;
+            while (offset < batch.Length)
+            {
+                int length = Math.Min(maxRows, batch.Length - offset);
+                var slice = SliceBatch(batch, offset, length);
+                await WriteSingleRowGroupAsync(slice, cancellationToken).ConfigureAwait(false);
+                offset += length;
+            }
+            return;
+        }
+
+        await WriteSingleRowGroupAsync(batch, cancellationToken).ConfigureAwait(false);
+    }
+
+    private async ValueTask WriteSingleRowGroupAsync(
+        RecordBatch batch,
+        CancellationToken cancellationToken)
+    {
         // Decompose all Arrow columns into leaf columns (flat columns produce 1 leaf each,
         // nested columns produce multiple leaves)
         int arrowColumnCount = batch.ColumnCount;
@@ -164,6 +188,129 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
             TotalCompressedSize = totalCompressedSize,
             Ordinal = checked((short)_rowGroups.Count),
         });
+    }
+
+    /// <summary>
+    /// Creates a zero-offset copy of a batch slice.
+    /// Arrow's <c>Array.Slice</c> creates offset-based views, but the write path
+    /// reads value buffers from index 0 — so we must materialize each slice.
+    /// </summary>
+    private static RecordBatch SliceBatch(RecordBatch batch, int offset, int length)
+    {
+        var arrays = new IArrowArray[batch.ColumnCount];
+        for (int i = 0; i < batch.ColumnCount; i++)
+            arrays[i] = MaterializeSlice(batch.Column(i), offset, length);
+        return new RecordBatch(batch.Schema, arrays, length);
+    }
+
+    private static IArrowArray MaterializeSlice(IArrowArray array, int offset, int length)
+    {
+        // Use Arrow's builder pattern to create a zero-offset copy of the slice
+        var sliced = ((Apache.Arrow.Array)array).Slice(offset, length);
+        var slicedData = sliced.Data;
+
+        if (slicedData.Offset == 0)
+            return sliced; // Already zero-offset (e.g., first slice)
+
+        // For non-zero offset slices, create a compact copy.
+        // The simplest approach: build new ArrayData with copied buffers.
+        return CopyArray(slicedData, array.Data.DataType, length);
+    }
+
+    private static IArrowArray CopyArray(ArrayData data, Apache.Arrow.Types.IArrowType type, int length)
+    {
+        // For fixed-width types: copy value buffer, bitmap
+        // For variable-width types: copy offsets + data buffer, bitmap
+        int nullCount = data.NullCount;
+        int srcOffset = data.Offset;
+
+        ArrowBuffer newBitmap;
+        if (data.Buffers.Length > 0 && data.Buffers[0].Length > 0 && nullCount > 0)
+        {
+            // Copy null bitmap
+            var bitmapBytes = new byte[(length + 7) / 8];
+            var srcBitmap = data.Buffers[0].Span;
+            for (int i = 0; i < length; i++)
+            {
+                bool isSet = (srcBitmap[(srcOffset + i) / 8] & (1 << ((srcOffset + i) % 8))) != 0;
+                if (isSet)
+                    bitmapBytes[i / 8] |= (byte)(1 << (i % 8));
+            }
+            newBitmap = new ArrowBuffer(bitmapBytes);
+        }
+        else if (nullCount == 0)
+        {
+            newBitmap = ArrowBuffer.Empty;
+        }
+        else
+        {
+            newBitmap = data.Buffers.Length > 0 ? data.Buffers[0] : ArrowBuffer.Empty;
+        }
+
+        switch (type)
+        {
+            case Apache.Arrow.Types.BooleanType:
+            {
+                var boolBytes = new byte[(length + 7) / 8];
+                var srcValues = data.Buffers[1].Span;
+                for (int i = 0; i < length; i++)
+                {
+                    bool val = (srcValues[(srcOffset + i) / 8] & (1 << ((srcOffset + i) % 8))) != 0;
+                    if (val) boolBytes[i / 8] |= (byte)(1 << (i % 8));
+                }
+                var boolData = new ArrayData(type, length, nullCount, 0,
+                    [newBitmap, new ArrowBuffer(boolBytes)]);
+                return Apache.Arrow.ArrowArrayFactory.BuildArray(boolData);
+            }
+
+            case Apache.Arrow.Types.FixedSizeBinaryType fsb:
+            {
+                int byteWidth = fsb.ByteWidth;
+                var src = data.Buffers[1].Span.Slice(srcOffset * byteWidth, length * byteWidth);
+                var newData = new ArrayData(type, length, nullCount, 0,
+                    [newBitmap, new ArrowBuffer(src.ToArray())]);
+                return Apache.Arrow.ArrowArrayFactory.BuildArray(newData);
+            }
+
+            case Apache.Arrow.Types.StringType or Apache.Arrow.Types.BinaryType:
+            {
+                var srcOffsets = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+                int dataStart = srcOffsets[srcOffset];
+                int dataEnd = srcOffsets[srcOffset + length];
+
+                var newOffsets = new int[length + 1];
+                for (int i = 0; i <= length; i++)
+                    newOffsets[i] = srcOffsets[srcOffset + i] - dataStart;
+
+                var srcData = data.Buffers[2].Span.Slice(dataStart, dataEnd - dataStart);
+                var offsetBytes = System.Runtime.InteropServices.MemoryMarshal.AsBytes(newOffsets.AsSpan()).ToArray();
+                var newData = new ArrayData(type, length, nullCount, 0,
+                    [newBitmap, new ArrowBuffer(offsetBytes), new ArrowBuffer(srcData.ToArray())]);
+                return Apache.Arrow.ArrowArrayFactory.BuildArray(newData);
+            }
+
+            default:
+            {
+                // Fixed-width numeric types (int, long, float, double, etc.)
+                int byteWidth = type switch
+                {
+                    Apache.Arrow.Types.Int8Type or Apache.Arrow.Types.UInt8Type => 1,
+                    Apache.Arrow.Types.Int16Type or Apache.Arrow.Types.UInt16Type or Apache.Arrow.Types.HalfFloatType => 2,
+                    Apache.Arrow.Types.Int32Type or Apache.Arrow.Types.UInt32Type or Apache.Arrow.Types.FloatType
+                        or Apache.Arrow.Types.Date32Type or Apache.Arrow.Types.Time32Type => 4,
+                    Apache.Arrow.Types.Int64Type or Apache.Arrow.Types.UInt64Type or Apache.Arrow.Types.DoubleType
+                        or Apache.Arrow.Types.Date64Type or Apache.Arrow.Types.Time64Type
+                        or Apache.Arrow.Types.TimestampType or Apache.Arrow.Types.DurationType => 8,
+                    _ => throw new NotSupportedException(
+                        $"Auto-split does not support column type {type.Name}. " +
+                        "Split the RecordBatch manually before calling WriteRowGroupAsync."),
+                };
+                var src = data.Buffers[1].Span.Slice(srcOffset * byteWidth, length * byteWidth);
+                var newData = new ArrayData(type, length, nullCount, 0,
+                    [newBitmap, new ArrowBuffer(src.ToArray())]);
+                return Apache.Arrow.ArrowArrayFactory.BuildArray(newData);
+            }
+        }
     }
 
     /// <summary>
