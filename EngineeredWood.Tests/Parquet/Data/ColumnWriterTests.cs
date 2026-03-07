@@ -359,4 +359,266 @@ public class ColumnWriterTests
                 Assert.Equal(expected[i], readBack.GetValue(i));
         }
     }
+
+    // --- V2 Data Page Tests ---
+
+    [Fact]
+    public void V2_Int32_NonNullable_Plain_RoundTrips()
+    {
+        var column = MakeDescriptor(PhysicalType.Int32);
+        var writer = new ColumnWriter(column, pageVersion: DataPageVersion.V2);
+
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < 100; i++) builder.Append(i);
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+
+        Assert.Equal(100, result.Metadata.NumValues);
+        Assert.Contains(Encoding.Plain, result.Metadata.Encodings);
+
+        var readBack = (Int32Array)ReadBackColumn(result.Data, column, result.Metadata, 100);
+        Assert.Equal(100, readBack.Length);
+        for (int i = 0; i < 100; i++)
+            Assert.Equal(i, readBack.GetValue(i));
+    }
+
+    [Fact]
+    public void V2_Int32_Nullable_Plain_RoundTrips()
+    {
+        var column = MakeDescriptor(PhysicalType.Int32, maxDefLevel: 1);
+        var writer = new ColumnWriter(column, pageVersion: DataPageVersion.V2);
+
+        var builder = new Int32Array.Builder();
+        builder.Append(10);
+        builder.AppendNull();
+        builder.Append(30);
+        builder.AppendNull();
+        builder.Append(50);
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+
+        Assert.Equal(5, result.Metadata.NumValues);
+        Assert.Contains(Encoding.Rle, result.Metadata.Encodings);
+
+        var readBack = (Int32Array)ReadBackColumn(result.Data, column, result.Metadata, 5);
+        Assert.Equal(5, readBack.Length);
+        Assert.Equal(10, readBack.GetValue(0));
+        Assert.False(readBack.IsValid(1));
+        Assert.Equal(30, readBack.GetValue(2));
+        Assert.False(readBack.IsValid(3));
+        Assert.Equal(50, readBack.GetValue(4));
+    }
+
+    [Fact]
+    public void V2_String_Nullable_Plain_RoundTrips()
+    {
+        var element = new SchemaElement
+        {
+            Name = "str",
+            Type = PhysicalType.ByteArray,
+            RepetitionType = FieldRepetitionType.Optional,
+            LogicalType = new LogicalType.StringType(),
+        };
+        var column = MakeDescriptor(PhysicalType.ByteArray, name: "str", maxDefLevel: 1, schemaElement: element);
+        var writer = new ColumnWriter(column, pageVersion: DataPageVersion.V2);
+
+        var builder = new StringArray.Builder();
+        builder.Append("hello");
+        builder.AppendNull();
+        builder.Append("world");
+        builder.Append("");
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+
+        var readBack = (StringArray)ReadBackColumn(result.Data, column, result.Metadata, 4);
+        Assert.Equal(4, readBack.Length);
+        Assert.Equal("hello", readBack.GetString(0));
+        Assert.False(readBack.IsValid(1));
+        Assert.Equal("world", readBack.GetString(2));
+        Assert.Equal("", readBack.GetString(3));
+    }
+
+    [Fact]
+    public void V2_Int32_Snappy_RoundTrips()
+    {
+        var column = MakeDescriptor(PhysicalType.Int32, maxDefLevel: 1);
+        var writer = new ColumnWriter(column, codec: CompressionCodec.Snappy, pageVersion: DataPageVersion.V2);
+
+        var rng = new Random(42);
+        var builder = new Int32Array.Builder();
+        var expected = new int?[1000];
+        for (int i = 0; i < 1000; i++)
+        {
+            if (rng.NextDouble() < 0.15)
+            {
+                builder.AppendNull();
+                expected[i] = null;
+            }
+            else
+            {
+                int v = i % 50;
+                builder.Append(v);
+                expected[i] = v;
+            }
+        }
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+        Assert.Equal(CompressionCodec.Snappy, result.Metadata.Codec);
+
+        var readBack = (Int32Array)ReadBackColumn(result.Data, column, result.Metadata, 1000);
+        Assert.Equal(1000, readBack.Length);
+        for (int i = 0; i < 1000; i++)
+        {
+            if (expected[i] == null)
+                Assert.False(readBack.IsValid(i));
+            else
+                Assert.Equal(expected[i], readBack.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public void V2_Int32_Zstd_RoundTrips()
+    {
+        var column = MakeDescriptor(PhysicalType.Int32);
+        var writer = new ColumnWriter(column, codec: CompressionCodec.Zstd, pageVersion: DataPageVersion.V2);
+
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < 500; i++) builder.Append(i % 10);
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+        Assert.Equal(CompressionCodec.Zstd, result.Metadata.Codec);
+
+        var readBack = (Int32Array)ReadBackColumn(result.Data, column, result.Metadata, 500);
+        for (int i = 0; i < 500; i++)
+            Assert.Equal(i % 10, readBack.GetValue(i));
+    }
+
+    [Fact]
+    public void V2_Dictionary_Nullable_RoundTrips()
+    {
+        var element = new SchemaElement
+        {
+            Name = "cat",
+            Type = PhysicalType.ByteArray,
+            RepetitionType = FieldRepetitionType.Optional,
+            LogicalType = new LogicalType.StringType(),
+        };
+        var column = MakeDescriptor(PhysicalType.ByteArray, name: "cat", maxDefLevel: 1, schemaElement: element);
+        var writer = new ColumnWriter(column, encoding: Encoding.PlainDictionary, pageVersion: DataPageVersion.V2);
+
+        var builder = new StringArray.Builder();
+        var rng = new Random(99);
+        var categories = new[] { "alpha", "beta", "gamma", null };
+        var expected = new string?[200];
+        for (int i = 0; i < 200; i++)
+        {
+            var val = categories[rng.Next(categories.Length)];
+            expected[i] = val;
+            if (val == null) builder.AppendNull();
+            else builder.Append(val);
+        }
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+        Assert.Contains(Encoding.PlainDictionary, result.Metadata.Encodings); // dict page
+        Assert.Contains(Encoding.RleDictionary, result.Metadata.Encodings); // index pages
+
+        var readBack = (StringArray)ReadBackColumn(result.Data, column, result.Metadata, 200);
+        Assert.Equal(200, readBack.Length);
+        for (int i = 0; i < 200; i++)
+        {
+            if (expected[i] == null)
+                Assert.False(readBack.IsValid(i));
+            else
+                Assert.Equal(expected[i], readBack.GetString(i));
+        }
+    }
+
+    [Fact]
+    public void V2_Boolean_Nullable_RoundTrips()
+    {
+        var column = MakeDescriptor(PhysicalType.Boolean, maxDefLevel: 1);
+        var writer = new ColumnWriter(column, pageVersion: DataPageVersion.V2);
+
+        var builder = new BooleanArray.Builder();
+        builder.Append(true);
+        builder.AppendNull();
+        builder.Append(false);
+        builder.Append(true);
+        builder.AppendNull();
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+
+        var readBack = (BooleanArray)ReadBackColumn(result.Data, column, result.Metadata, 5);
+        Assert.Equal(5, readBack.Length);
+        Assert.True(readBack.GetValue(0));
+        Assert.False(readBack.IsValid(1));
+        Assert.False(readBack.GetValue(2));
+        Assert.True(readBack.GetValue(3));
+        Assert.False(readBack.IsValid(4));
+    }
+
+    [Fact]
+    public void V2_Double_NonNullable_RoundTrips()
+    {
+        var column = MakeDescriptor(PhysicalType.Double);
+        var writer = new ColumnWriter(column, pageVersion: DataPageVersion.V2);
+
+        var builder = new DoubleArray.Builder();
+        builder.Append(3.14);
+        builder.Append(2.71);
+        builder.Append(1.41);
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+
+        var readBack = (DoubleArray)ReadBackColumn(result.Data, column, result.Metadata, 3);
+        Assert.Equal(3.14, readBack.GetValue(0));
+        Assert.Equal(2.71, readBack.GetValue(1));
+        Assert.Equal(1.41, readBack.GetValue(2));
+    }
+
+    [Fact]
+    public void V2_LargeDataset_Compressed_RoundTrips()
+    {
+        var column = MakeDescriptor(PhysicalType.Int32, maxDefLevel: 1);
+        var writer = new ColumnWriter(column, codec: CompressionCodec.Snappy, pageVersion: DataPageVersion.V2);
+
+        var rng = new Random(42);
+        var builder = new Int32Array.Builder();
+        var expected = new int?[10_000];
+        for (int i = 0; i < 10_000; i++)
+        {
+            if (rng.NextDouble() < 0.1)
+            {
+                builder.AppendNull();
+                expected[i] = null;
+            }
+            else
+            {
+                int v = rng.Next(-1000, 1000);
+                builder.Append(v);
+                expected[i] = v;
+            }
+        }
+        var array = builder.Build();
+
+        var result = writer.Write(array);
+        var readBack = (Int32Array)ReadBackColumn(result.Data, column, result.Metadata, 10_000);
+
+        Assert.Equal(10_000, readBack.Length);
+        for (int i = 0; i < 10_000; i++)
+        {
+            if (expected[i] == null)
+                Assert.False(readBack.IsValid(i));
+            else
+                Assert.Equal(expected[i], readBack.GetValue(i));
+        }
+    }
 }

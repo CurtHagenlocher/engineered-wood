@@ -18,19 +18,22 @@ internal sealed class ColumnWriter
     private readonly Encoding _encoding;
     private readonly int _targetPageSize;
     private readonly int _maxDictionarySize;
+    private readonly DataPageVersion _pageVersion;
 
     public ColumnWriter(
         ColumnDescriptor column,
         CompressionCodec codec = CompressionCodec.Uncompressed,
         Encoding encoding = Encoding.Plain,
         int targetPageSize = 1 * 1024 * 1024,
-        int maxDictionarySize = 1 * 1024 * 1024)
+        int maxDictionarySize = 1 * 1024 * 1024,
+        DataPageVersion pageVersion = DataPageVersion.V1)
     {
         _column = column;
         _codec = codec;
         _encoding = encoding;
         _targetPageSize = targetPageSize;
         _maxDictionarySize = maxDictionarySize;
+        _pageVersion = pageVersion;
     }
 
     /// <summary>
@@ -226,8 +229,14 @@ internal sealed class ColumnWriter
     {
         encodingsUsed.Add(Encoding.RleDictionary);
 
-        // For V1: def levels + RLE indices go together per page
-        // For simplicity, write all as a single data page
+        if (_pageVersion == DataPageVersion.V2)
+        {
+            WriteIndexPagesV2(indexData, indexBitWidth, decomposed, numValues,
+                output, encodingsUsed, ref totalUncompressedSize, ref totalCompressedSize);
+            return;
+        }
+
+        // V1: def levels + RLE indices go together, then compress everything
         byte[] defLevelBytes = decomposed.DefLevels != null
             ? LevelEncoder.EncodeV1(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
@@ -247,6 +256,33 @@ internal sealed class ColumnWriter
                 DefinitionLevelEncoding = Encoding.Rle,
                 RepetitionLevelEncoding = Encoding.Rle,
             });
+    }
+
+    private void WriteIndexPagesV2(
+        byte[] indexData,
+        int indexBitWidth,
+        ArrowArrayDecomposer.DecomposedColumn decomposed,
+        int numValues,
+        MemoryStream output,
+        HashSet<Encoding> encodingsUsed,
+        ref long totalUncompressedSize,
+        ref long totalCompressedSize)
+    {
+        byte[] defLevelBytes = decomposed.DefLevels != null
+            ? LevelEncoder.EncodeV2(decomposed.DefLevels, _column.MaxDefinitionLevel)
+            : [];
+
+        // Values = [bit width byte] + index data
+        byte[] valuesData = new byte[1 + indexData.Length];
+        valuesData[0] = (byte)indexBitWidth;
+        indexData.CopyTo(valuesData.AsSpan(1));
+
+        int numNulls = numValues - decomposed.NonNullCount;
+
+        WriteV2Page(output, defLevelBytes, [], valuesData,
+            numValues, numNulls, numValues,
+            Encoding.RleDictionary, encodingsUsed,
+            ref totalUncompressedSize, ref totalCompressedSize);
     }
 
     private void WritePlainPages(
@@ -283,17 +319,31 @@ internal sealed class ColumnWriter
         ref long totalCompressedSize)
     {
         encodingsUsed.Add(encoding);
-
         byte[] encodedValues = EncodeValues(decomposed, encoding);
 
+        if (_pageVersion == DataPageVersion.V2)
+        {
+            byte[] defLevelBytes = decomposed.DefLevels != null
+                ? LevelEncoder.EncodeV2(decomposed.DefLevels, _column.MaxDefinitionLevel)
+                : [];
+
+            int numNulls = numValues - decomposed.NonNullCount;
+
+            WriteV2Page(output, defLevelBytes, [], encodedValues,
+                numValues, numNulls, numValues,
+                encoding, encodingsUsed,
+                ref totalUncompressedSize, ref totalCompressedSize);
+            return;
+        }
+
         // V1 data page: def levels (with 4-byte length prefix) + encoded values
-        byte[] defLevelBytes = decomposed.DefLevels != null
+        byte[] v1DefLevelBytes = decomposed.DefLevels != null
             ? LevelEncoder.EncodeV1(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
 
-        byte[] pageData = new byte[defLevelBytes.Length + encodedValues.Length];
-        defLevelBytes.CopyTo(pageData.AsSpan());
-        encodedValues.CopyTo(pageData.AsSpan(defLevelBytes.Length));
+        byte[] pageData = new byte[v1DefLevelBytes.Length + encodedValues.Length];
+        v1DefLevelBytes.CopyTo(pageData.AsSpan());
+        encodedValues.CopyTo(pageData.AsSpan(v1DefLevelBytes.Length));
 
         WritePage(output, PageType.DataPage, pageData, pageData.Length,
             encodingsUsed, ref totalUncompressedSize, ref totalCompressedSize,
@@ -390,6 +440,76 @@ internal sealed class ColumnWriter
                 System.Runtime.InteropServices.MemoryMarshal.Cast<byte, long>(decomposed.ValueBytes)),
             _ => EncodePlain(decomposed),
         };
+    }
+
+    /// <summary>
+    /// Writes a V2 data page: levels uncompressed prefix, values optionally compressed.
+    /// </summary>
+    private void WriteV2Page(
+        MemoryStream output,
+        byte[] defLevelBytes,
+        byte[] repLevelBytes,
+        byte[] valuesData,
+        int numValues,
+        int numNulls,
+        int numRows,
+        Encoding encoding,
+        HashSet<Encoding> encodingsUsed,
+        ref long totalUncompressedSize,
+        ref long totalCompressedSize)
+    {
+        int uncompressedValuesSize = valuesData.Length;
+        byte[] compressedValues;
+        int compressedValuesSize;
+        bool isCompressed;
+
+        if (_codec == CompressionCodec.Uncompressed)
+        {
+            compressedValues = valuesData;
+            compressedValuesSize = uncompressedValuesSize;
+            isCompressed = false;
+        }
+        else
+        {
+            int maxLen = Compressor.GetMaxCompressedLength(_codec, uncompressedValuesSize);
+            compressedValues = new byte[maxLen];
+            compressedValuesSize = Compressor.Compress(_codec, valuesData, compressedValues);
+            isCompressed = true;
+        }
+
+        // Total page sizes: levels (uncompressed) + values (compressed or not)
+        int totalUncompressed = repLevelBytes.Length + defLevelBytes.Length + uncompressedValuesSize;
+        int totalCompressed = repLevelBytes.Length + defLevelBytes.Length + compressedValuesSize;
+
+        var pageHeader = new PageHeader
+        {
+            Type = PageType.DataPageV2,
+            UncompressedPageSize = totalUncompressed,
+            CompressedPageSize = totalCompressed,
+            DataPageHeaderV2 = new DataPageHeaderV2
+            {
+                NumValues = numValues,
+                NumNulls = numNulls,
+                NumRows = numRows,
+                Encoding = encoding,
+                DefinitionLevelsByteLength = defLevelBytes.Length,
+                RepetitionLevelsByteLength = repLevelBytes.Length,
+                IsCompressed = isCompressed,
+            }
+        };
+
+        byte[] headerBytes = PageHeaderEncoder.Encode(pageHeader);
+
+        output.Write(headerBytes);
+        if (repLevelBytes.Length > 0) output.Write(repLevelBytes);
+        if (defLevelBytes.Length > 0) output.Write(defLevelBytes);
+        output.Write(compressedValues, 0, compressedValuesSize);
+
+        totalUncompressedSize += headerBytes.Length + totalUncompressed;
+        totalCompressedSize += headerBytes.Length + totalCompressed;
+
+        if (_column.MaxDefinitionLevel > 0)
+            encodingsUsed.Add(Encoding.Rle);
     }
 
     private void WritePage(

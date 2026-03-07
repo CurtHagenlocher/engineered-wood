@@ -35,6 +35,9 @@ public sealed class ParquetWriteOptions
     /// <summary>Parquet format version. Default: 2.</summary>
     public int Version { get; init; } = 2;
 
+    /// <summary>Data page version: V1 or V2. Default: V2.</summary>
+    public DataPageVersion DataPageVersion { get; init; } = DataPageVersion.V2;
+
     /// <summary>Created-by identifier written to the file footer.</summary>
     public string CreatedBy { get; init; } = "EngineeredWood";
 

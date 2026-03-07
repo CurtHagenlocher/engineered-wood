@@ -97,7 +97,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable
                 codec: codec,
                 encoding: encoding,
                 targetPageSize: _options.TargetPageSize,
-                maxDictionarySize: _options.MaxDictionarySize);
+                maxDictionarySize: _options.MaxDictionarySize,
+                pageVersion: _options.DataPageVersion);
 
             var array = batch.Column(i);
             var writeResult = colWriter.Write(array);

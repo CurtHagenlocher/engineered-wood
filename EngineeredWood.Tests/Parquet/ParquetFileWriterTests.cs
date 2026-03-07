@@ -427,4 +427,273 @@ public class ParquetFileWriterTests : IDisposable
 
         Assert.Equal("TestWriter 1.0", meta.CreatedBy);
     }
+
+    // --- V2 Data Page Tests (file-level) ---
+
+    [Fact]
+    public async Task V2_DefaultPageVersion_Is_V2()
+    {
+        // The default options should write V2 pages
+        var options = new ParquetWriteOptions();
+        Assert.Equal(DataPageVersion.V2, options.DataPageVersion);
+    }
+
+    [Fact]
+    public async Task V2_Int32_Nullable_RoundTrips()
+    {
+        var options = new ParquetWriteOptions { DataPageVersion = DataPageVersion.V2 };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("value", Int32Type.Default, nullable: true))
+            .Build();
+
+        var builder = new Int32Array.Builder();
+        builder.Append(10);
+        builder.AppendNull();
+        builder.Append(30);
+        builder.AppendNull();
+        builder.Append(50);
+
+        var batch = new RecordBatch(schema, [builder.Build()], 5);
+        var result = await WriteAndRead(batch, options);
+
+        var col = (Int32Array)result.Column(0);
+        Assert.Equal(5, col.Length);
+        Assert.Equal(10, col.GetValue(0));
+        Assert.False(col.IsValid(1));
+        Assert.Equal(30, col.GetValue(2));
+        Assert.False(col.IsValid(3));
+        Assert.Equal(50, col.GetValue(4));
+    }
+
+    [Fact]
+    public async Task V2_MultipleColumns_WithCompression_RoundTrips()
+    {
+        var options = new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+            Codec = CompressionCodec.Snappy,
+        };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, nullable: false))
+            .Field(new Field("name", Apache.Arrow.Types.StringType.Default, nullable: true))
+            .Field(new Field("score", DoubleType.Default, nullable: true))
+            .Build();
+
+        var idBuilder = new Int32Array.Builder();
+        var nameBuilder = new StringArray.Builder();
+        var scoreBuilder = new DoubleArray.Builder();
+
+        for (int i = 0; i < 200; i++)
+        {
+            idBuilder.Append(i);
+            nameBuilder.Append(i % 7 == 0 ? null : $"item_{i}");
+            scoreBuilder.Append(i % 4 == 0 ? null : (double?)(i * 2.5));
+        }
+
+        var batch = new RecordBatch(schema,
+            [idBuilder.Build(), nameBuilder.Build(), scoreBuilder.Build()], 200);
+        var result = await WriteAndRead(batch, options);
+
+        Assert.Equal(200, result.Length);
+        var ids = (Int32Array)result.Column(0);
+        var names = (StringArray)result.Column(1);
+        var scores = (DoubleArray)result.Column(2);
+
+        for (int i = 0; i < 200; i++)
+        {
+            Assert.Equal(i, ids.GetValue(i));
+            if (i % 7 == 0)
+                Assert.False(names.IsValid(i));
+            else
+                Assert.Equal($"item_{i}", names.GetString(i));
+            if (i % 4 == 0)
+                Assert.False(scores.IsValid(i));
+            else
+                Assert.Equal(i * 2.5, scores.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task V2_Zstd_RoundTrips()
+    {
+        var options = new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+            Codec = CompressionCodec.Zstd,
+        };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", Int64Type.Default, nullable: true))
+            .Build();
+
+        var builder = new Int64Array.Builder();
+        for (int i = 0; i < 500; i++)
+            builder.Append(i % 3 == 0 ? null : (long?)(i * 100L));
+
+        var batch = new RecordBatch(schema, [builder.Build()], 500);
+        var result = await WriteAndRead(batch, options);
+
+        var col = (Int64Array)result.Column(0);
+        Assert.Equal(500, col.Length);
+        for (int i = 0; i < 500; i++)
+        {
+            if (i % 3 == 0)
+                Assert.False(col.IsValid(i));
+            else
+                Assert.Equal(i * 100L, col.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task V2_LargeDataset_RoundTrips()
+    {
+        var options = new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+            Codec = CompressionCodec.Snappy,
+        };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, nullable: false))
+            .Field(new Field("value", DoubleType.Default, nullable: true))
+            .Build();
+
+        var idBuilder = new Int32Array.Builder();
+        var valBuilder = new DoubleArray.Builder();
+        var rng = new Random(42);
+
+        int rowCount = 50_000;
+        var expectedValues = new double?[rowCount];
+
+        for (int i = 0; i < rowCount; i++)
+        {
+            idBuilder.Append(i);
+            if (rng.NextDouble() < 0.1)
+            {
+                valBuilder.AppendNull();
+                expectedValues[i] = null;
+            }
+            else
+            {
+                double v = rng.NextDouble() * 1000;
+                valBuilder.Append(v);
+                expectedValues[i] = v;
+            }
+        }
+
+        var batch = new RecordBatch(schema,
+            [idBuilder.Build(), valBuilder.Build()], rowCount);
+        var result = await WriteAndRead(batch, options);
+
+        Assert.Equal(rowCount, result.Length);
+        var ids = (Int32Array)result.Column(0);
+        var vals = (DoubleArray)result.Column(1);
+
+        for (int i = 0; i < rowCount; i++)
+        {
+            Assert.Equal(i, ids.GetValue(i));
+            if (expectedValues[i] == null)
+                Assert.False(vals.IsValid(i));
+            else
+                Assert.Equal(expectedValues[i], vals.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task V2_MultipleRowGroups_RoundTrips()
+    {
+        var path = TempFile("v2-multi-rg.parquet");
+        var options = new ParquetWriteOptions { DataPageVersion = DataPageVersion.V2 };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("value", Int32Type.Default, nullable: true))
+            .Build();
+
+        await using (var output = new LocalOutputFile(path))
+        await using (var writer = new ParquetFileWriter(output, options))
+        {
+            var b1 = new Int32Array.Builder();
+            for (int i = 0; i < 100; i++)
+                b1.Append(i % 5 == 0 ? null : (int?)i);
+            await writer.WriteAsync(new RecordBatch(schema, [b1.Build()], 100));
+
+            var b2 = new Int32Array.Builder();
+            for (int i = 100; i < 250; i++)
+                b2.Append(i % 7 == 0 ? null : (int?)i);
+            await writer.WriteAsync(new RecordBatch(schema, [b2.Build()], 150));
+        }
+
+        using var input = new LocalRandomAccessFile(path);
+        var reader = new ParquetFileReader(input);
+        var meta = await reader.ReadMetadataAsync();
+
+        Assert.Equal(250, meta.NumRows);
+        Assert.Equal(2, meta.RowGroups.Count);
+
+        var rg0 = await reader.ReadRowGroupAsync(0);
+        var col0 = (Int32Array)rg0.Column(0);
+        for (int i = 0; i < 100; i++)
+        {
+            if (i % 5 == 0)
+                Assert.False(col0.IsValid(i));
+            else
+                Assert.Equal(i, col0.GetValue(i));
+        }
+
+        var rg1 = await reader.ReadRowGroupAsync(1);
+        var col1 = (Int32Array)rg1.Column(0);
+        for (int i = 0; i < 150; i++)
+        {
+            int val = i + 100;
+            if (val % 7 == 0)
+                Assert.False(col1.IsValid(i));
+            else
+                Assert.Equal(val, col1.GetValue(i));
+        }
+    }
+
+    // --- Explicit V1 Tests (ensure V1 still works when selected) ---
+
+    [Fact]
+    public async Task V1_Explicit_Int32_Nullable_RoundTrips()
+    {
+        var options = new ParquetWriteOptions { DataPageVersion = DataPageVersion.V1 };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("value", Int32Type.Default, nullable: true))
+            .Build();
+
+        var builder = new Int32Array.Builder();
+        builder.Append(1);
+        builder.AppendNull();
+        builder.Append(3);
+
+        var batch = new RecordBatch(schema, [builder.Build()], 3);
+        var result = await WriteAndRead(batch, options);
+
+        var col = (Int32Array)result.Column(0);
+        Assert.Equal(3, col.Length);
+        Assert.Equal(1, col.GetValue(0));
+        Assert.False(col.IsValid(1));
+        Assert.Equal(3, col.GetValue(2));
+    }
+
+    [Fact]
+    public async Task V1_Explicit_WithSnappy_RoundTrips()
+    {
+        var options = new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V1,
+            Codec = CompressionCodec.Snappy,
+        };
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("x", Int32Type.Default, nullable: false))
+            .Build();
+
+        var builder = new Int32Array.Builder();
+        for (int i = 0; i < 1000; i++) builder.Append(i);
+
+        var batch = new RecordBatch(schema, [builder.Build()], 1000);
+        var result = await WriteAndRead(batch, options);
+
+        var col = (Int32Array)result.Column(0);
+        for (int i = 0; i < 1000; i++)
+            Assert.Equal(i, col.GetValue(i));
+    }
 }

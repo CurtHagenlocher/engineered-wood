@@ -105,3 +105,14 @@ public enum BoundaryOrder
     Ascending = 1,
     Descending = 2,
 }
+
+/// <summary>
+/// Data page format version for writing.
+/// </summary>
+public enum DataPageVersion
+{
+    /// <summary>V1: levels + values compressed together.</summary>
+    V1 = 1,
+    /// <summary>V2: levels uncompressed prefix, only values compressed.</summary>
+    V2 = 2,
+}
