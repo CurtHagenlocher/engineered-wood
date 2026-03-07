@@ -15,6 +15,8 @@ static class FileManifest
     private const string PdS = Pd + "special/";
     private const string PdI = Pd + "issues/";
     private const string Pt = "https://raw.githubusercontent.com/hangxie/parquet-tools/main/testdata/";
+    private const string Dk = "https://raw.githubusercontent.com/duckdb/duckdb/main/data/parquet-testing/";
+    private const string DkC = Dk + "compression/generated/";
     private const string Hf = "https://huggingface.co/datasets/";
 
     public static IReadOnlyList<FileEntry> Files { get; } =
@@ -117,6 +119,63 @@ static class FileManifest
 
         // UNKNOWN logical type (NullType) — supported
         new(Pt + "unknown-type.parquet",         "pt-unknown-type.parquet",         "parquet-tools", ExpectedOutcome.Pass),
+
+        // ── duckdb/duckdb (~45 files) ────────────────────────────────────
+        // Bug regression files
+        new(Dk + "bug687_nulls.parquet",           "dk-bug687_nulls.parquet",           "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug1554.parquet",                "dk-bug1554.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug1588.parquet",                "dk-bug1588.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug1589.parquet",                "dk-bug1589.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug1618_struct_strings.parquet", "dk-bug1618_struct_strings.parquet", "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug2267.parquet",                "dk-bug2267.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug2557.parquet",                "dk-bug2557.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug3734.parquet",                "dk-bug3734.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug4442.parquet",                "dk-bug4442.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug4859.parquet",                "dk-bug4859.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug4903.parquet",                "dk-bug4903.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug10148-wide-decimal-stats.parquet","dk-bug10148-wide-decimal-stats.parquet","duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug13053.parquet",               "dk-bug13053.parquet",               "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "bug14120-dict-nulls-only.parquet","dk-bug14120-dict-nulls-only.parquet","duckdb", ExpectedOutcome.Pass),
+
+        // Encoding edge cases
+        new(Dk + "byte_stream_split.parquet",      "dk-byte_stream_split.parquet",      "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "dbp_small_decimal.parquet",      "dk-dbp_small_decimal.parquet",      "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "issue10279_delta_encoding.parquet","dk-issue10279_delta_encoding.parquet","duckdb", ExpectedOutcome.Pass),
+
+        // Compression variants (data page V1 + V2 × all codecs)
+        new(DkC + "data_page=1_BROTLI.parquet",   "dk-dp1-brotli.parquet",             "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=1_GZIP.parquet",      "dk-dp1-gzip.parquet",              "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=1_LZ4.parquet",       "dk-dp1-lz4.parquet",               "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=1_NONE.parquet",      "dk-dp1-none.parquet",              "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=1_SNAPPY.parquet",    "dk-dp1-snappy.parquet",            "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=1_ZSTD.parquet",      "dk-dp1-zstd.parquet",              "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=2_BROTLI.parquet",    "dk-dp2-brotli.parquet",            "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=2_GZIP.parquet",      "dk-dp2-gzip.parquet",              "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=2_LZ4.parquet",       "dk-dp2-lz4.parquet",               "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=2_NONE.parquet",      "dk-dp2-none.parquet",              "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=2_SNAPPY.parquet",    "dk-dp2-snappy.parquet",            "duckdb", ExpectedOutcome.Pass),
+        new(DkC + "data_page=2_ZSTD.parquet",      "dk-dp2-zstd.parquet",              "duckdb", ExpectedOutcome.Pass),
+
+        // Type and schema edge cases
+        new(Dk + "struct.parquet",                 "dk-struct.parquet",                 "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "map.parquet",                    "dk-map.parquet",                    "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "complex.parquet",                "dk-complex.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "enum.parquet",                   "dk-enum.parquet",                   "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "unsigned.parquet",               "dk-unsigned.parquet",               "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "blob.parquet",                   "dk-blob.parquet",                   "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "binary_string.parquet",          "dk-binary_string.parquet",          "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "date.parquet",                   "dk-date.parquet",                   "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "timestamp.parquet",              "dk-timestamp.parquet",              "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "timestamp-ms.parquet",           "dk-timestamp-ms.parquet",           "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "float16.parquet",                "dk-float16.parquet",                "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "decimal/pandas_decimal.parquet", "dk-pandas_decimal.parquet",         "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "decimal/decimal_dc.parquet",     "dk-decimal_dc.parquet",             "duckdb", ExpectedOutcome.Pass),
+
+        // Multi-row-group and misc
+        new(Dk + "manyrowgroups.parquet",          "dk-manyrowgroups.parquet",          "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "simple.parquet",                 "dk-simple.parquet",                 "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "userdata1.parquet",              "dk-userdata1.parquet",              "duckdb", ExpectedOutcome.Pass),
+        new(Dk + "zstd.parquet",                   "dk-zstd.parquet",                   "duckdb", ExpectedOutcome.Pass),
 
         // ── Hugging Face (3 files) ────────────────────────────────────────
         new(Hf + "scikit-learn/iris/resolve/refs%2Fconvert%2Fparquet/default/train/0000.parquet",
