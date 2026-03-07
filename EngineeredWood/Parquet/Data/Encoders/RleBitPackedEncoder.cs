@@ -50,7 +50,6 @@ internal sealed class RleBitPackedEncoder
         _output.SetLength(0);
         if (_buffered.Count == 0 || _bitWidth == 0)
         {
-            // bitWidth 0 means all values are 0 — still need to emit an RLE run
             if (_buffered.Count > 0 && _bitWidth == 0)
             {
                 WriteRleRun(0, _buffered.Count);
@@ -59,47 +58,58 @@ internal sealed class RleBitPackedEncoder
             return _output.ToArray();
         }
 
-        EncodeValues();
+        EncodeValues(System.Runtime.InteropServices.CollectionsMarshal.AsSpan(_buffered));
         _buffered.Clear();
         return _output.ToArray();
     }
 
-    private void EncodeValues()
+    /// <summary>
+    /// Encodes a span of values directly without buffering. More efficient when values are already in contiguous memory.
+    /// </summary>
+    public static byte[] Encode(ReadOnlySpan<int> values, int bitWidth)
+    {
+        var encoder = new RleBitPackedEncoder(bitWidth, Math.Max(256, values.Length * bitWidth / 8));
+        if (values.Length == 0 || bitWidth == 0)
+        {
+            if (values.Length > 0 && bitWidth == 0)
+                encoder.WriteRleRun(0, values.Length);
+            return encoder._output.ToArray();
+        }
+        encoder.EncodeValues(values);
+        return encoder._output.ToArray();
+    }
+
+    private void EncodeValues(ReadOnlySpan<int> values)
     {
         int i = 0;
-        int count = _buffered.Count;
+        int count = values.Length;
 
         while (i < count)
         {
-            // Look ahead to decide between RLE and bit-packing.
-            // Use RLE if there are >= 8 consecutive equal values.
             int runLength = 1;
-            while (i + runLength < count && _buffered[i + runLength] == _buffered[i])
+            while (i + runLength < count && values[i + runLength] == values[i])
                 runLength++;
 
             if (runLength >= 8)
             {
-                WriteRleRun(_buffered[i], runLength);
+                WriteRleRun(values[i], runLength);
                 i += runLength;
             }
             else
             {
-                // Bit-pack in groups of 8. Collect values until we hit an RLE-worthy run.
                 int start = i;
                 while (i < count)
                 {
                     int ahead = 1;
-                    while (i + ahead < count && _buffered[i + ahead] == _buffered[i])
+                    while (i + ahead < count && values[i + ahead] == values[i])
                         ahead++;
 
                     if (ahead >= 8)
-                        break; // let the next iteration handle this as RLE
+                        break;
 
                     i++;
                 }
 
-                // When not at the end, absorb extra values to fill the last group of 8.
-                // Zero-padding in the middle of the stream would corrupt subsequent values.
                 int bitPackedCount = i - start;
                 if (i < count && bitPackedCount % 8 != 0)
                 {
@@ -107,7 +117,7 @@ internal sealed class RleBitPackedEncoder
                     i = Math.Min(i + needed, count);
                 }
 
-                WriteBitPackedRun(start, i - start);
+                WriteBitPackedRun(values, start, i - start);
             }
         }
     }
@@ -123,7 +133,7 @@ internal sealed class RleBitPackedEncoder
             _output.WriteByte((byte)((value >> (i * 8)) & 0xFF));
     }
 
-    private void WriteBitPackedRun(int start, int count)
+    private void WriteBitPackedRun(ReadOnlySpan<int> values, int start, int count)
     {
         // Pad to a multiple of 8
         int groupCount = (count + 7) / 8;
@@ -135,16 +145,15 @@ internal sealed class RleBitPackedEncoder
         // Bit-pack values, LSB first
         int totalBits = paddedCount * _bitWidth;
         int totalBytes = (totalBits + 7) / 8;
-        var packed = new byte[totalBytes];
+        Span<byte> packed = totalBytes <= 256 ? stackalloc byte[totalBytes] : new byte[totalBytes];
 
         int bitOffset = 0;
         for (int i = 0; i < paddedCount; i++)
         {
-            int value = (start + i < start + count) ? _buffered[start + i] : 0;
+            int value = (i < count) ? values[start + i] : 0;
             int byteIdx = bitOffset >> 3;
             int bitIdx = bitOffset & 7;
 
-            // Write value bits starting at bitIdx
             if (_bitWidth > 0)
             {
                 long bits = (long)(uint)value << bitIdx;
@@ -156,7 +165,7 @@ internal sealed class RleBitPackedEncoder
             bitOffset += _bitWidth;
         }
 
-        _output.Write(packed, 0, totalBytes);
+        _output.Write(packed);
     }
 
     private void WriteVarInt(int value)

@@ -77,7 +77,7 @@ internal sealed class ColumnWriter
 
         if (_encoding == Encoding.RleDictionary || _encoding == Encoding.PlainDictionary)
         {
-            var dictResult = TryBuildDictionary(decomposed);
+            var dictResult = TryBuildDictionary(decomposed, numValues);
 
             if (dictResult.HasValue)
             {
@@ -183,9 +183,9 @@ internal sealed class ColumnWriter
     /// Builds a dictionary from the decomposed values without writing anything.
     /// Returns null if the dictionary exceeds the size limit.
     /// </summary>
-    private DictBuildResult? TryBuildDictionary(ArrowArrayDecomposer.DecomposedColumn decomposed)
+    private DictBuildResult? TryBuildDictionary(ArrowArrayDecomposer.DecomposedColumn decomposed, int valueCount)
     {
-        var dictEncoder = new DictionaryEncoder(_column.PhysicalType);
+        var dictEncoder = new DictionaryEncoder(_column.PhysicalType, estimatedValues: valueCount);
 
         if (_column.PhysicalType == PhysicalType.Boolean && decomposed.BoolValues != null)
         {

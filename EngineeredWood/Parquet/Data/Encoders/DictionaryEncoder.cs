@@ -6,27 +6,40 @@ namespace EngineeredWood.Parquet.Data.Encoders;
 /// <summary>
 /// Encodes values using dictionary encoding (PLAIN_DICTIONARY / RLE_DICTIONARY).
 /// Produces a PLAIN-encoded dictionary page and RLE-encoded index pages.
+/// Uses flat buffers to minimize per-entry heap allocations.
 /// </summary>
 internal sealed class DictionaryEncoder
 {
     private readonly PhysicalType _physicalType;
-    private readonly int _typeLength; // for FIXED_LEN_BYTE_ARRAY
-    private readonly Dictionary<long, int> _fixedWidthDict = new();
-    private readonly Dictionary<ByteArrayKey, int> _byteArrayDict = new(ByteArrayKeyComparer.Instance);
-    private readonly List<byte[]> _dictEntries = new();
-    private readonly List<int> _indices = new();
+    private readonly int _typeLength;
     private readonly int _entryByteWidth;
 
+    // Fixed-width: value bits → dict index, entries stored in flat buffer
+    private readonly Dictionary<long, int> _fixedWidthDict = new();
+    private byte[] _fixedBuf = new byte[256];
+    private int _fixedCount;
+
+    // Variable-width: entries stored in flat buffer + offsets, lookup via hash
+    private byte[] _varBuf = new byte[256];
+    private int _varBufLen;
+    private readonly List<int> _varOffsets = new();
+    private readonly Dictionary<VarKey, int> _varDict;
+
+    // Indices (one per value added)
+    private int[] _indices = new int[256];
+    private int _indexCount;
+
     /// <summary>Number of distinct values in the dictionary.</summary>
-    public int DictionarySize => _dictEntries.Count;
+    public int DictionarySize => _physicalType is PhysicalType.ByteArray or PhysicalType.FixedLenByteArray
+        ? _varOffsets.Count : _fixedCount;
 
     /// <summary>Total byte size of the dictionary entries.</summary>
     public int DictionaryByteSize { get; private set; }
 
     /// <summary>Number of values encoded so far.</summary>
-    public int ValueCount => _indices.Count;
+    public int ValueCount => _indexCount;
 
-    public DictionaryEncoder(PhysicalType physicalType, int typeLength = 0)
+    public DictionaryEncoder(PhysicalType physicalType, int typeLength = 0, int estimatedValues = 0)
     {
         _physicalType = physicalType;
         _typeLength = typeLength;
@@ -37,184 +50,236 @@ internal sealed class DictionaryEncoder
             PhysicalType.Int64 or PhysicalType.Double => 8,
             PhysicalType.Int96 => 12,
             PhysicalType.FixedLenByteArray => typeLength,
-            PhysicalType.ByteArray => 0, // variable
+            PhysicalType.ByteArray => 0,
             _ => throw new ArgumentOutOfRangeException(nameof(physicalType)),
         };
+
+        if (estimatedValues > 0)
+        {
+            _indices = new int[estimatedValues];
+            int estDistinct = Math.Min(estimatedValues, 16384);
+            _fixedWidthDict = new(estDistinct);
+            if (_entryByteWidth > 0)
+                _fixedBuf = new byte[estDistinct * _entryByteWidth];
+        }
+        _varDict = new Dictionary<VarKey, int>(new VarKeyComparer(this));
     }
 
-    /// <summary>Adds an Int32 value and returns its dictionary index.</summary>
     public int AddInt32(int value)
     {
         long key = value;
         if (!_fixedWidthDict.TryGetValue(key, out int index))
         {
-            index = _dictEntries.Count;
+            index = _fixedCount++;
             _fixedWidthDict[key] = index;
-            var entry = new byte[4];
-            BinaryPrimitives.WriteInt32LittleEndian(entry, value);
-            _dictEntries.Add(entry);
+            EnsureFixedCapacity(index);
+            BinaryPrimitives.WriteInt32LittleEndian(
+                _fixedBuf.AsSpan(index * 4, 4), value);
             DictionaryByteSize += 4;
         }
-        _indices.Add(index);
+        AppendIndex(index);
         return index;
     }
 
-    /// <summary>Adds an Int64 value and returns its dictionary index.</summary>
     public int AddInt64(long value)
     {
         if (!_fixedWidthDict.TryGetValue(value, out int index))
         {
-            index = _dictEntries.Count;
+            index = _fixedCount++;
             _fixedWidthDict[value] = index;
-            var entry = new byte[8];
-            BinaryPrimitives.WriteInt64LittleEndian(entry, value);
-            _dictEntries.Add(entry);
+            EnsureFixedCapacity(index);
+            BinaryPrimitives.WriteInt64LittleEndian(
+                _fixedBuf.AsSpan(index * 8, 8), value);
             DictionaryByteSize += 8;
         }
-        _indices.Add(index);
+        AppendIndex(index);
         return index;
     }
 
-    /// <summary>Adds a Float value and returns its dictionary index.</summary>
     public int AddFloat(float value)
     {
         long key = BitConverter.SingleToInt32Bits(value);
         if (!_fixedWidthDict.TryGetValue(key, out int index))
         {
-            index = _dictEntries.Count;
+            index = _fixedCount++;
             _fixedWidthDict[key] = index;
-            var entry = new byte[4];
-            BinaryPrimitives.WriteSingleLittleEndian(entry, value);
-            _dictEntries.Add(entry);
+            EnsureFixedCapacity(index);
+            BinaryPrimitives.WriteSingleLittleEndian(
+                _fixedBuf.AsSpan(index * 4, 4), value);
             DictionaryByteSize += 4;
         }
-        _indices.Add(index);
+        AppendIndex(index);
         return index;
     }
 
-    /// <summary>Adds a Double value and returns its dictionary index.</summary>
     public int AddDouble(double value)
     {
         long key = BitConverter.DoubleToInt64Bits(value);
         if (!_fixedWidthDict.TryGetValue(key, out int index))
         {
-            index = _dictEntries.Count;
+            index = _fixedCount++;
             _fixedWidthDict[key] = index;
-            var entry = new byte[8];
-            BinaryPrimitives.WriteDoubleLittleEndian(entry, value);
-            _dictEntries.Add(entry);
+            EnsureFixedCapacity(index);
+            BinaryPrimitives.WriteDoubleLittleEndian(
+                _fixedBuf.AsSpan(index * 8, 8), value);
             DictionaryByteSize += 8;
         }
-        _indices.Add(index);
+        AppendIndex(index);
         return index;
     }
 
-    /// <summary>Adds a ByteArray value and returns its dictionary index.</summary>
     public int AddByteArray(ReadOnlySpan<byte> value)
     {
-        var key = new ByteArrayKey(value.ToArray());
-        if (!_byteArrayDict.TryGetValue(key, out int index))
+        // Write to buffer temporarily for hash/compare, keep if new
+        int tempOffset = _varBufLen;
+        EnsureVarCapacity(value.Length);
+        value.CopyTo(_varBuf.AsSpan(tempOffset));
+
+        var lookupKey = new VarKey(tempOffset, value.Length);
+        if (_varDict.TryGetValue(lookupKey, out int index))
         {
-            index = _dictEntries.Count;
-            _byteArrayDict[key] = index;
-            _dictEntries.Add(value.ToArray());
-            DictionaryByteSize += 4 + value.Length; // 4-byte length prefix + data
+            // Duplicate — don't advance buffer
+            AppendIndex(index);
+            return index;
         }
-        _indices.Add(index);
+
+        // New entry — keep the data in the buffer
+        _varBufLen += value.Length;
+        index = _varOffsets.Count;
+        _varOffsets.Add(tempOffset);
+        _varDict[lookupKey] = index;
+        DictionaryByteSize += 4 + value.Length;
+        AppendIndex(index);
         return index;
     }
 
-    /// <summary>Adds a FixedLenByteArray value and returns its dictionary index.</summary>
     public int AddFixedLenByteArray(ReadOnlySpan<byte> value)
     {
-        var key = new ByteArrayKey(value.ToArray());
-        if (!_byteArrayDict.TryGetValue(key, out int index))
+        int tempOffset = _varBufLen;
+        EnsureVarCapacity(value.Length);
+        value.CopyTo(_varBuf.AsSpan(tempOffset));
+
+        var lookupKey = new VarKey(tempOffset, value.Length);
+        if (_varDict.TryGetValue(lookupKey, out int index))
         {
-            index = _dictEntries.Count;
-            _byteArrayDict[key] = index;
-            _dictEntries.Add(value.ToArray());
-            DictionaryByteSize += value.Length;
+            AppendIndex(index);
+            return index;
         }
-        _indices.Add(index);
+
+        _varBufLen += value.Length;
+        index = _varOffsets.Count;
+        _varOffsets.Add(tempOffset);
+        _varDict[lookupKey] = index;
+        DictionaryByteSize += value.Length;
+        AppendIndex(index);
         return index;
     }
 
-    /// <summary>
-    /// Produces the PLAIN-encoded dictionary page bytes.
-    /// </summary>
+    /// <summary>Produces the PLAIN-encoded dictionary page bytes.</summary>
     public byte[] EncodeDictionaryPage()
     {
         if (_physicalType == PhysicalType.ByteArray)
         {
             // Length-prefixed format
-            var ms = new MemoryStream(DictionaryByteSize);
-            Span<byte> lenBuf = stackalloc byte[4];
-            foreach (var entry in _dictEntries)
+            var result = new byte[DictionaryByteSize];
+            int pos = 0;
+            for (int i = 0; i < _varOffsets.Count; i++)
             {
-                BinaryPrimitives.WriteInt32LittleEndian(lenBuf, entry.Length);
-                ms.Write(lenBuf);
-                ms.Write(entry);
+                int start = _varOffsets[i];
+                int len = (i + 1 < _varOffsets.Count ? _varOffsets[i + 1] : _varBufLen) - start;
+                BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(pos), len);
+                pos += 4;
+                _varBuf.AsSpan(start, len).CopyTo(result.AsSpan(pos));
+                pos += len;
             }
-            return ms.ToArray();
+            return result;
         }
 
-        // Fixed-width: concatenate entries
-        var result = new byte[_dictEntries.Count * (_physicalType == PhysicalType.FixedLenByteArray ? _typeLength : _entryByteWidth)];
-        int pos = 0;
-        foreach (var entry in _dictEntries)
+        if (_physicalType == PhysicalType.FixedLenByteArray)
         {
-            entry.CopyTo(result, pos);
-            pos += entry.Length;
+            return _varBuf.AsSpan(0, _varBufLen).ToArray();
         }
-        return result;
+
+        // Fixed-width: slice the flat buffer
+        return _fixedBuf.AsSpan(0, _fixedCount * _entryByteWidth).ToArray();
     }
 
-    /// <summary>
-    /// Produces the RLE-encoded index page bytes.
-    /// The format is: [1-byte bitWidth] [RLE/bit-packed indices].
-    /// </summary>
+    /// <summary>Produces the RLE-encoded index page bytes.</summary>
     public byte[] EncodeIndices()
     {
         int bitWidth = DictionarySize <= 1 ? 0 : 32 - BitOperations.LeadingZeroCount((uint)(DictionarySize - 1));
-        // Minimum bitWidth is 1 even if dictionary has only one entry (to match spec requirement)
         if (bitWidth == 0 && DictionarySize > 0)
             bitWidth = 1;
 
-        var rle = new RleBitPackedEncoder(bitWidth);
-        foreach (int idx in _indices)
-            rle.WriteValue(idx);
-
-        var rleBytes = rle.Finish();
-        return rleBytes;
+        return RleBitPackedEncoder.Encode(_indices.AsSpan(0, _indexCount), bitWidth);
     }
 
-    /// <summary>
-    /// Returns the bit width needed for dictionary indices.
-    /// </summary>
+    /// <summary>Returns the bit width needed for dictionary indices.</summary>
     public int GetIndexBitWidth()
     {
         if (DictionarySize <= 1) return DictionarySize == 0 ? 0 : 1;
         return 32 - BitOperations.LeadingZeroCount((uint)(DictionarySize - 1));
     }
 
-    // --- ByteArray key for dictionary lookups ---
-
-    private readonly struct ByteArrayKey
+    private void AppendIndex(int index)
     {
-        public readonly byte[] Data;
-        public ByteArrayKey(byte[] data) => Data = data;
+        if (_indexCount == _indices.Length)
+            Array.Resize(ref _indices, _indices.Length * 2);
+        _indices[_indexCount++] = index;
     }
 
-    private sealed class ByteArrayKeyComparer : IEqualityComparer<ByteArrayKey>
+    private void EnsureFixedCapacity(int entryIndex)
     {
-        public static readonly ByteArrayKeyComparer Instance = new();
-
-        public bool Equals(ByteArrayKey x, ByteArrayKey y) =>
-            x.Data.AsSpan().SequenceEqual(y.Data);
-
-        public int GetHashCode(ByteArrayKey obj)
+        int needed = (entryIndex + 1) * _entryByteWidth;
+        if (needed > _fixedBuf.Length)
         {
-            var data = obj.Data;
+            int newLen = _fixedBuf.Length;
+            while (newLen < needed) newLen *= 2;
+            Array.Resize(ref _fixedBuf, newLen);
+        }
+    }
+
+    private void EnsureVarCapacity(int additionalBytes)
+    {
+        int needed = _varBufLen + additionalBytes;
+        if (needed > _varBuf.Length)
+        {
+            int newLen = _varBuf.Length;
+            while (newLen < needed) newLen *= 2;
+            Array.Resize(ref _varBuf, newLen);
+        }
+    }
+
+    // Key that references a slice of the shared _varBuf (no per-entry byte[] allocation)
+    private readonly struct VarKey : IEquatable<VarKey>
+    {
+        public readonly int Offset;
+        public readonly int Length;
+
+        public VarKey(int offset, int length)
+        {
+            Offset = offset;
+            Length = length;
+        }
+
+        public bool Equals(VarKey other) => Offset == other.Offset && Length == other.Length;
+        public override bool Equals(object? obj) => obj is VarKey other && Equals(other);
+        public override int GetHashCode() => HashCode.Combine(Offset, Length);
+    }
+
+    // Compares VarKeys by their actual byte content in the shared buffer
+    private sealed class VarKeyComparer : IEqualityComparer<VarKey>
+    {
+        private readonly DictionaryEncoder _encoder;
+        public VarKeyComparer(DictionaryEncoder encoder) => _encoder = encoder;
+
+        public bool Equals(VarKey x, VarKey y) =>
+            _encoder._varBuf.AsSpan(x.Offset, x.Length)
+                .SequenceEqual(_encoder._varBuf.AsSpan(y.Offset, y.Length));
+
+        public int GetHashCode(VarKey key)
+        {
+            var data = _encoder._varBuf.AsSpan(key.Offset, key.Length);
             uint hash = 2166136261;
             for (int i = 0; i < data.Length; i++)
                 hash = (hash ^ data[i]) * 16777619;

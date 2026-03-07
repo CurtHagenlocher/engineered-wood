@@ -1,3 +1,4 @@
+using System.Buffers;
 using System.Buffers.Binary;
 
 namespace EngineeredWood.Parquet.Data.Encoders;
@@ -16,13 +17,7 @@ internal static class LevelEncoder
         if (maxLevel == 0)
             return [];
 
-        int bitWidth = LevelDecoder.GetBitWidth(maxLevel);
-        var rleEncoder = new RleBitPackedEncoder(bitWidth);
-
-        for (int i = 0; i < levels.Length; i++)
-            rleEncoder.WriteValue(levels[i]);
-
-        byte[] rleData = rleEncoder.Finish();
+        byte[] rleData = EncodeRle(levels, maxLevel);
 
         // V1 format: [4-byte length][RLE data]
         var result = new byte[4 + rleData.Length];
@@ -40,12 +35,22 @@ internal static class LevelEncoder
         if (maxLevel == 0)
             return [];
 
+        return EncodeRle(levels, maxLevel);
+    }
+
+    private static byte[] EncodeRle(ReadOnlySpan<byte> levels, int maxLevel)
+    {
         int bitWidth = LevelDecoder.GetBitWidth(maxLevel);
-        var rleEncoder = new RleBitPackedEncoder(bitWidth);
-
-        for (int i = 0; i < levels.Length; i++)
-            rleEncoder.WriteValue(levels[i]);
-
-        return rleEncoder.Finish();
+        int[] temp = ArrayPool<int>.Shared.Rent(levels.Length);
+        try
+        {
+            for (int i = 0; i < levels.Length; i++)
+                temp[i] = levels[i];
+            return RleBitPackedEncoder.Encode(temp.AsSpan(0, levels.Length), bitWidth);
+        }
+        finally
+        {
+            ArrayPool<int>.Shared.Return(temp);
+        }
     }
 }
