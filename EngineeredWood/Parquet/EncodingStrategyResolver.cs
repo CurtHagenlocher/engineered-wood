@@ -17,9 +17,12 @@ internal static class EncodingStrategyResolver
         if (strategy == EncodingStrategy.None)
             return explicitEncoding;
 
+        // Booleans don't benefit from dictionary — always use Plain
+        if (physicalType == PhysicalType.Boolean)
+            return Encoding.Plain;
+
         // Both Adaptive and Aggressive start with dictionary encoding.
         // ColumnWriter already handles dictionary-too-large fallback to Plain.
-        // We override the fallback encoding based on the strategy.
         return Encoding.PlainDictionary;
     }
 

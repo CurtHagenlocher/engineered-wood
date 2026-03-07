@@ -41,8 +41,8 @@ public sealed class ParquetWriteOptions
     /// <summary>Created-by identifier written to the file footer.</summary>
     public string CreatedBy { get; init; } = "EngineeredWood";
 
-    /// <summary>Encoding strategy for automatic encoding selection. Default: None (use explicit encoding).</summary>
-    public EncodingStrategy EncodingStrategy { get; init; } = EncodingStrategy.None;
+    /// <summary>Encoding strategy for automatic encoding selection. Default: Adaptive.</summary>
+    public EncodingStrategy EncodingStrategy { get; init; } = EncodingStrategy.Adaptive;
 
     /// <summary>
     /// Gets the effective compression codec for a column.
