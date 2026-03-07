@@ -296,39 +296,32 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
             leafArrowFields[i] = ArrowSchemaConverter.ToArrowField(selectedColumns[i], _options);
         }
 
-        // Detect nested columns: when reading all columns, check if any
-        // top-level schema child is a non-leaf (struct, list, or map).
+        // Detect nested columns: check if any selected top-level schema child
+        // is a non-leaf (struct, list, or map) or a bare repeated leaf.
         bool hasNestedColumns = false;
         SchemaNode? schemaRoot = null;
         Field[]? topLevelFields = null;
 
-        if (columnNames == null)
+        // Build the effective schema root: full root when reading all columns,
+        // or a pruned root containing only the selected top-level children.
+        var effectiveRoot = columnNames == null
+            ? schema.Root
+            : PruneSchemaRoot(schema.Root, selectedColumns);
+
+        foreach (var child in effectiveRoot.Children)
         {
-            schemaRoot = schema.Root;
-            foreach (var child in schemaRoot.Children)
+            if (!child.IsLeaf ||
+                child.Element.RepetitionType == FieldRepetitionType.Repeated)
             {
-                if (!child.IsLeaf)
-                {
-                    hasNestedColumns = true;
-                    break;
-                }
+                hasNestedColumns = true;
+                break;
             }
+        }
 
-            // Also check for bare repeated leaves (top-level repeated primitives)
-            if (!hasNestedColumns)
-            {
-                foreach (var child in schemaRoot.Children)
-                {
-                    if (child.IsLeaf && child.Element.RepetitionType == FieldRepetitionType.Repeated)
-                    {
-                        hasNestedColumns = true;
-                        break;
-                    }
-                }
-            }
-
-            if (hasNestedColumns)
-                topLevelFields = ArrowSchemaConverter.ToArrowFields(schemaRoot, _options);
+        if (hasNestedColumns)
+        {
+            schemaRoot = effectiveRoot;
+            topLevelFields = ArrowSchemaConverter.ToArrowFields(effectiveRoot, _options);
         }
 
         return new RowGroupContext(selectedColumns, selectedChunks, ranges,
@@ -453,6 +446,46 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
         }
 
         return (columns, chunks);
+    }
+
+    /// <summary>
+    /// Builds a pruned schema root containing only the top-level children
+    /// that have at least one descendant leaf in the selected columns.
+    /// Preserves the original subtrees — only filters at the top level.
+    /// </summary>
+    private static SchemaNode PruneSchemaRoot(
+        SchemaNode fullRoot,
+        IReadOnlyList<ColumnDescriptor> selectedColumns)
+    {
+        // Collect unique top-level names from selected columns (preserving order)
+        var topLevelNames = new List<string>();
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var col in selectedColumns)
+        {
+            if (col.Path.Count > 0 && seen.Add(col.Path[0]))
+                topLevelNames.Add(col.Path[0]);
+        }
+
+        // Pick matching children from the full root in the requested order
+        var children = new List<SchemaNode>(topLevelNames.Count);
+        foreach (var name in topLevelNames)
+        {
+            foreach (var child in fullRoot.Children)
+            {
+                if (child.Name == name)
+                {
+                    children.Add(child);
+                    break;
+                }
+            }
+        }
+
+        return new SchemaNode
+        {
+            Element = fullRoot.Element,
+            Parent = null,
+            Children = children,
+        };
     }
 
     [GeneratedRegex(@"version\s+(\d+)\.(\d+)\.(\d+)")]

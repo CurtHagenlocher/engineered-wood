@@ -1910,4 +1910,209 @@ public class ReadRowGroupTests
             }
         }
     }
+
+    // ---- Column projection with nested types ----
+
+    [Fact]
+    public async Task ColumnProjection_NestedStruct_ByGroupName()
+    {
+        // Write a file with flat + nested columns, then read back with projection
+        var path = Path.Combine(Path.GetTempPath(), $"ew-proj-struct-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            var structType = new StructType(
+            [
+                new Field("x", Int32Type.Default, nullable: false),
+                new Field("y", Int64Type.Default, nullable: false),
+            ]);
+            var schema = new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int32Type.Default, nullable: false))
+                .Field(new Field("data", structType, nullable: true))
+                .Field(new Field("tag", StringType.Default, nullable: false))
+                .Build();
+
+            var idArray = new Int32Array.Builder().AppendRange([1, 2, 3]).Build();
+            var xArray = new Int32Array.Builder().AppendRange([10, 20, 30]).Build();
+            var yArray = new Int64Array.Builder().AppendRange([100L, 200L, 300L]).Build();
+            var tagArray = new StringArray.Builder().Append("a").Append("b").Append("c").Build();
+
+            var structBitmap = new byte[] { 0b101 }; // index 1 null
+            var structData = new Apache.Arrow.ArrayData(structType, 3, 1, 0,
+                [new ArrowBuffer(structBitmap)],
+                [xArray.Data, yArray.Data]);
+            var structArray = new StructArray(structData);
+
+            var batch = new RecordBatch(schema, [idArray, structArray, tagArray], 3);
+
+            await using (var file = new LocalSequentialFile(path))
+            await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+            {
+                await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
+            }
+
+            // Project: only "data" (nested struct)
+            await using var readFile = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(readFile, ownsFile: false);
+            var projected = await reader.ReadRowGroupAsync(0, ["data"]);
+
+            Assert.Equal(3, projected.Length);
+            Assert.Single(projected.Schema.FieldsList);
+            Assert.Equal("data", projected.Schema.FieldsList[0].Name);
+            Assert.IsType<StructType>(projected.Schema.FieldsList[0].DataType);
+
+            var result = (StructArray)projected.Column(0);
+            Assert.False(result.IsNull(0));
+            Assert.True(result.IsNull(1));
+            Assert.False(result.IsNull(2));
+
+            var xResult = (Int32Array)result.Fields[0];
+            Assert.Equal(10, xResult.GetValue(0));
+            Assert.Equal(30, xResult.GetValue(2));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ColumnProjection_MixedFlatAndNested()
+    {
+        var path = Path.Combine(Path.GetTempPath(), $"ew-proj-mixed-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            var listType = new ListType(new Field("item", Int32Type.Default, nullable: false));
+            var schema = new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int32Type.Default, nullable: false))
+                .Field(new Field("nums", listType, nullable: true))
+                .Field(new Field("name", StringType.Default, nullable: false))
+                .Build();
+
+            var idArray = new Int32Array.Builder().AppendRange([1, 2, 3]).Build();
+            var nameArray = new StringArray.Builder().Append("a").Append("b").Append("c").Build();
+
+            // Build list: [[10, 20], null, [30]]
+            var valuesArray = new Int32Array.Builder().AppendRange([10, 20, 30]).Build();
+            var offsets = new int[] { 0, 2, 2, 3 };
+            var listBitmap = new byte[] { 0b101 };
+            var listData = new Apache.Arrow.ArrayData(listType, 3, 1, 0,
+                [new ArrowBuffer(listBitmap),
+                 new ArrowBuffer(System.Runtime.InteropServices.MemoryMarshal.AsBytes(offsets.AsSpan()).ToArray())],
+                [valuesArray.Data]);
+            var listArray = new ListArray(listData);
+
+            var batch = new RecordBatch(schema, [idArray, listArray, nameArray], 3);
+
+            await using (var file = new LocalSequentialFile(path))
+            await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+            {
+                await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
+            }
+
+            // Project: "id" (flat) + "nums" (nested list)
+            await using var readFile = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(readFile, ownsFile: false);
+            var projected = await reader.ReadRowGroupAsync(0, ["id", "nums"]);
+
+            Assert.Equal(3, projected.Length);
+            Assert.Equal(2, projected.Schema.FieldsList.Count);
+            Assert.Equal("id", projected.Schema.FieldsList[0].Name);
+            Assert.Equal("nums", projected.Schema.FieldsList[1].Name);
+
+            var idResult = (Int32Array)projected.Column(0);
+            Assert.Equal(1, idResult.GetValue(0));
+            Assert.Equal(3, idResult.GetValue(2));
+
+            var listResult = (ListArray)projected.Column(1);
+            Assert.False(listResult.IsNull(0));
+            Assert.True(listResult.IsNull(1));
+            Assert.False(listResult.IsNull(2));
+
+            var list0 = (Int32Array)listResult.GetSlicedValues(0);
+            Assert.Equal(2, list0.Length);
+            Assert.Equal(10, list0.GetValue(0));
+            Assert.Equal(20, list0.GetValue(1));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ColumnProjection_OnlyFlatFromMixedSchema()
+    {
+        // When projecting only flat columns from a file that has nested columns,
+        // the result should be a flat RecordBatch (no nested assembly)
+        var path = Path.Combine(Path.GetTempPath(), $"ew-proj-flat-{Guid.NewGuid():N}.parquet");
+        try
+        {
+            var structType = new StructType(
+            [
+                new Field("x", Int32Type.Default, nullable: false),
+            ]);
+            var schema = new Apache.Arrow.Schema.Builder()
+                .Field(new Field("id", Int32Type.Default, nullable: false))
+                .Field(new Field("s", structType, nullable: false))
+                .Field(new Field("tag", StringType.Default, nullable: false))
+                .Build();
+
+            var idArray = new Int32Array.Builder().AppendRange([1, 2, 3]).Build();
+            var xArray = new Int32Array.Builder().AppendRange([10, 20, 30]).Build();
+            var structData = new Apache.Arrow.ArrayData(structType, 3, 0, 0,
+                [ArrowBuffer.Empty], [xArray.Data]);
+            var structArray = new StructArray(structData);
+            var tagArray = new StringArray.Builder().Append("a").Append("b").Append("c").Build();
+
+            var batch = new RecordBatch(schema, [idArray, structArray, tagArray], 3);
+
+            await using (var file = new LocalSequentialFile(path))
+            await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+            {
+                await writer.WriteRowGroupAsync(batch);
+                await writer.CloseAsync();
+            }
+
+            // Project: only flat columns "id" and "tag"
+            await using var readFile = new LocalRandomAccessFile(path);
+            using var reader = new ParquetFileReader(readFile, ownsFile: false);
+            var projected = await reader.ReadRowGroupAsync(0, ["id", "tag"]);
+
+            Assert.Equal(3, projected.Length);
+            Assert.Equal(2, projected.Schema.FieldsList.Count);
+            Assert.Equal("id", projected.Schema.FieldsList[0].Name);
+            Assert.Equal("tag", projected.Schema.FieldsList[1].Name);
+
+            Assert.Equal(1, ((Int32Array)projected.Column(0)).GetValue(0));
+            Assert.Equal("c", ((StringArray)projected.Column(1)).GetString(2));
+        }
+        finally
+        {
+            File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ColumnProjection_ListColumns_SingleList()
+    {
+        // Project a single list column from list_columns.parquet
+        await using var file = new LocalRandomAccessFile(TestData.GetPath("list_columns.parquet"));
+        using var reader = new ParquetFileReader(file, ownsFile: false);
+
+        var batch = await reader.ReadRowGroupAsync(0, ["int64_list"]);
+
+        Assert.Equal(3, batch.Length);
+        Assert.Single(batch.Schema.FieldsList);
+        Assert.Equal("int64_list", batch.Schema.FieldsList[0].Name);
+
+        var listArray = (ListArray)batch.Column(0);
+        // Row 0: [1, 2, 3]
+        var row0 = (Int64Array)listArray.GetSlicedValues(0);
+        Assert.Equal(3, row0.Length);
+        Assert.Equal(1, row0.GetValue(0));
+        Assert.Equal(2, row0.GetValue(1));
+        Assert.Equal(3, row0.GetValue(2));
+    }
 }
