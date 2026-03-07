@@ -224,4 +224,66 @@ internal static class StatisticsCollector
         if (double.IsNaN(b)) return -1;
         return a.CompareTo(b);
     }
+
+    /// <summary>
+    /// Collects ByteArray statistics from dictionary entries rather than full decomposed data.
+    /// Since min/max of all values equals min/max of unique dictionary values, this avoids
+    /// requiring the full byte array data to be materialized.
+    /// </summary>
+    internal static Statistics? CollectByteArrayFromEntries(
+        byte[] buffer, (int offset, int length)[] entries, int entryCount,
+        long nullCount, int maxBinaryStatLength = DefaultMaxBinaryStatLength)
+    {
+        if (entryCount == 0)
+        {
+            return new Statistics
+            {
+                NullCount = nullCount,
+                IsMinValueExact = true,
+                IsMaxValueExact = true,
+            };
+        }
+
+        var (minOff, minLen) = entries[0];
+        var (maxOff, maxLen) = entries[0];
+
+        for (int i = 1; i < entryCount; i++)
+        {
+            var (off, len) = entries[i];
+            var current = buffer.AsSpan(off, len);
+
+            if (current.SequenceCompareTo(buffer.AsSpan(minOff, minLen)) < 0)
+                (minOff, minLen) = (off, len);
+            if (current.SequenceCompareTo(buffer.AsSpan(maxOff, maxLen)) > 0)
+                (maxOff, maxLen) = (off, len);
+        }
+
+        bool minExact = true, maxExact = true;
+        byte[] minBytes, maxBytes;
+
+        if (minLen <= maxBinaryStatLength)
+            minBytes = buffer.AsSpan(minOff, minLen).ToArray();
+        else
+        {
+            minBytes = TruncateMin(buffer.AsSpan(minOff, minLen), maxBinaryStatLength);
+            minExact = false;
+        }
+
+        if (maxLen <= maxBinaryStatLength)
+            maxBytes = buffer.AsSpan(maxOff, maxLen).ToArray();
+        else
+        {
+            maxBytes = TruncateMax(buffer.AsSpan(maxOff, maxLen), maxBinaryStatLength);
+            maxExact = maxBytes.Length == maxLen;
+        }
+
+        return new Statistics
+        {
+            MinValue = minBytes,
+            MaxValue = maxBytes,
+            NullCount = nullCount,
+            IsMinValueExact = minExact,
+            IsMaxValueExact = maxExact,
+        };
+    }
 }

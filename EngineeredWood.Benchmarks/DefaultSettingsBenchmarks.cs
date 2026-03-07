@@ -14,7 +14,7 @@ namespace EngineeredWood.Benchmarks;
 /// writing a ~1MB dataset and measuring both wall-clock time and output file size.
 ///
 /// Defaults:
-///   - EngineeredWood: Snappy, Plain encoding, V2 data pages
+///   - EngineeredWood: Snappy, Adaptive encoding (dictionary + fallback), V2 data pages
 ///   - ParquetSharp:   Snappy, dictionary + fallback encodings, V1 data pages
 ///   - Parquet.NET:    Snappy
 /// </summary>
@@ -78,7 +78,7 @@ public class DefaultSettingsBenchmarks
     public async Task EW_Defaults()
     {
         var path = TempPath("ew");
-        // ParquetWriteOptions.Default: Snappy, Plain, V2
+        // ParquetWriteOptions.Default: Snappy, Adaptive encoding, V2
         await using var output = new LocalOutputFile(path);
         await using var writer = new ParquetFileWriter(output);
         await writer.WriteAsync(_data.Batch);

@@ -65,13 +65,8 @@ internal static class ArrowArrayDecomposer
         int maxDefLevel,
         int typeLength = 0)
     {
-        byte[]? defLevels = null;
+        byte[]? defLevels = BuildDefLevels(array, maxDefLevel);
         int nonNullCount = array.Length - array.NullCount;
-
-        if (maxDefLevel > 0)
-        {
-            defLevels = BuildDefLevels(array, (byte)maxDefLevel);
-        }
 
         return physicalType switch
         {
@@ -87,22 +82,24 @@ internal static class ArrowArrayDecomposer
         };
     }
 
-    private static byte[] BuildDefLevels(IArrowArray array, byte maxDefLevel)
+    internal static byte[]? BuildDefLevels(IArrowArray array, int maxDefLevel)
     {
+        if (maxDefLevel == 0) return null;
+
+        byte maxDef = (byte)maxDefLevel;
         var defLevels = new byte[array.Length];
         var data = array.Data;
 
         if (data.NullCount == 0)
         {
-            defLevels.AsSpan().Fill(maxDefLevel);
+            defLevels.AsSpan().Fill(maxDef);
             return defLevels;
         }
 
         var validityBuffer = data.Buffers[0];
         if (validityBuffer.IsEmpty)
         {
-            // No validity bitmap means all valid
-            defLevels.AsSpan().Fill(maxDefLevel);
+            defLevels.AsSpan().Fill(maxDef);
             return defLevels;
         }
 
@@ -113,7 +110,7 @@ internal static class ArrowArrayDecomposer
         {
             int idx = offset + i;
             bool isValid = (bitmap[idx >> 3] & (1 << (idx & 7))) != 0;
-            defLevels[i] = isValid ? maxDefLevel : (byte)0;
+            defLevels[i] = isValid ? maxDef : (byte)0;
         }
 
         return defLevels;

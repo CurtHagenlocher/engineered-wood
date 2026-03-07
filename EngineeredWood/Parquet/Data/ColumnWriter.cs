@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using System.Runtime.InteropServices;
 using Apache.Arrow;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet.Compression;
@@ -69,15 +70,69 @@ internal sealed class ColumnWriter
         IArrowArray array, IOutputFile output, CancellationToken ct = default)
     {
         int typeLength = _column.TypeLength ?? 0;
-        var decomposed = ArrowArrayDecomposer.Decompose(
-            array, _column.PhysicalType, _column.MaxDefinitionLevel, typeLength);
-
         var state = new WriteState();
         int numValues = array.Length;
+        bool isDictionary = _encoding == Encoding.RleDictionary || _encoding == Encoding.PlainDictionary;
 
-        if (_encoding == Encoding.RleDictionary || _encoding == Encoding.PlainDictionary)
+        // For ByteArray dictionary encoding, attempt zero-copy path:
+        // build dictionary directly from Arrow buffers, skipping ArrowArrayDecomposer entirely.
+        if (isDictionary && _column.PhysicalType == PhysicalType.ByteArray)
         {
-            var dictResult = TryBuildDictionary(decomposed, numValues);
+            var dictResult = TryBuildDictionaryFromArrow(array, numValues);
+
+            if (dictResult.HasValue)
+            {
+                // Dictionary succeeded — write without full decomposition
+                byte[]? defLevels = ArrowArrayDecomposer.BuildDefLevels(
+                    array, _column.MaxDefinitionLevel);
+                int nonNullCount = numValues - array.NullCount;
+
+                state.DictionaryPageOffset = output.Position;
+                byte[] dictPage = dictResult.Value.encoder.EncodeDictionaryPage();
+                await WritePageAsync(output, PageType.DictionaryPage, dictPage, dictPage.Length,
+                    state, ct,
+                    dictPageHeader: new DictionaryPageHeader
+                    {
+                        NumValues = dictResult.Value.encoder.DictionarySize,
+                        Encoding = Encoding.PlainDictionary,
+                    }).ConfigureAwait(false);
+                state.Encodings.Add(Encoding.PlainDictionary);
+
+                byte[] indexData = dictResult.Value.encoder.EncodeIndices();
+                int indexBitWidth = dictResult.Value.encoder.GetIndexBitWidth();
+                state.DataPageOffset = output.Position;
+
+                var lightDecomposed = new ArrowArrayDecomposer.DecomposedColumn(
+                    defLevels, nonNullCount);
+                await WriteIndexPagesAsync(indexData, indexBitWidth, lightDecomposed, numValues,
+                    output, state, ct).ConfigureAwait(false);
+
+                // Statistics from dictionary entries (min/max of unique values = min/max of all)
+                var (buf, count, entries) = dictResult.Value.encoder.GetVarEntries();
+                var statistics = StatisticsCollector.CollectByteArrayFromEntries(
+                    buf, entries, count, numValues - nonNullCount);
+
+                return BuildColumnMetaData(numValues, state, statistics);
+            }
+
+            // Dictionary too large — fall back to full decomposition
+            var decomposed = ArrowArrayDecomposer.Decompose(
+                array, _column.PhysicalType, _column.MaxDefinitionLevel, typeLength);
+            var fallback = EncodingStrategyResolver.GetFallbackEncoding(_strategy, _column.PhysicalType);
+            state.DataPageOffset = output.Position;
+            await WriteEncodedPagesAsync(decomposed, numValues, fallback,
+                output, state, ct).ConfigureAwait(false);
+            var fallbackStats = StatisticsCollector.Collect(decomposed, _column.PhysicalType, numValues);
+            return BuildColumnMetaData(numValues, state, fallbackStats);
+        }
+
+        // Standard path for non-ByteArray or non-dictionary columns
+        var standardDecomposed = ArrowArrayDecomposer.Decompose(
+            array, _column.PhysicalType, _column.MaxDefinitionLevel, typeLength);
+
+        if (isDictionary)
+        {
+            var dictResult = TryBuildDictionary(standardDecomposed, numValues);
 
             if (dictResult.HasValue)
             {
@@ -95,26 +150,31 @@ internal sealed class ColumnWriter
                 byte[] indexData = dictResult.Value.encoder.EncodeIndices();
                 int indexBitWidth = dictResult.Value.encoder.GetIndexBitWidth();
                 state.DataPageOffset = output.Position;
-                await WriteIndexPagesAsync(indexData, indexBitWidth, decomposed, numValues,
+                await WriteIndexPagesAsync(indexData, indexBitWidth, standardDecomposed, numValues,
                     output, state, ct).ConfigureAwait(false);
             }
             else
             {
                 var fallback = EncodingStrategyResolver.GetFallbackEncoding(_strategy, _column.PhysicalType);
                 state.DataPageOffset = output.Position;
-                await WriteEncodedPagesAsync(decomposed, numValues, fallback,
+                await WriteEncodedPagesAsync(standardDecomposed, numValues, fallback,
                     output, state, ct).ConfigureAwait(false);
             }
         }
         else
         {
             state.DataPageOffset = output.Position;
-            await WriteEncodedPagesAsync(decomposed, numValues, _encoding,
+            await WriteEncodedPagesAsync(standardDecomposed, numValues, _encoding,
                 output, state, ct).ConfigureAwait(false);
         }
 
-        var statistics = StatisticsCollector.Collect(decomposed, _column.PhysicalType, numValues);
+        var stdStats = StatisticsCollector.Collect(standardDecomposed, _column.PhysicalType, numValues);
+        return BuildColumnMetaData(numValues, state, stdStats);
+    }
 
+    private Metadata.ColumnMetaData BuildColumnMetaData(
+        int numValues, WriteState state, Metadata.Statistics? statistics)
+    {
         return new Metadata.ColumnMetaData
         {
             Type = _column.PhysicalType,
@@ -210,6 +270,107 @@ internal sealed class ColumnWriter
             return null;
 
         return new DictBuildResult(dictEncoder);
+    }
+
+    /// <summary>
+    /// Builds a dictionary directly from an Arrow StringArray/BinaryArray without going through
+    /// ArrowArrayDecomposer. Reads string offsets and data from Arrow's internal buffers,
+    /// eliminating the need to copy the entire byte array data into a separate allocation.
+    /// </summary>
+    private DictBuildResult? TryBuildDictionaryFromArrow(IArrowArray array, int valueCount)
+    {
+        var dictEncoder = new DictionaryEncoder(PhysicalType.ByteArray, estimatedValues: valueCount);
+
+        switch (array)
+        {
+            case StringArray sa:
+                AddFromArrowOffsets(dictEncoder, sa.Data, valueCount);
+                break;
+            case BinaryArray ba:
+                AddFromArrowOffsets(dictEncoder, ba.Data, valueCount);
+                break;
+            case LargeStringArray lsa:
+                AddFromArrowLargeOffsets(dictEncoder, lsa.Data, valueCount);
+                break;
+            case LargeBinaryArray lba:
+                AddFromArrowLargeOffsets(dictEncoder, lba.Data, valueCount);
+                break;
+            default:
+                return null; // Unsupported array type, fall back
+        }
+
+        if (dictEncoder.DictionaryByteSize > _maxDictionarySize)
+            return null;
+
+        return new DictBuildResult(dictEncoder);
+    }
+
+    private static void AddFromArrowOffsets(DictionaryEncoder encoder, ArrayData data, int valueCount)
+    {
+        var offsetsSpan = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+        var dataSpan = data.Buffers[2].Span;
+        int baseOffset = data.Offset;
+
+        if (data.NullCount == 0)
+        {
+            for (int i = 0; i < valueCount; i++)
+            {
+                int start = offsetsSpan[baseOffset + i];
+                int end = offsetsSpan[baseOffset + i + 1];
+                encoder.AddByteArray(dataSpan.Slice(start, end - start));
+            }
+        }
+        else
+        {
+            var validityBuf = data.Buffers[0];
+            var bitmap = validityBuf.IsEmpty ? ReadOnlySpan<byte>.Empty : validityBuf.Span;
+
+            for (int i = 0; i < valueCount; i++)
+            {
+                int idx = baseOffset + i;
+                bool isValid = bitmap.IsEmpty || (bitmap[idx >> 3] & (1 << (idx & 7))) != 0;
+                if (isValid)
+                {
+                    int start = offsetsSpan[idx];
+                    int end = offsetsSpan[idx + 1];
+                    encoder.AddByteArray(dataSpan.Slice(start, end - start));
+                }
+            }
+        }
+    }
+
+    private static void AddFromArrowLargeOffsets(DictionaryEncoder encoder, ArrayData data, int valueCount)
+    {
+        var offsetsSpan = MemoryMarshal.Cast<byte, long>(data.Buffers[1].Span);
+        var dataSpan = data.Buffers[2].Span;
+        int baseOffset = data.Offset;
+
+        if (data.NullCount == 0)
+        {
+            for (int i = 0; i < valueCount; i++)
+            {
+                int start = checked((int)offsetsSpan[baseOffset + i]);
+                int end = checked((int)offsetsSpan[baseOffset + i + 1]);
+                encoder.AddByteArray(dataSpan.Slice(start, end - start));
+            }
+        }
+        else
+        {
+            var validityBuf = data.Buffers[0];
+            var bitmap = validityBuf.IsEmpty ? ReadOnlySpan<byte>.Empty : validityBuf.Span;
+
+            for (int i = 0; i < valueCount; i++)
+            {
+                int idx = baseOffset + i;
+                bool isValid = bitmap.IsEmpty || (bitmap[idx >> 3] & (1 << (idx & 7))) != 0;
+                if (isValid)
+                {
+                    int start = checked((int)offsetsSpan[idx]);
+                    int end = checked((int)offsetsSpan[idx + 1]);
+                    encoder.AddByteArray(dataSpan.Slice(start, end - start));
+                }
+            }
+        }
     }
 
     private static void AddFixedWidthToDictionary(

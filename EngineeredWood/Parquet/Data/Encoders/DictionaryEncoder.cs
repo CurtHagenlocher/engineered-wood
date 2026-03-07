@@ -1,12 +1,14 @@
 using System.Buffers.Binary;
 using System.Numerics;
+using System.Runtime.InteropServices;
 
 namespace EngineeredWood.Parquet.Data.Encoders;
 
 /// <summary>
 /// Encodes values using dictionary encoding (PLAIN_DICTIONARY / RLE_DICTIONARY).
 /// Produces a PLAIN-encoded dictionary page and RLE-encoded index pages.
-/// Uses flat buffers to minimize per-entry heap allocations.
+/// Uses flat buffers and a custom open-addressing hash map for variable-width types
+/// to enable zero-copy lookups against source data (e.g. Arrow buffers).
 /// </summary>
 internal sealed class DictionaryEncoder
 {
@@ -19,11 +21,13 @@ internal sealed class DictionaryEncoder
     private byte[] _fixedBuf = new byte[256];
     private int _fixedCount;
 
-    // Variable-width: entries stored in flat buffer + offsets, lookup via hash
+    // Variable-width: open-addressing hash map for zero-copy span lookups.
+    // Unique values stored in _varBuf; hash table entries reference _varBuf slices.
     private byte[] _varBuf = new byte[256];
     private int _varBufLen;
-    private readonly List<int> _varOffsets = new();
-    private readonly Dictionary<VarKey, int> _varDict;
+    private int _varCount;
+    private VarEntry[] _varTable = new VarEntry[16];
+    private int _varTableMask = 15; // _varTable.Length - 1
 
     // Indices (one per value added)
     private int[] _indices = new int[256];
@@ -31,7 +35,7 @@ internal sealed class DictionaryEncoder
 
     /// <summary>Number of distinct values in the dictionary.</summary>
     public int DictionarySize => _physicalType is PhysicalType.ByteArray or PhysicalType.FixedLenByteArray
-        ? _varOffsets.Count : _fixedCount;
+        ? _varCount : _fixedCount;
 
     /// <summary>Total byte size of the dictionary entries.</summary>
     public int DictionaryByteSize { get; private set; }
@@ -54,15 +58,32 @@ internal sealed class DictionaryEncoder
             _ => throw new ArgumentOutOfRangeException(nameof(physicalType)),
         };
 
+        bool isVarWidth = physicalType is PhysicalType.ByteArray or PhysicalType.FixedLenByteArray;
+
         if (estimatedValues > 0)
         {
             _indices = new int[estimatedValues];
             int estDistinct = Math.Min(estimatedValues, 16384);
-            _fixedWidthDict = new(estDistinct);
-            if (_entryByteWidth > 0)
-                _fixedBuf = new byte[estDistinct * _entryByteWidth];
+
+            if (isVarWidth)
+            {
+                // Pre-size hash table for variable-width types only
+                int tableSize = 16;
+                while (tableSize < estDistinct * 2) tableSize <<= 1;
+                _varTable = new VarEntry[tableSize];
+                _varTableMask = tableSize - 1;
+            }
+            else
+            {
+                // Pre-size Dictionary for fixed-width types only
+                _fixedWidthDict = new(estDistinct);
+                if (_entryByteWidth > 0)
+                    _fixedBuf = new byte[estDistinct * _entryByteWidth];
+            }
         }
-        _varDict = new Dictionary<VarKey, int>(new VarKeyComparer(this));
+
+        // Initialize hash table sentinel values
+        _varTable.AsSpan().Fill(VarEntry.Empty);
     }
 
     public int AddInt32(int value)
@@ -128,51 +149,91 @@ internal sealed class DictionaryEncoder
         return index;
     }
 
+    /// <summary>
+    /// Adds a variable-length byte array value. Hashes and compares directly from the source
+    /// span — only copies to the internal buffer for genuinely new (unique) values.
+    /// </summary>
     public int AddByteArray(ReadOnlySpan<byte> value)
     {
-        // Write to buffer temporarily for hash/compare, keep if new
-        int tempOffset = _varBufLen;
-        EnsureVarCapacity(value.Length);
-        value.CopyTo(_varBuf.AsSpan(tempOffset));
+        uint hash = FnvHash(value);
+        int slot = (int)(hash & (uint)_varTableMask);
 
-        var lookupKey = new VarKey(tempOffset, value.Length);
-        if (_varDict.TryGetValue(lookupKey, out int index))
+        while (true)
         {
-            // Duplicate — don't advance buffer
-            AppendIndex(index);
-            return index;
-        }
+            ref VarEntry entry = ref _varTable[slot];
 
-        // New entry — keep the data in the buffer
-        _varBufLen += value.Length;
-        index = _varOffsets.Count;
-        _varOffsets.Add(tempOffset);
-        _varDict[lookupKey] = index;
-        DictionaryByteSize += 4 + value.Length;
-        AppendIndex(index);
-        return index;
+            if (entry.DictIndex < 0)
+            {
+                // Empty slot — new unique value. Copy to _varBuf and insert.
+                int bufOffset = _varBufLen;
+                EnsureVarCapacity(value.Length);
+                value.CopyTo(_varBuf.AsSpan(bufOffset));
+                _varBufLen += value.Length;
+
+                entry.BufOffset = bufOffset;
+                entry.Length = value.Length;
+                entry.Hash = hash;
+                entry.DictIndex = _varCount++;
+                DictionaryByteSize += 4 + value.Length;
+                GrowVarTableIfNeeded();
+
+                AppendIndex(entry.DictIndex);
+                return entry.DictIndex;
+            }
+
+            // Occupied slot — check if it matches
+            if (entry.Hash == hash && entry.Length == value.Length &&
+                value.SequenceEqual(_varBuf.AsSpan(entry.BufOffset, entry.Length)))
+            {
+                // Duplicate — no copy needed
+                AppendIndex(entry.DictIndex);
+                return entry.DictIndex;
+            }
+
+            // Collision — linear probe
+            slot = (slot + 1) & _varTableMask;
+        }
     }
 
+    /// <summary>
+    /// Adds a fixed-length byte array value. Same zero-copy lookup as AddByteArray.
+    /// </summary>
     public int AddFixedLenByteArray(ReadOnlySpan<byte> value)
     {
-        int tempOffset = _varBufLen;
-        EnsureVarCapacity(value.Length);
-        value.CopyTo(_varBuf.AsSpan(tempOffset));
+        uint hash = FnvHash(value);
+        int slot = (int)(hash & (uint)_varTableMask);
 
-        var lookupKey = new VarKey(tempOffset, value.Length);
-        if (_varDict.TryGetValue(lookupKey, out int index))
+        while (true)
         {
-            AppendIndex(index);
-            return index;
-        }
+            ref VarEntry entry = ref _varTable[slot];
 
-        _varBufLen += value.Length;
-        index = _varOffsets.Count;
-        _varOffsets.Add(tempOffset);
-        _varDict[lookupKey] = index;
-        DictionaryByteSize += value.Length;
-        AppendIndex(index);
-        return index;
+            if (entry.DictIndex < 0)
+            {
+                int bufOffset = _varBufLen;
+                EnsureVarCapacity(value.Length);
+                value.CopyTo(_varBuf.AsSpan(bufOffset));
+                _varBufLen += value.Length;
+
+                entry.BufOffset = bufOffset;
+                entry.Length = value.Length;
+                entry.Hash = hash;
+                entry.DictIndex = _varCount++;
+                DictionaryByteSize += value.Length;
+                GrowVarTableIfNeeded();
+
+                AppendIndex(entry.DictIndex);
+                return entry.DictIndex;
+            }
+
+            if (entry.Hash == hash && entry.Length == value.Length &&
+                value.SequenceEqual(_varBuf.AsSpan(entry.BufOffset, entry.Length)))
+            {
+                AppendIndex(entry.DictIndex);
+                return entry.DictIndex;
+            }
+
+            slot = (slot + 1) & _varTableMask;
+        }
     }
 
     /// <summary>Produces the PLAIN-encoded dictionary page bytes.</summary>
@@ -180,24 +241,33 @@ internal sealed class DictionaryEncoder
     {
         if (_physicalType == PhysicalType.ByteArray)
         {
-            // Length-prefixed format
+            // Length-prefixed format: collect entries in dict-index order
             var result = new byte[DictionaryByteSize];
             int pos = 0;
-            for (int i = 0; i < _varOffsets.Count; i++)
+            var entries = GetSortedVarEntries();
+            for (int i = 0; i < entries.Length; i++)
             {
-                int start = _varOffsets[i];
-                int len = (i + 1 < _varOffsets.Count ? _varOffsets[i + 1] : _varBufLen) - start;
-                BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(pos), len);
+                var e = entries[i];
+                BinaryPrimitives.WriteInt32LittleEndian(result.AsSpan(pos), e.Length);
                 pos += 4;
-                _varBuf.AsSpan(start, len).CopyTo(result.AsSpan(pos));
-                pos += len;
+                _varBuf.AsSpan(e.BufOffset, e.Length).CopyTo(result.AsSpan(pos));
+                pos += e.Length;
             }
             return result;
         }
 
         if (_physicalType == PhysicalType.FixedLenByteArray)
         {
-            return _varBuf.AsSpan(0, _varBufLen).ToArray();
+            var entries = GetSortedVarEntries();
+            var result = new byte[_varBufLen];
+            int pos = 0;
+            for (int i = 0; i < entries.Length; i++)
+            {
+                var e = entries[i];
+                _varBuf.AsSpan(e.BufOffset, e.Length).CopyTo(result.AsSpan(pos));
+                pos += e.Length;
+            }
+            return result;
         }
 
         // Fixed-width: slice the flat buffer
@@ -219,6 +289,20 @@ internal sealed class DictionaryEncoder
     {
         if (DictionarySize <= 1) return DictionarySize == 0 ? 0 : 1;
         return 32 - BitOperations.LeadingZeroCount((uint)(DictionarySize - 1));
+    }
+
+    /// <summary>
+    /// Returns the internal buffer and sorted entry descriptors for variable-width entries.
+    /// Used by StatisticsCollector to compute min/max from dictionary entries without
+    /// requiring a full decomposition of the source data.
+    /// </summary>
+    public (byte[] buffer, int count, (int offset, int length)[] entries) GetVarEntries()
+    {
+        var sorted = GetSortedVarEntries();
+        var descriptors = new (int offset, int length)[sorted.Length];
+        for (int i = 0; i < sorted.Length; i++)
+            descriptors[i] = (sorted[i].BufOffset, sorted[i].Length);
+        return (_varBuf, _varCount, descriptors);
     }
 
     private void AppendIndex(int index)
@@ -250,40 +334,64 @@ internal sealed class DictionaryEncoder
         }
     }
 
-    // Key that references a slice of the shared _varBuf (no per-entry byte[] allocation)
-    private readonly struct VarKey : IEquatable<VarKey>
+    /// <summary>Grows the hash table when load factor exceeds 0.7.</summary>
+    private void GrowVarTableIfNeeded()
     {
-        public readonly int Offset;
-        public readonly int Length;
+        // Load factor check: _varCount / _varTable.Length > 0.7
+        // Equivalent to: _varCount * 10 > _varTable.Length * 7
+        if (_varCount * 10 <= _varTable.Length * 7)
+            return;
 
-        public VarKey(int offset, int length)
+        int newSize = _varTable.Length << 1;
+        int newMask = newSize - 1;
+        var newTable = new VarEntry[newSize];
+        newTable.AsSpan().Fill(VarEntry.Empty);
+
+        // Re-insert all entries
+        for (int i = 0; i < _varTable.Length; i++)
         {
-            Offset = offset;
-            Length = length;
+            ref var old = ref _varTable[i];
+            if (old.DictIndex < 0) continue;
+
+            int slot = (int)(old.Hash & (uint)newMask);
+            while (newTable[slot].DictIndex >= 0)
+                slot = (slot + 1) & newMask;
+            newTable[slot] = old;
         }
 
-        public bool Equals(VarKey other) => Offset == other.Offset && Length == other.Length;
-        public override bool Equals(object? obj) => obj is VarKey other && Equals(other);
-        public override int GetHashCode() => HashCode.Combine(Offset, Length);
+        _varTable = newTable;
+        _varTableMask = newMask;
     }
 
-    // Compares VarKeys by their actual byte content in the shared buffer
-    private sealed class VarKeyComparer : IEqualityComparer<VarKey>
+    /// <summary>Returns var entries sorted by DictIndex for correct dictionary page order.</summary>
+    private VarEntry[] GetSortedVarEntries()
     {
-        private readonly DictionaryEncoder _encoder;
-        public VarKeyComparer(DictionaryEncoder encoder) => _encoder = encoder;
-
-        public bool Equals(VarKey x, VarKey y) =>
-            _encoder._varBuf.AsSpan(x.Offset, x.Length)
-                .SequenceEqual(_encoder._varBuf.AsSpan(y.Offset, y.Length));
-
-        public int GetHashCode(VarKey key)
+        var entries = new VarEntry[_varCount];
+        for (int i = 0; i < _varTable.Length; i++)
         {
-            var data = _encoder._varBuf.AsSpan(key.Offset, key.Length);
-            uint hash = 2166136261;
-            for (int i = 0; i < data.Length; i++)
-                hash = (hash ^ data[i]) * 16777619;
-            return (int)hash;
+            ref var e = ref _varTable[i];
+            if (e.DictIndex >= 0)
+                entries[e.DictIndex] = e;
         }
+        return entries;
+    }
+
+    private static uint FnvHash(ReadOnlySpan<byte> data)
+    {
+        uint hash = 2166136261;
+        for (int i = 0; i < data.Length; i++)
+            hash = (hash ^ data[i]) * 16777619;
+        return hash;
+    }
+
+    // Open-addressing hash table entry for variable-width values
+    private struct VarEntry
+    {
+        public int BufOffset;   // offset in _varBuf
+        public int Length;      // byte length of value
+        public uint Hash;       // cached FNV hash
+        public int DictIndex;   // dictionary index, or -1 if empty
+
+        public static readonly VarEntry Empty = new() { DictIndex = -1 };
     }
 }
