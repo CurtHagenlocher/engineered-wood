@@ -4,6 +4,7 @@
     <Project Path="src/EngineeredWood.Azure/EngineeredWood.Azure.csproj" />
     <Project Path="src/EngineeredWood.Parquet/EngineeredWood.Parquet.csproj" />
     <Project Path="src/EngineeredWood.Orc/EngineeredWood.Orc.csproj" />
+    <Project Path="src/EngineeredWood.Avro/EngineeredWood.Avro.csproj" />
   </Folder>
   <Folder Name="/test/">
     <Project Path="test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj" />
@@ -11,5 +12,7 @@
     <Project Path="test/EngineeredWood.Parquet.Compatibility/EngineeredWood.Parquet.Compatibility.csproj" />
     <Project Path="test/EngineeredWood.Orc.Tests/EngineeredWood.Orc.Tests.csproj" />
     <Project Path="test/EngineeredWood.Orc.Benchmarks/EngineeredWood.Orc.Benchmarks.csproj" />
+    <Project Path="test/EngineeredWood.Avro.Tests/EngineeredWood.Avro.Tests.csproj" />
+    <Project Path="test/EngineeredWood.Avro.Benchmarks/EngineeredWood.Avro.Benchmarks.csproj" />
   </Folder>
 </Solution>

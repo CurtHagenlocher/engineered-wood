@@ -25,6 +25,9 @@
     <InternalsVisibleTo Include="EngineeredWood.Orc" />
     <InternalsVisibleTo Include="EngineeredWood.Orc.Tests" />
     <InternalsVisibleTo Include="EngineeredWood.Orc.Benchmarks" />
+    <InternalsVisibleTo Include="EngineeredWood.Avro" />
+    <InternalsVisibleTo Include="EngineeredWood.Avro.Tests" />
+    <InternalsVisibleTo Include="EngineeredWood.Avro.Benchmarks" />
   </ItemGroup>
 
 </Project>

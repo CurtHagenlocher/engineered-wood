@@ -1,6 +1,7 @@
 using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Types;
+using EngineeredWood.Buffers;
 using EngineeredWood.Orc.Proto;
 
 namespace EngineeredWood.Orc.Tests;
@@ -3603,7 +3604,7 @@ public class OrcWriterTests
     public void RleV2_ExtremeValues_RoundTrip()
     {
         var original = new long[] { long.MinValue, long.MaxValue, 0, -1, 1, long.MinValue + 1, long.MaxValue - 1 };
-        var buf = new EngineeredWood.Orc.Encodings.GrowableBuffer();
+        var buf = new GrowableBuffer();
         var encoder = new EngineeredWood.Orc.Encodings.RleEncoderV2(buf, signed: true);
         encoder.WriteValues(original);
         encoder.Flush();
@@ -3620,7 +3621,7 @@ public class OrcWriterTests
     [Fact]
     public void RleV2_FlushWithoutData_NoOutput()
     {
-        var buf = new EngineeredWood.Orc.Encodings.GrowableBuffer();
+        var buf = new GrowableBuffer();
         var encoder = new EngineeredWood.Orc.Encodings.RleEncoderV2(buf, signed: true);
         encoder.Flush();
         encoder.Flush(); // double flush
@@ -3947,7 +3948,7 @@ public class OrcWriterTests
             100, 255, 65535, 16777215,
         };
 
-        var buf = new EngineeredWood.Orc.Encodings.GrowableBuffer();
+        var buf = new GrowableBuffer();
         var encoder = new EngineeredWood.Orc.Encodings.RleEncoderV2(buf, signed: false);
         encoder.WriteValues(original);
         encoder.Flush();
