@@ -85,6 +85,18 @@ public sealed class ParquetWriteOptions
     public ByteArrayEncoding ByteArrayEncoding { get; init; } = ByteArrayEncoding.DeltaLengthByteArray;
 
     /// <summary>
+    /// Per-column compression codec overrides, keyed by dotted column path (e.g. "col1" or "struct1.field1").
+    /// Columns not listed use <see cref="Compression"/>.
+    /// </summary>
+    public IReadOnlyDictionary<string, CompressionCodec>? ColumnCodecs { get; init; }
+
+    /// <summary>
+    /// Per-column encoding overrides for BYTE_ARRAY/FIXED_LEN_BYTE_ARRAY columns,
+    /// keyed by dotted column path. Columns not listed use <see cref="ByteArrayEncoding"/>.
+    /// </summary>
+    public IReadOnlyDictionary<string, ByteArrayEncoding>? ColumnEncodings { get; init; }
+
+    /// <summary>
     /// Application identifier written to the file footer's <c>created_by</c> field.
     /// </summary>
     public string CreatedBy { get; init; } = "EngineeredWood";
@@ -93,4 +105,20 @@ public sealed class ParquetWriteOptions
     /// Optional key-value metadata to include in the file footer.
     /// </summary>
     public IReadOnlyList<Metadata.KeyValue>? KeyValueMetadata { get; init; }
+
+    /// <summary>
+    /// Resolves the compression codec for a column, checking per-column overrides first.
+    /// </summary>
+    internal CompressionCodec GetCodec(IReadOnlyList<string> pathInSchema) =>
+        ColumnCodecs != null && ColumnCodecs.TryGetValue(string.Join(".", pathInSchema), out var codec)
+            ? codec
+            : Compression;
+
+    /// <summary>
+    /// Resolves the byte-array encoding for a column, checking per-column overrides first.
+    /// </summary>
+    internal ByteArrayEncoding GetByteArrayEncoding(IReadOnlyList<string> pathInSchema) =>
+        ColumnEncodings != null && ColumnEncodings.TryGetValue(string.Join(".", pathInSchema), out var enc)
+            ? enc
+            : ByteArrayEncoding;
 }

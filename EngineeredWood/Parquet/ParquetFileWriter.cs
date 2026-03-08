@@ -370,10 +370,11 @@ public sealed class ParquetFileWriter : IAsyncDisposable, IDisposable
     public async ValueTask DisposeAsync()
     {
         if (_disposed) return;
-        _disposed = true;
 
         if (!_closed)
             await CloseAsync().ConfigureAwait(false);
+
+        _disposed = true;
 
         if (_ownsFile)
             await _file.DisposeAsync().ConfigureAwait(false);

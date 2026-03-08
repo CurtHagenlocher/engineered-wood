@@ -1584,4 +1584,290 @@ public class ParquetFileWriterTests : IDisposable
 
         verify(readBatch);
     }
+
+    // --- Binary Stat Truncation Tests ---
+
+    [Fact]
+    public async Task Stats_LongStringValues_Truncated()
+    {
+        var path = TempPath("truncated_stats.parquet");
+
+        // Both min and max are > 64 bytes, so both should be truncated
+        // Use lowercase to ensure lexicographic min/max work as expected
+        string longMin = new string('a', 100);
+        string longMax = new string('z', 100);
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", StringType.Default, nullable: false))
+            .Build();
+        var batch = new RecordBatch(schema,
+            [new StringArray.Builder().Append(longMin).Append(longMax).Build()], 2);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false,
+            new ParquetWriteOptions { DictionaryEnabled = false }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        // Read back and check stats
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        var colMeta = metadata.RowGroups[0].Columns![0].MetaData!;
+
+        // Min should be truncated to 64-byte prefix (exact = false)
+        Assert.NotNull(colMeta.Statistics?.MinValue);
+        Assert.Equal(64, colMeta.Statistics!.MinValue!.Length);
+        Assert.False(colMeta.Statistics.IsMinValueExact);
+
+        // Max should be truncated and incremented
+        Assert.NotNull(colMeta.Statistics.MaxValue);
+        Assert.True(colMeta.Statistics.MaxValue!.Length <= 64);
+        Assert.False(colMeta.Statistics.IsMaxValueExact);
+    }
+
+    [Fact]
+    public async Task Stats_ShortStringValues_NotTruncated()
+    {
+        var path = TempPath("short_stats.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", StringType.Default, nullable: false))
+            .Build();
+        var batch = new RecordBatch(schema,
+            [new StringArray.Builder().Append("alpha").Append("beta").Append("gamma").Build()], 3);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false,
+            new ParquetWriteOptions { DictionaryEnabled = false }))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        var stats = metadata.RowGroups[0].Columns![0].MetaData!.Statistics!;
+
+        Assert.True(stats.IsMinValueExact);
+        Assert.True(stats.IsMaxValueExact);
+        Assert.Equal("alpha"u8.ToArray(), stats.MinValue);
+        Assert.Equal("gamma"u8.ToArray(), stats.MaxValue);
+    }
+
+    // --- Dictionary-based Statistics Tests ---
+
+    [Fact]
+    public async Task Stats_DictEncoded_MatchesFullScan()
+    {
+        var path = TempPath("dict_stats.parquet");
+
+        // Low-cardinality string column — will use dictionary encoding
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("category", StringType.Default, nullable: true))
+            .Build();
+        var builder = new StringArray.Builder();
+        var values = new[] { "cherry", "apple", null, "banana", "apple", "cherry" };
+        foreach (var v in values)
+        {
+            if (v == null) builder.AppendNull();
+            else builder.Append(v);
+        }
+        var batch = new RecordBatch(schema, [builder.Build()], values.Length);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        var stats = metadata.RowGroups[0].Columns![0].MetaData!.Statistics!;
+
+        Assert.Equal(1, stats.NullCount);
+        Assert.Equal("apple"u8.ToArray(), stats.MinValue);
+        Assert.Equal("cherry"u8.ToArray(), stats.MaxValue);
+        Assert.True(stats.IsMinValueExact);
+        Assert.True(stats.IsMaxValueExact);
+    }
+
+    [Fact]
+    public async Task Stats_DictEncodedInt32_CorrectMinMax()
+    {
+        var path = TempPath("dict_int_stats.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("val", Int32Type.Default, nullable: false))
+            .Build();
+        // Low cardinality: 3 unique values repeated
+        var arr = new Int32Array.Builder().Append(10).Append(5).Append(20).Append(5).Append(10).Build();
+        var batch = new RecordBatch(schema, [arr], 5);
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+        var stats = metadata.RowGroups[0].Columns![0].MetaData!.Statistics!;
+
+        var minVal = BitConverter.ToInt32(stats.MinValue!);
+        var maxVal = BitConverter.ToInt32(stats.MaxValue!);
+        Assert.Equal(5, minVal);
+        Assert.Equal(20, maxVal);
+    }
+
+    // --- Per-Column Codec/Encoding Override Tests ---
+
+    [Fact]
+    public async Task PerColumnCodec_OverridesDefault()
+    {
+        var path = TempPath("per_col_codec.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("a", Int32Type.Default, nullable: false))
+            .Field(new Field("b", Int32Type.Default, nullable: false))
+            .Build();
+        var batch = new RecordBatch(schema,
+        [
+            new Int32Array.Builder().Append(1).Append(2).Append(3).Build(),
+            new Int32Array.Builder().Append(4).Append(5).Append(6).Build(),
+        ], 3);
+
+        var options = new ParquetWriteOptions
+        {
+            Compression = CompressionCodec.Snappy,
+            ColumnCodecs = new Dictionary<string, CompressionCodec>
+            {
+                ["b"] = CompressionCodec.Uncompressed,
+            },
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        var colA = metadata.RowGroups[0].Columns![0].MetaData!;
+        var colB = metadata.RowGroups[0].Columns![1].MetaData!;
+
+        Assert.Equal(CompressionCodec.Snappy, colA.Codec);
+        Assert.Equal(CompressionCodec.Uncompressed, colB.Codec);
+
+        // Verify data roundtrips
+        var readBatch = await reader.ReadRowGroupAsync(0);
+        Assert.Equal(3, readBatch.Length);
+    }
+
+    [Fact]
+    public async Task PerColumnEncoding_DeltaByteArrayOverride()
+    {
+        var path = TempPath("per_col_enc.parquet");
+
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("plain_col", StringType.Default, nullable: false))
+            .Field(new Field("dba_col", StringType.Default, nullable: false))
+            .Build();
+        var batch = new RecordBatch(schema,
+        [
+            new StringArray.Builder().Append("foo").Append("bar").Append("baz").Build(),
+            new StringArray.Builder().Append("prefix_a").Append("prefix_b").Append("prefix_c").Build(),
+        ], 3);
+
+        var options = new ParquetWriteOptions
+        {
+            DictionaryEnabled = false,
+            ByteArrayEncoding = ByteArrayEncoding.DeltaLengthByteArray,
+            ColumnEncodings = new Dictionary<string, ByteArrayEncoding>
+            {
+                ["dba_col"] = ByteArrayEncoding.DeltaByteArray,
+            },
+        };
+
+        await using (var file = new LocalSequentialFile(path))
+        await using (var writer = new ParquetFileWriter(file, ownsFile: false, options))
+        {
+            await writer.WriteRowGroupAsync(batch);
+        }
+
+        await using var readFile = new LocalRandomAccessFile(path);
+        await using var reader = new ParquetFileReader(readFile, ownsFile: false);
+        var metadata = await reader.ReadMetadataAsync();
+
+        var colPlain = metadata.RowGroups[0].Columns![0].MetaData!;
+        var colDba = metadata.RowGroups[0].Columns![1].MetaData!;
+
+        Assert.Contains(Encoding.DeltaLengthByteArray, colPlain.Encodings!);
+        Assert.Contains(Encoding.DeltaByteArray, colDba.Encodings!);
+
+        // Verify data roundtrips
+        var readBatch = await reader.ReadRowGroupAsync(0);
+        var plain = (StringArray)readBatch.Column(0);
+        var dba = (StringArray)readBatch.Column(1);
+        Assert.Equal("foo", plain.GetString(0));
+        Assert.Equal("prefix_a", dba.GetString(0));
+    }
+
+    // --- EncodingStrategyResolver Tests ---
+
+    [Fact]
+    public void EncodingStrategyResolver_V2_Int32_DeltaBinaryPacked()
+    {
+        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.Int32, ByteArrayEncoding.DeltaLengthByteArray);
+        Assert.Equal(Encoding.DeltaBinaryPacked, enc);
+    }
+
+    [Fact]
+    public void EncodingStrategyResolver_V2_Float_ByteStreamSplit()
+    {
+        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.Float, ByteArrayEncoding.DeltaLengthByteArray);
+        Assert.Equal(Encoding.ByteStreamSplit, enc);
+    }
+
+    [Fact]
+    public void EncodingStrategyResolver_V2_ByteArray_Default_DLBA()
+    {
+        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.ByteArray, ByteArrayEncoding.DeltaLengthByteArray);
+        Assert.Equal(Encoding.DeltaLengthByteArray, enc);
+    }
+
+    [Fact]
+    public void EncodingStrategyResolver_V2_ByteArray_DBA()
+    {
+        var enc = EncodingStrategyResolver.GetV2Encoding(PhysicalType.ByteArray, ByteArrayEncoding.DeltaByteArray);
+        Assert.Equal(Encoding.DeltaByteArray, enc);
+    }
+
+    [Fact]
+    public void EncodingStrategyResolver_Fallback_V1_AlwaysPlain()
+    {
+        var options = new ParquetWriteOptions { DataPageVersion = DataPageVersion.V1 };
+        var enc = EncodingStrategyResolver.GetFallbackEncoding(PhysicalType.Int32, options);
+        Assert.Equal(Encoding.Plain, enc);
+    }
+
+    [Fact]
+    public void EncodingStrategyResolver_ShouldAttemptDictionary_Boolean_False()
+    {
+        Assert.False(EncodingStrategyResolver.ShouldAttemptDictionary(
+            PhysicalType.Boolean, ParquetWriteOptions.Default));
+    }
+
+    [Fact]
+    public void EncodingStrategyResolver_ShouldAttemptDictionary_Int32_True()
+    {
+        Assert.True(EncodingStrategyResolver.ShouldAttemptDictionary(
+            PhysicalType.Int32, ParquetWriteOptions.Default));
+    }
 }

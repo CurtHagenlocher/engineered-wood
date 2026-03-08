@@ -119,8 +119,8 @@ internal static class DictionaryEncoder
         ReadOnlySpan<int> arrowOffsets = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
         ReadOnlySpan<byte> arrowData = data.Buffers[2].Span;
 
-        // Hash-based dictionary with collision lists for byte sequence comparison
-        var hashMap = new Dictionary<int, List<(byte[] Bytes, int Index)>>();
+        // Open-addressing hash table with linear probing
+        var table = new BytesHashTable(Math.Max(16, maxCardinality * 2));
         var uniqueEntries = new List<byte[]>();
         var indices = new int[nonNullCount];
         int idx = 0;
@@ -134,23 +134,20 @@ internal static class DictionaryEncoder
             int len = arrowOffsets[i + 1] - start;
             ReadOnlySpan<byte> valueBytes = arrowData.Slice(start, len);
 
-            int hash = GetBytesHash(valueBytes);
-            int dictIdx = FindInBucket(hashMap, hash, valueBytes);
+            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count);
 
-            if (dictIdx < 0)
+            if (dictIdx == uniqueEntries.Count)
             {
+                // New entry
                 if (uniqueEntries.Count >= maxCardinality)
                     return null;
 
-                dictIdx = uniqueEntries.Count;
                 var copy = valueBytes.ToArray();
                 uniqueEntries.Add(copy);
                 totalDictBytes += 4 + len;
 
                 if (totalDictBytes > pageSizeLimit)
                     return null;
-
-                AddToBucket(hashMap, hash, copy, dictIdx);
             }
 
             indices[idx++] = dictIdx;
@@ -183,7 +180,7 @@ internal static class DictionaryEncoder
 
         var valueBuffer = array.Data.Buffers[1].Span;
 
-        var hashMap = new Dictionary<int, List<(byte[] Bytes, int Index)>>();
+        var table = new BytesHashTable(Math.Max(16, maxCardinality * 2));
         var uniqueEntries = new List<byte[]>();
         var indices = new int[nonNullCount];
         int idx = 0;
@@ -193,22 +190,18 @@ internal static class DictionaryEncoder
             if (defLevels != null && defLevels[i] == 0) continue;
 
             ReadOnlySpan<byte> valueBytes = valueBuffer.Slice(i * typeLength, typeLength);
-            int hash = GetBytesHash(valueBytes);
-            int dictIdx = FindInBucket(hashMap, hash, valueBytes);
+            int dictIdx = table.GetOrAdd(valueBytes, uniqueEntries.Count);
 
-            if (dictIdx < 0)
+            if (dictIdx == uniqueEntries.Count)
             {
+                // New entry
                 if (uniqueEntries.Count >= maxCardinality)
                     return null;
 
-                dictIdx = uniqueEntries.Count;
-                var copy = valueBytes.ToArray();
-                uniqueEntries.Add(copy);
+                uniqueEntries.Add(valueBytes.ToArray());
 
                 if (uniqueEntries.Count * typeLength > pageSizeLimit)
                     return null;
-
-                AddToBucket(hashMap, hash, copy, dictIdx);
             }
 
             indices[idx++] = dictIdx;
@@ -231,38 +224,69 @@ internal static class DictionaryEncoder
         };
     }
 
-    private static int FindInBucket(
-        Dictionary<int, List<(byte[] Bytes, int Index)>> hashMap,
-        int hash, ReadOnlySpan<byte> valueBytes)
+    /// <summary>
+    /// Open-addressing hash table with linear probing for byte sequences.
+    /// More cache-friendly than Dictionary&lt;int, List&lt;...&gt;&gt; with collision chains.
+    /// Uses FNV-1a for hashing.
+    /// </summary>
+    private sealed class BytesHashTable
     {
-        if (!hashMap.TryGetValue(hash, out var bucket))
-            return -1;
+        private readonly int[] _hashes;    // 0 = empty slot
+        private readonly byte[]?[] _keys;
+        private readonly int[] _values;
+        private readonly int _mask;
 
-        foreach (var (bytes, bIdx) in bucket)
+        public BytesHashTable(int capacity)
         {
-            if (valueBytes.SequenceEqual(bytes))
-                return bIdx;
+            // Round up to next power of 2
+            int size = 1;
+            while (size < capacity) size <<= 1;
+            _hashes = new int[size];
+            _keys = new byte[]?[size];
+            _values = new int[size];
+            _mask = size - 1;
         }
 
-        return -1;
-    }
-
-    private static void AddToBucket(
-        Dictionary<int, List<(byte[] Bytes, int Index)>> hashMap,
-        int hash, byte[] bytes, int index)
-    {
-        if (!hashMap.TryGetValue(hash, out var bucket))
+        /// <summary>
+        /// Returns the existing index for the key, or inserts <paramref name="nextIndex"/>
+        /// and returns it if the key is new.
+        /// </summary>
+        public int GetOrAdd(ReadOnlySpan<byte> key, int nextIndex)
         {
-            bucket = new List<(byte[], int)>(1);
-            hashMap[hash] = bucket;
-        }
-        bucket.Add((bytes, index));
-    }
+            uint h = Fnv1a(key);
+            // Ensure hash is non-zero (0 = empty sentinel)
+            int hash = (int)(h | 1);
+            int slot = hash & _mask;
 
-    private static int GetBytesHash(ReadOnlySpan<byte> bytes)
-    {
-        var hash = new HashCode();
-        hash.AddBytes(bytes);
-        return hash.ToHashCode();
+            while (true)
+            {
+                if (_hashes[slot] == 0)
+                {
+                    // Empty slot — insert
+                    _hashes[slot] = hash;
+                    _keys[slot] = key.ToArray();
+                    _values[slot] = nextIndex;
+                    return nextIndex;
+                }
+
+                if (_hashes[slot] == hash && key.SequenceEqual(_keys[slot]))
+                {
+                    return _values[slot];
+                }
+
+                slot = (slot + 1) & _mask;
+            }
+        }
+
+        private static uint Fnv1a(ReadOnlySpan<byte> data)
+        {
+            uint hash = 2166136261u;
+            for (int i = 0; i < data.Length; i++)
+            {
+                hash ^= data[i];
+                hash *= 16777619u;
+            }
+            return hash;
+        }
     }
 }

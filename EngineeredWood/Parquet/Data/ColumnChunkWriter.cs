@@ -98,6 +98,28 @@ internal static class ColumnChunkWriter
         int nonNullCount,
         ParquetWriteOptions options)
     {
+        // Resolve per-column overrides for compression and byte-array encoding
+        var columnCodec = options.GetCodec(pathInSchema);
+        var columnByteArrayEncoding = options.GetByteArrayEncoding(pathInSchema);
+        if (columnCodec != options.Compression || columnByteArrayEncoding != options.ByteArrayEncoding)
+        {
+            options = new ParquetWriteOptions
+            {
+                Compression = columnCodec,
+                DataPageVersion = options.DataPageVersion,
+                DataPageSize = options.DataPageSize,
+                DictionaryPageSizeLimit = options.DictionaryPageSizeLimit,
+                DictionaryEnabled = options.DictionaryEnabled,
+                RowGroupMaxRows = options.RowGroupMaxRows,
+                RowGroupMaxBytes = options.RowGroupMaxBytes,
+                ByteArrayEncoding = columnByteArrayEncoding,
+                ColumnCodecs = options.ColumnCodecs,
+                ColumnEncodings = options.ColumnEncodings,
+                CreatedBy = options.CreatedBy,
+                KeyValueMetadata = options.KeyValueMetadata,
+            };
+        }
+
         // Normalize def levels for value-encoding and dictionary methods:
         // these check defLevels[i] == 0 for null, which only works when maxDefLevel <= 1.
         int[]? valueDefLevels = NormalizeDefLevels(defLevels, maxDefLevel);
@@ -130,9 +152,13 @@ internal static class ColumnChunkWriter
                 maxDefLevel, maxRepLevel, defLevels, repLevels, valueDefLevels, nonNullCount, options);
         }
 
-        // Compute column-level statistics (uses normalized levels for null detection)
-        var stats = StatisticsCollector.Compute(
-            array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount);
+        // Compute column-level statistics: use dictionary entries when available (O(unique) vs O(total))
+        var stats = dictResult != null
+            ? StatisticsCollector.ComputeFromDictEntries(
+                dictResult.Value.DictionaryPageData, dictResult.Value.DictionaryCount,
+                physicalType, typeLength, rowCount - nonNullCount)
+            : StatisticsCollector.Compute(
+                array, physicalType, typeLength, valueDefLevels, nonNullCount, rowCount);
         result.MetaData.Statistics = stats;
 
         return result;
@@ -704,12 +730,12 @@ internal static class ColumnChunkWriter
 
         if (nonNullCount == 0)
         {
-            encoding = GetV2Encoding(physicalType, useDba);
+            encoding = EncodingStrategyResolver.GetV2Encoding(physicalType, options.ByteArrayEncoding);
             EnsureValuesBuffer(0);
             return 0;
         }
 
-        encoding = GetV2Encoding(physicalType, useDba);
+        encoding = EncodingStrategyResolver.GetV2Encoding(physicalType, options.ByteArrayEncoding);
         return physicalType switch
         {
             PhysicalType.Boolean => EncodeBooleanValuesRleToBuffer(array, offset, numValues, nonNullCount, defLevels),
@@ -724,15 +750,6 @@ internal static class ColumnChunkWriter
         };
     }
 
-    private static Encoding GetV2Encoding(PhysicalType physicalType, bool useDba) => physicalType switch
-    {
-        PhysicalType.Boolean => Encoding.Rle,
-        PhysicalType.Int32 or PhysicalType.Int64 => Encoding.DeltaBinaryPacked,
-        PhysicalType.Float or PhysicalType.Double => Encoding.ByteStreamSplit,
-        PhysicalType.ByteArray => useDba ? Encoding.DeltaByteArray : Encoding.DeltaLengthByteArray,
-        PhysicalType.FixedLenByteArray when useDba => Encoding.DeltaByteArray,
-        _ => Encoding.Plain,
-    };
 
     private static int EncodeBooleanValuesRleToBuffer(
         IArrowArray array, int offset, int numValues, int nonNullCount, int[]? defLevels)
