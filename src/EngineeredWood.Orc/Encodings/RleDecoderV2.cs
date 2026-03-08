@@ -1,4 +1,5 @@
 using System.Buffers;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Orc.Encodings;
 
@@ -98,7 +99,7 @@ internal sealed class RleDecoderV2
         }
 
         if (_signed)
-            value = ZigzagDecode(value);
+            value = Varint.ZigzagDecode(value);
 
         int toWrite = Math.Min(count, output.Length);
         output.Slice(0, toWrite).Fill(value);
@@ -130,7 +131,7 @@ internal sealed class RleDecoderV2
             for (int i = 0; i < length; i++)
             {
                 long val = _bitReader.ReadBits(bitWidth);
-                if (_signed) val = ZigzagDecode(val);
+                if (_signed) val = Varint.ZigzagDecode(val);
                 output[i] = val;
             }
             return length;
@@ -142,7 +143,7 @@ internal sealed class RleDecoderV2
         for (int i = 0; i < length; i++)
         {
             long val = _bitReader.ReadBits(bitWidth);
-            if (_signed) val = ZigzagDecode(val);
+            if (_signed) val = Varint.ZigzagDecode(val);
             pool[i] = val;
         }
 
@@ -227,7 +228,7 @@ internal sealed class RleDecoderV2
         for (int i = 0; i < toWrite; i++)
         {
             long val = dataValues[i] + baseValue;
-            if (_signed) val = ZigzagDecode(val);
+            if (_signed) val = Varint.ZigzagDecode(val);
             output[i] = val;
         }
 
@@ -237,7 +238,7 @@ internal sealed class RleDecoderV2
             for (int i = toWrite; i < length; i++)
             {
                 long val = dataValues[i] + baseValue;
-                if (_signed) val = ZigzagDecode(val);
+                if (_signed) val = Varint.ZigzagDecode(val);
                 dataValues[i] = val;
             }
             BufferExcess(dataValues, toWrite, length - toWrite, true);
@@ -348,12 +349,6 @@ internal sealed class RleDecoderV2
 
     private long ReadSignedVarInt()
     {
-        long unsigned = ReadUnsignedVarInt();
-        return ZigzagDecode(unsigned);
-    }
-
-    private static long ZigzagDecode(long value)
-    {
-        return (long)((ulong)value >> 1) ^ -(value & 1);
+        return Varint.ZigzagDecode(ReadUnsignedVarInt());
     }
 }

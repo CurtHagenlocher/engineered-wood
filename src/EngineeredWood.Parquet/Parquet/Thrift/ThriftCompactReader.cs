@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Parquet.Thrift;
 
@@ -46,32 +47,25 @@ internal ref struct ThriftCompactReader
     /// <summary>Reads an unsigned variable-length integer (ULEB128).</summary>
     public ulong ReadVarint()
     {
-        ulong result = 0;
-        int shift = 0;
-        while (true)
-        {
-            byte b = ReadByte();
-            result |= (ulong)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            shift += 7;
-            if (shift > 63)
-                throw new ParquetFormatException("Varint too long.");
-        }
+        if (_position >= _data.Length)
+            throw new ParquetFormatException("Unexpected end of Thrift data.");
+        return unchecked((ulong)Varint.ReadUnsigned(_data, ref _position));
     }
 
     /// <summary>Reads a zigzag-encoded 32-bit integer.</summary>
     public int ReadZigZagInt32()
     {
-        uint n = (uint)ReadVarint();
-        return (int)(n >> 1) ^ -(int)(n & 1);
+        if (_position >= _data.Length)
+            throw new ParquetFormatException("Unexpected end of Thrift data.");
+        return checked((int)Varint.ReadSigned(_data, ref _position));
     }
 
     /// <summary>Reads a zigzag-encoded 64-bit integer.</summary>
     public long ReadZigZagInt64()
     {
-        ulong n = ReadVarint();
-        return (long)(n >> 1) ^ -(long)(n & 1);
+        if (_position >= _data.Length)
+            throw new ParquetFormatException("Unexpected end of Thrift data.");
+        return Varint.ReadSigned(_data, ref _position);
     }
 
     /// <summary>Reads a 16-bit integer (zigzag encoded in compact protocol).</summary>

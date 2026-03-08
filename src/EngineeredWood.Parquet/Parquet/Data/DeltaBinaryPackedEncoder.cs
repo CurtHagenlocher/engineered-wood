@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Parquet.Data;
 
@@ -194,19 +195,13 @@ internal sealed class DeltaBinaryPackedEncoder
     private void WriteUnsignedVarInt(long value)
     {
         EnsureCapacity(10);
-        ulong v = unchecked((ulong)value);
-        while (v > 0x7F)
-        {
-            _buffer[_position++] = (byte)(v | 0x80);
-            v >>= 7;
-        }
-        _buffer[_position++] = (byte)v;
+        _position += Varint.WriteUnsigned(_buffer.AsSpan(_position), unchecked((ulong)value));
     }
 
     private void WriteZigZagVarInt(long value)
     {
-        ulong encoded = unchecked((ulong)((value << 1) ^ (value >> 63)));
-        WriteUnsignedVarInt(unchecked((long)encoded));
+        EnsureCapacity(10);
+        _position += Varint.WriteSigned(_buffer.AsSpan(_position), value);
     }
 
     private void EnsureCapacity(int additionalBytes)

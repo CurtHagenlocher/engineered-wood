@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using System.Numerics;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Parquet.Data;
 
@@ -343,18 +344,9 @@ internal ref struct RleBitPackedDecoder
 
     private int ReadVarInt()
     {
-        int result = 0;
-        int shift = 0;
-        while (true)
-        {
-            if (_position >= _data.Length)
-                throw new ParquetFormatException("Unexpected end of RLE data reading varint.");
-            byte b = _data[_position++];
-            result |= (b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            shift += 7;
-        }
+        if (_position >= _data.Length)
+            throw new ParquetFormatException("Unexpected end of RLE data reading varint.");
+        return checked((int)Varint.ReadUnsigned(_data, ref _position));
     }
 
     private int ReadRleValue()

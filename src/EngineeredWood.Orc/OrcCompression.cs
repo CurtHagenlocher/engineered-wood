@@ -1,29 +1,44 @@
 using System.Buffers;
-using System.IO.Compression;
+using EngineeredWood.Compression;
 using EngineeredWood.Orc.Proto;
 
 namespace EngineeredWood.Orc;
 
 /// <summary>
-/// Handles ORC stream decompression. ORC uses a block-based compression scheme
-/// where each compressed block has a 3-byte header.
+/// Handles ORC stream compression/decompression. ORC uses a block-based scheme
+/// where each compressed block has a 3-byte header. Raw codec operations are
+/// delegated to <see cref="Compressor"/> and <see cref="Decompressor"/> in Core.
 /// </summary>
 internal static class OrcCompression
 {
-    /// <summary>
-    /// Decompresses an ORC compressed stream (which may contain multiple blocks).
-    /// Each block has a 3-byte header:
-    ///   - byte 0 bit 0: 0 = original (uncompressed), 1 = compressed
-    ///   - remaining 23 bits: length of the chunk (original or compressed)
-    /// </summary>
     [ThreadStatic]
     private static MemoryStream? t_outputBuffer;
 
+    /// <summary>
+    /// Maps an ORC <see cref="CompressionKind"/> to the shared <see cref="CompressionCodec"/>.
+    /// </summary>
+    public static CompressionCodec ToCodec(CompressionKind kind) => kind switch
+    {
+        CompressionKind.None => CompressionCodec.Uncompressed,
+        CompressionKind.Zlib => CompressionCodec.Deflate,
+        CompressionKind.Snappy => CompressionCodec.Snappy,
+        CompressionKind.Lz4 => CompressionCodec.Lz4,
+        CompressionKind.Zstd => CompressionCodec.Zstd,
+        _ => throw new NotSupportedException($"Compression kind {kind} is not supported."),
+    };
+
+    /// <summary>
+    /// Decompresses an ORC compressed stream (which may contain multiple blocks).
+    /// Each block has a 3-byte header:
+    ///   - byte 0 bit 0: 0 = compressed, 1 = original (uncompressed)
+    ///   - remaining 23 bits: length of the chunk
+    /// </summary>
     public static byte[] Decompress(CompressionKind kind, ReadOnlySpan<byte> input, int compressionBlockSize)
     {
         if (kind == CompressionKind.None)
             return input.ToArray();
 
+        var codec = ToCodec(kind);
         var output = t_outputBuffer ??= new MemoryStream();
         output.SetLength(0);
         var offset = 0;
@@ -33,7 +48,6 @@ internal static class OrcCompression
             if (offset + 3 > input.Length)
                 throw new InvalidDataException("Truncated ORC compression block header.");
 
-            // Read 3-byte header (little-endian)
             int header = input[offset] | (input[offset + 1] << 8) | (input[offset + 2] << 16);
             offset += 3;
 
@@ -52,7 +66,10 @@ internal static class OrcCompression
             }
             else
             {
-                DecompressBlock(kind, chunk, output, compressionBlockSize);
+                var decompBuf = ArrayPool<byte>.Shared.Rent(compressionBlockSize);
+                int written = Decompressor.Decompress(codec, chunk, decompBuf);
+                output.Write(decompBuf, 0, written);
+                ArrayPool<byte>.Shared.Return(decompBuf);
             }
         }
 
@@ -72,6 +89,7 @@ internal static class OrcCompression
             return (copy, input.Length);
         }
 
+        var codec = ToCodec(kind);
         var output = t_outputBuffer ??= new MemoryStream();
         output.SetLength(0);
         var offset = 0;
@@ -94,9 +112,16 @@ internal static class OrcCompression
             offset += chunkLength;
 
             if (isOriginal)
+            {
                 output.Write(chunk);
+            }
             else
-                DecompressBlock(kind, chunk, output, compressionBlockSize);
+            {
+                var decompBuf = ArrayPool<byte>.Shared.Rent(compressionBlockSize);
+                int written = Decompressor.Decompress(codec, chunk, decompBuf);
+                output.Write(decompBuf, 0, written);
+                ArrayPool<byte>.Shared.Return(decompBuf);
+            }
         }
 
         int length = (int)output.Length;
@@ -104,65 +129,6 @@ internal static class OrcCompression
         output.Position = 0;
         output.Read(pooled, 0, length);
         return (pooled, length);
-    }
-
-    private static void DecompressBlock(CompressionKind kind, ReadOnlySpan<byte> compressed, MemoryStream output, int maxDecompressedSize)
-    {
-        switch (kind)
-        {
-            case CompressionKind.Zlib:
-                DecompressZlib(compressed, output);
-                break;
-            case CompressionKind.Snappy:
-                DecompressSnappy(compressed, output);
-                break;
-            case CompressionKind.Lz4:
-                DecompressLz4(compressed, output, maxDecompressedSize);
-                break;
-            case CompressionKind.Zstd:
-                DecompressZstd(compressed, output);
-                break;
-            default:
-                throw new NotSupportedException($"Compression kind {kind} is not yet supported.");
-        }
-    }
-
-    private static void DecompressZlib(ReadOnlySpan<byte> compressed, MemoryStream output)
-    {
-        // ORC uses raw deflate (RFC 1951) without zlib or gzip headers
-        // Use unsafe to pin the span and wrap in UnmanagedMemoryStream to avoid ToArray() copy
-        unsafe
-        {
-            fixed (byte* ptr = compressed)
-            {
-                using var input = new UnmanagedMemoryStream(ptr, compressed.Length);
-                using var deflate = new DeflateStream(input, CompressionMode.Decompress);
-                deflate.CopyTo(output);
-            }
-        }
-    }
-
-    private static void DecompressSnappy(ReadOnlySpan<byte> compressed, MemoryStream output)
-    {
-        var decompressed = new byte[Snappier.Snappy.GetUncompressedLength(compressed)];
-        int written = Snappier.Snappy.Decompress(compressed, decompressed);
-        output.Write(decompressed, 0, written);
-    }
-
-    private static void DecompressLz4(ReadOnlySpan<byte> compressed, MemoryStream output, int maxDecompressedSize)
-    {
-        var decompressed = new byte[maxDecompressedSize];
-        int written = K4os.Compression.LZ4.LZ4Codec.Decode(compressed, decompressed);
-        if (written < 0)
-            throw new InvalidDataException("LZ4 decompression failed.");
-        output.Write(decompressed, 0, written);
-    }
-
-    private static void DecompressZstd(ReadOnlySpan<byte> compressed, MemoryStream output)
-    {
-        using var decompressor = new ZstdSharp.Decompressor();
-        var decompressed = decompressor.Unwrap(compressed);
-        output.Write(decompressed);
     }
 
     /// <summary>
@@ -174,6 +140,7 @@ internal static class OrcCompression
         if (kind == CompressionKind.None)
             return input.ToArray();
 
+        var codec = ToCodec(kind);
         var output = t_outputBuffer ??= new MemoryStream();
         output.SetLength(0);
 
@@ -184,15 +151,18 @@ internal static class OrcCompression
             var block = input.Slice(offset, blockSize);
             offset += blockSize;
 
-            var compressed = CompressBlock(kind, block);
-            if (compressed != null && compressed.Length < blockSize)
+            int maxCompressed = Compressor.GetMaxCompressedLength(codec, blockSize);
+            var compBuf = ArrayPool<byte>.Shared.Rent(maxCompressed);
+            int compLen = Compressor.Compress(codec, block, compBuf);
+
+            if (compLen < blockSize)
             {
-                // Write compressed block header: isOriginal=0, length=compressed.Length
-                int header = compressed.Length << 1;
+                // Write compressed block header: isOriginal=0, length=compLen
+                int header = compLen << 1;
                 output.WriteByte((byte)(header & 0xFF));
                 output.WriteByte((byte)((header >> 8) & 0xFF));
                 output.WriteByte((byte)((header >> 16) & 0xFF));
-                output.Write(compressed);
+                output.Write(compBuf, 0, compLen);
             }
             else
             {
@@ -203,6 +173,8 @@ internal static class OrcCompression
                 output.WriteByte((byte)((header >> 16) & 0xFF));
                 output.Write(block);
             }
+
+            ArrayPool<byte>.Shared.Return(compBuf);
         }
 
         return output.ToArray();
@@ -222,7 +194,7 @@ internal static class OrcCompression
             return;
         }
 
-        // Walk through compression blocks to find which block contains our offset
+        var codec = ToCodec(kind);
         long inputOffset = 0;
         long compressedOffset = 0;
 
@@ -233,7 +205,6 @@ internal static class OrcCompression
 
             if (uncompressedOffset < nextInputOffset || nextInputOffset >= uncompressedData.Length)
             {
-                // Our target is in this block
                 positions.Add((ulong)compressedOffset);
                 positions.Add((ulong)(uncompressedOffset - inputOffset));
                 return;
@@ -241,61 +212,17 @@ internal static class OrcCompression
 
             // Compute compressed size of this block
             var block = uncompressedData.Slice((int)inputOffset, blockSize);
-            var compressed = CompressBlock(kind, block);
-            int outputBlockSize = (compressed != null && compressed.Length < blockSize)
-                ? compressed.Length : blockSize;
+            int maxCompressed = Compressor.GetMaxCompressedLength(codec, blockSize);
+            var compBuf = ArrayPool<byte>.Shared.Rent(maxCompressed);
+            int compLen = Compressor.Compress(codec, block, compBuf);
+            int outputBlockSize = compLen < blockSize ? compLen : blockSize;
+            ArrayPool<byte>.Shared.Return(compBuf);
 
-            compressedOffset += 3 + outputBlockSize; // 3-byte header + data
+            compressedOffset += 3 + outputBlockSize;
             inputOffset = nextInputOffset;
         }
 
-        // Offset is at or past the end
         positions.Add((ulong)compressedOffset);
         positions.Add(0);
-    }
-
-    private static byte[]? CompressBlock(CompressionKind kind, ReadOnlySpan<byte> data)
-    {
-        return kind switch
-        {
-            CompressionKind.Zlib => CompressZlib(data),
-            CompressionKind.Snappy => CompressSnappy(data),
-            CompressionKind.Lz4 => CompressLz4(data),
-            CompressionKind.Zstd => CompressZstd(data),
-            _ => null,
-        };
-    }
-
-    private static byte[]? CompressZlib(ReadOnlySpan<byte> data)
-    {
-        using var ms = new MemoryStream();
-        using (var deflate = new DeflateStream(ms, CompressionLevel.Optimal, leaveOpen: true))
-        {
-            deflate.Write(data);
-        }
-        return ms.ToArray();
-    }
-
-    private static byte[]? CompressSnappy(ReadOnlySpan<byte> data)
-    {
-        int maxLen = Snappier.Snappy.GetMaxCompressedLength(data.Length);
-        var output = new byte[maxLen];
-        int written = Snappier.Snappy.Compress(data, output);
-        return output.AsSpan(0, written).ToArray();
-    }
-
-    private static byte[]? CompressLz4(ReadOnlySpan<byte> data)
-    {
-        var output = new byte[K4os.Compression.LZ4.LZ4Codec.MaximumOutputSize(data.Length)];
-        int written = K4os.Compression.LZ4.LZ4Codec.Encode(data, output);
-        if (written <= 0) return null;
-        return output.AsSpan(0, written).ToArray();
-    }
-
-    private static byte[]? CompressZstd(ReadOnlySpan<byte> data)
-    {
-        using var compressor = new ZstdSharp.Compressor();
-        var compressed = compressor.Wrap(data);
-        return compressed.ToArray();
     }
 }

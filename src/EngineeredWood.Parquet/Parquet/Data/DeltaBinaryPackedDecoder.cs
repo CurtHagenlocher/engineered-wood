@@ -1,4 +1,5 @@
 using System.Buffers.Binary;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Parquet.Data;
 
@@ -213,23 +214,7 @@ internal ref struct DeltaBinaryPackedDecoder
         return value;
     }
 
-    private long ReadUnsignedVarInt()
-    {
-        long result = 0;
-        int shift = 0;
-        while (true)
-        {
-            byte b = _data[_pos++];
-            result |= (long)(b & 0x7F) << shift;
-            if ((b & 0x80) == 0)
-                return result;
-            shift += 7;
-        }
-    }
+    private long ReadUnsignedVarInt() => Varint.ReadUnsigned(_data, ref _pos);
 
-    private long ReadZigZagVarInt()
-    {
-        long encoded = ReadUnsignedVarInt();
-        return (long)((ulong)encoded >> 1) ^ -(encoded & 1);
-    }
+    private long ReadZigZagVarInt() => Varint.ReadSigned(_data, ref _pos);
 }

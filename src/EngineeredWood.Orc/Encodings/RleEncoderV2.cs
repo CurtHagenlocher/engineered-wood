@@ -1,4 +1,5 @@
 using System.Numerics;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Orc.Encodings;
 
@@ -83,10 +84,7 @@ internal sealed class RleEncoderV2
     {
         var result = new long[values.Length];
         for (int i = 0; i < values.Length; i++)
-        {
-            long v = values[i];
-            result[i] = (v << 1) ^ (v >> 63);
-        }
+            result[i] = (long)Varint.ZigzagEncode(values[i]);
         return result;
     }
 
@@ -97,7 +95,7 @@ internal sealed class RleEncoderV2
             if (values[i] != first) return false;
 
         // All identical — encode as Short Repeat
-        long value = _signed ? (first << 1) ^ (first >> 63) : first;
+        long value = _signed ? (long)Varint.ZigzagEncode(first) : first;
 
         int byteWidth;
         if (value == 0)
@@ -348,7 +346,7 @@ internal sealed class RleEncoderV2
         long max = 0;
         for (int i = 0; i < values.Length; i++)
         {
-            long v = _signed ? (values[i] << 1) ^ (values[i] >> 63) : values[i];
+            long v = _signed ? (long)Varint.ZigzagEncode(values[i]) : values[i];
             if (v > max) max = v;
         }
         int bw = max == 0 ? 1 : 64 - BitOperations.LeadingZeroCount((ulong)max);
@@ -365,33 +363,11 @@ internal sealed class RleEncoderV2
         return baseBits;
     }
 
-    private static int VarIntSize(long value)
-    {
-        ulong v = value < 0 ? (ulong)(~value) * 2 + 1 : (ulong)value * 2;
-        if (v == 0) return 1;
-        return (64 - BitOperations.LeadingZeroCount(v) + 6) / 7;
-    }
+    private static int VarIntSize(long value) => Varint.SignedSize(value);
 
     internal static void WriteUnsignedVarInt(Stream output, long value)
-    {
-        ulong v = (ulong)value;
-        while (v > 0x7F)
-        {
-            output.WriteByte((byte)(0x80 | (v & 0x7F)));
-            v >>= 7;
-        }
-        output.WriteByte((byte)v);
-    }
+        => Varint.WriteUnsigned(output, (ulong)value);
 
     internal static void WriteSignedVarInt(Stream output, long value)
-    {
-        // Zigzag encode then write unsigned
-        ulong zz = (ulong)((value << 1) ^ (value >> 63));
-        while (zz > 0x7F)
-        {
-            output.WriteByte((byte)(0x80 | (zz & 0x7F)));
-            zz >>= 7;
-        }
-        output.WriteByte((byte)zz);
-    }
+        => Varint.WriteSigned(output, value);
 }

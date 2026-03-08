@@ -1,5 +1,6 @@
 using System.Buffers;
 using System.Buffers.Binary;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Parquet.Thrift;
 
@@ -63,26 +64,21 @@ internal sealed class ThriftCompactWriter
     public void WriteVarint(ulong value)
     {
         EnsureCapacity(10); // max varint size
-        while (value > 0x7F)
-        {
-            _buffer[_position++] = (byte)(value | 0x80);
-            value >>= 7;
-        }
-        _buffer[_position++] = (byte)value;
+        _position += Varint.WriteUnsigned(_buffer.AsSpan(_position), value);
     }
 
     /// <summary>Writes a zigzag-encoded 32-bit integer.</summary>
     public void WriteZigZagInt32(int value)
     {
-        uint zigzag = (uint)((value << 1) ^ (value >> 31));
-        WriteVarint(zigzag);
+        EnsureCapacity(10);
+        _position += Varint.WriteSigned(_buffer.AsSpan(_position), value);
     }
 
     /// <summary>Writes a zigzag-encoded 64-bit integer.</summary>
     public void WriteZigZagInt64(long value)
     {
-        ulong zigzag = (ulong)((value << 1) ^ (value >> 63));
-        WriteVarint(zigzag);
+        EnsureCapacity(10);
+        _position += Varint.WriteSigned(_buffer.AsSpan(_position), value);
     }
 
     /// <summary>Writes a 16-bit integer (zigzag encoded in compact protocol).</summary>

@@ -1,4 +1,5 @@
 using System.Buffers;
+using EngineeredWood.Encodings;
 
 namespace EngineeredWood.Orc.Encodings;
 
@@ -130,7 +131,6 @@ internal sealed class RleDecoderV1
 
     private long ReadSignedVarInt()
     {
-        long unsigned = ReadUnsignedVarInt();
-        return (long)((ulong)unsigned >> 1) ^ -(unsigned & 1);
+        return Varint.ZigzagDecode(ReadUnsignedVarInt());
     }
 }
