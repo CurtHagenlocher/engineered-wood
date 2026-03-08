@@ -53,6 +53,81 @@ internal static class ParquetSchemaConverter
             foreach (var childField in structType.Fields)
                 AddFieldElements(childField, elements);
         }
+        else if (field.DataType is ListType listType)
+        {
+            // 3-level list encoding:
+            // optional/required group <name> (LIST) {
+            //   repeated group list {
+            //     optional/required <element-type> element;
+            //   }
+            // }
+            elements.Add(new SchemaElement
+            {
+                Name = field.Name,
+                NumChildren = 1,
+                RepetitionType = field.IsNullable ? FieldRepetitionType.Optional : FieldRepetitionType.Required,
+                LogicalType = new LogicalType.ListType(),
+                ConvertedType = ConvertedType.List,
+            });
+
+            var valueField = listType.Fields[0]; // "item" field
+            var elementField = new Field("element", valueField.DataType, valueField.IsNullable);
+
+            // The "list" repeated group
+            if (elementField.DataType is StructType or ListType or MapType)
+            {
+                // Complex element — repeated group with children
+                elements.Add(new SchemaElement
+                {
+                    Name = "list",
+                    NumChildren = 1,
+                    RepetitionType = FieldRepetitionType.Repeated,
+                });
+                AddFieldElements(elementField, elements);
+            }
+            else
+            {
+                // Primitive element — repeated group "list" with single child "element"
+                elements.Add(new SchemaElement
+                {
+                    Name = "list",
+                    NumChildren = 1,
+                    RepetitionType = FieldRepetitionType.Repeated,
+                });
+                elements.Add(ToSchemaElement(elementField));
+            }
+        }
+        else if (field.DataType is MapType mapType)
+        {
+            // MAP encoding:
+            // optional/required group <name> (MAP) {
+            //   repeated group key_value {
+            //     required <key-type> key;
+            //     optional/required <value-type> value;
+            //   }
+            // }
+            elements.Add(new SchemaElement
+            {
+                Name = field.Name,
+                NumChildren = 1,
+                RepetitionType = field.IsNullable ? FieldRepetitionType.Optional : FieldRepetitionType.Required,
+                LogicalType = new LogicalType.MapType(),
+                ConvertedType = ConvertedType.Map,
+            });
+
+            var keyField = new Field("key", mapType.KeyField.DataType, nullable: false);
+            var valueField = new Field("value", mapType.ValueField.DataType, mapType.ValueField.IsNullable);
+
+            elements.Add(new SchemaElement
+            {
+                Name = "key_value",
+                NumChildren = 2,
+                RepetitionType = FieldRepetitionType.Repeated,
+            });
+
+            AddFieldElements(keyField, elements);
+            AddFieldElements(valueField, elements);
+        }
         else
         {
             elements.Add(ToSchemaElement(field));

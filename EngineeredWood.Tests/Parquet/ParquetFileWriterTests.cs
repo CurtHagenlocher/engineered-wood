@@ -1025,6 +1025,292 @@ public class ParquetFileWriterTests : IDisposable
         }
     }
 
+    // --- List Write Tests ---
+
+    [Fact]
+    public async Task List_NullableListOfNullableInt32_RoundTrips()
+    {
+        // Schema: values (optional list<optional int32>)
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("values", listType, nullable: true))
+            .Build();
+
+        // Row 0: [1, 2, 3]
+        // Row 1: null (list is null)
+        // Row 2: [] (empty list)
+        // Row 3: [null, 5]
+        // Row 4: [6]
+        var valuesBuilder = new Int32Array.Builder();
+        valuesBuilder.Append(1); valuesBuilder.Append(2); valuesBuilder.Append(3); // row 0
+        valuesBuilder.AppendNull(); valuesBuilder.Append(5); // row 3
+        valuesBuilder.Append(6); // row 4
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); // row 0 start
+        offsetsBuilder.Append(3); // row 1 start (null)
+        offsetsBuilder.Append(3); // row 2 start (empty)
+        offsetsBuilder.Append(3); // row 3 start
+        offsetsBuilder.Append(5); // row 4 start
+        offsetsBuilder.Append(6); // end
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);  // row 0: valid
+        BitUtility.SetBit(nullBitmap, 1, false); // row 1: null
+        BitUtility.SetBit(nullBitmap, 2, true);  // row 2: valid (empty)
+        BitUtility.SetBit(nullBitmap, 3, true);  // row 3: valid
+        BitUtility.SetBit(nullBitmap, 4, true);  // row 4: valid
+
+        int count = 5;
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), valuesBuilder.Build(),
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        Assert.IsType<ListType>(result.Schema.FieldsList[0].DataType);
+        var resultList = (ListArray)result.Column(0);
+
+        // Row 0: [1, 2, 3]
+        Assert.False(resultList.IsNull(0));
+        var r0 = (Int32Array)resultList.GetSlicedValues(0);
+        Assert.Equal(3, r0.Length);
+        Assert.Equal(1, r0.GetValue(0));
+        Assert.Equal(2, r0.GetValue(1));
+        Assert.Equal(3, r0.GetValue(2));
+
+        // Row 1: null
+        Assert.True(resultList.IsNull(1));
+
+        // Row 2: empty
+        Assert.False(resultList.IsNull(2));
+        var r2 = (Int32Array)resultList.GetSlicedValues(2);
+        Assert.Equal(0, r2.Length);
+
+        // Row 3: [null, 5]
+        Assert.False(resultList.IsNull(3));
+        var r3 = (Int32Array)resultList.GetSlicedValues(3);
+        Assert.Equal(2, r3.Length);
+        Assert.True(r3.IsNull(0));
+        Assert.Equal(5, r3.GetValue(1));
+
+        // Row 4: [6]
+        Assert.False(resultList.IsNull(4));
+        var r4 = (Int32Array)resultList.GetSlicedValues(4);
+        Assert.Equal(1, r4.Length);
+        Assert.Equal(6, r4.GetValue(0));
+    }
+
+    [Fact]
+    public async Task List_NullableListOfStrings_RoundTrips()
+    {
+        var listType = new ListType(new Field("element", Apache.Arrow.Types.StringType.Default, nullable: true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("names", listType, nullable: true))
+            .Build();
+
+        // Row 0: ["hello", "world"]
+        // Row 1: null
+        // Row 2: ["test"]
+        // Row 3: [null, "foo", "bar"]
+        var valuesBuilder = new StringArray.Builder();
+        valuesBuilder.Append("hello"); valuesBuilder.Append("world"); // row 0
+        valuesBuilder.Append("test"); // row 2
+        valuesBuilder.AppendNull(); valuesBuilder.Append("foo"); valuesBuilder.Append("bar"); // row 3
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(2);
+        offsetsBuilder.Append(3); offsetsBuilder.Append(6);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+        BitUtility.SetBit(nullBitmap, 3, true);
+
+        int count = 4;
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), valuesBuilder.Build(),
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultList = (ListArray)result.Column(0);
+
+        // Row 0: ["hello", "world"]
+        var r0 = (StringArray)resultList.GetSlicedValues(0);
+        Assert.Equal(2, r0.Length);
+        Assert.Equal("hello", r0.GetString(0));
+        Assert.Equal("world", r0.GetString(1));
+
+        // Row 1: null
+        Assert.True(resultList.IsNull(1));
+
+        // Row 2: ["test"]
+        var r2 = (StringArray)resultList.GetSlicedValues(2);
+        Assert.Equal(1, r2.Length);
+        Assert.Equal("test", r2.GetString(0));
+
+        // Row 3: [null, "foo", "bar"]
+        var r3 = (StringArray)resultList.GetSlicedValues(3);
+        Assert.Equal(3, r3.Length);
+        Assert.True(r3.IsNull(0));
+        Assert.Equal("foo", r3.GetString(1));
+        Assert.Equal("bar", r3.GetString(2));
+    }
+
+    [Fact]
+    public async Task List_RequiredListOfRequiredInt32_RoundTrips()
+    {
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: false));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("numbers", listType, nullable: false))
+            .Build();
+
+        // Row 0: [10, 20, 30]
+        // Row 1: [40]
+        // Row 2: [50, 60]
+        var valuesBuilder = new Int32Array.Builder();
+        valuesBuilder.Append(10); valuesBuilder.Append(20); valuesBuilder.Append(30);
+        valuesBuilder.Append(40);
+        valuesBuilder.Append(50); valuesBuilder.Append(60);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(3); offsetsBuilder.Append(4); offsetsBuilder.Append(6);
+
+        int count = 3;
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), valuesBuilder.Build(),
+            ArrowBuffer.Empty, nullCount: 0);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultList = (ListArray)result.Column(0);
+
+        var r0 = (Int32Array)resultList.GetSlicedValues(0);
+        Assert.Equal(3, r0.Length);
+        Assert.Equal(10, r0.GetValue(0));
+        Assert.Equal(20, r0.GetValue(1));
+        Assert.Equal(30, r0.GetValue(2));
+
+        var r1 = (Int32Array)resultList.GetSlicedValues(1);
+        Assert.Equal(1, r1.Length);
+        Assert.Equal(40, r1.GetValue(0));
+
+        var r2 = (Int32Array)resultList.GetSlicedValues(2);
+        Assert.Equal(2, r2.Length);
+        Assert.Equal(50, r2.GetValue(0));
+        Assert.Equal(60, r2.GetValue(1));
+    }
+
+    [Fact]
+    public async Task List_MixedWithFlatColumns_RoundTrips()
+    {
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, nullable: false))
+            .Field(new Field("tags", listType, nullable: true))
+            .Build();
+
+        int count = 3;
+        var idBuilder = new Int32Array.Builder();
+        idBuilder.Append(1); idBuilder.Append(2); idBuilder.Append(3);
+
+        // Row 0: [10, 20]
+        // Row 1: null
+        // Row 2: [30]
+        var valuesBuilder = new Int32Array.Builder();
+        valuesBuilder.Append(10); valuesBuilder.Append(20);
+        valuesBuilder.Append(30);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(2); offsetsBuilder.Append(3);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), valuesBuilder.Build(),
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { idBuilder.Build(), listArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultId = (Int32Array)result.Column(0);
+        var resultList = (ListArray)result.Column(1);
+
+        Assert.Equal(1, resultId.GetValue(0));
+        Assert.Equal(2, resultId.GetValue(1));
+        Assert.Equal(3, resultId.GetValue(2));
+
+        var r0 = (Int32Array)resultList.GetSlicedValues(0);
+        Assert.Equal(2, r0.Length);
+        Assert.Equal(10, r0.GetValue(0));
+        Assert.Equal(20, r0.GetValue(1));
+
+        Assert.True(resultList.IsNull(1));
+
+        var r2 = (Int32Array)resultList.GetSlicedValues(2);
+        Assert.Equal(1, r2.Length);
+        Assert.Equal(30, r2.GetValue(0));
+    }
+
+    [Fact]
+    public async Task List_V1_NullableList_RoundTrips()
+    {
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("values", listType, nullable: true))
+            .Build();
+
+        // Row 0: [1, 2]
+        // Row 1: null
+        // Row 2: [3]
+        var valuesBuilder = new Int32Array.Builder();
+        valuesBuilder.Append(1); valuesBuilder.Append(2);
+        valuesBuilder.Append(3);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(2); offsetsBuilder.Append(3);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+
+        int count = 3;
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), valuesBuilder.Build(),
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var result = await WriteAndRead(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V1,
+        });
+
+        var resultList = (ListArray)result.Column(0);
+        var r0 = (Int32Array)resultList.GetSlicedValues(0);
+        Assert.Equal(2, r0.Length);
+        Assert.Equal(1, r0.GetValue(0));
+        Assert.Equal(2, r0.GetValue(1));
+
+        Assert.True(resultList.IsNull(1));
+
+        var r2 = (Int32Array)resultList.GetSlicedValues(2);
+        Assert.Equal(1, r2.Length);
+        Assert.Equal(3, r2.GetValue(0));
+    }
+
     // --- Explicit V1 Tests (ensure V1 still works when selected) ---
 
     [Fact]

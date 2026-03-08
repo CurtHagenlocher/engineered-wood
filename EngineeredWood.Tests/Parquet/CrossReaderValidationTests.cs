@@ -761,6 +761,10 @@ public class CrossReaderValidationTests : IDisposable
     //  ParquetSharp cross-reader: struct tests
     // ----------------------------------------------------------------
 
+    // ----------------------------------------------------------------
+    //  ParquetSharp cross-reader: struct tests
+    // ----------------------------------------------------------------
+
     [Fact]
     public async Task PS_Struct_NullableStruct_V2()
     {
@@ -946,5 +950,90 @@ public class CrossReaderValidationTests : IDisposable
                 Assert.Equal(yValues[i], yVals[yIdx++]);
             }
         }
+    }
+
+    // ----------------------------------------------------------------
+    //  ParquetSharp cross-reader: list tests
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task PS_List_NullableListOfNullableInt32_V2()
+    {
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("values", listType, nullable: true))
+            .Build();
+
+        // Row 0: [1, 2, 3]
+        // Row 1: null
+        // Row 2: []
+        // Row 3: [null, 5]
+        // Row 4: [6]
+        var valuesBuilder = new Int32Array.Builder();
+        valuesBuilder.Append(1); valuesBuilder.Append(2); valuesBuilder.Append(3);
+        valuesBuilder.AppendNull(); valuesBuilder.Append(5);
+        valuesBuilder.Append(6);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(3); offsetsBuilder.Append(3);
+        offsetsBuilder.Append(3); offsetsBuilder.Append(5); offsetsBuilder.Append(6);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+        BitUtility.SetBit(nullBitmap, 3, true);
+        BitUtility.SetBit(nullBitmap, 4, true);
+
+        int count = 5;
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), valuesBuilder.Build(),
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var path = await WriteWithEW(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+        }, name: "ps_list.parquet");
+
+        // Read with ParquetSharp low-level API
+        // Schema: optional group values (LIST) → repeated group list → optional int32 element
+        // maxDef=3, maxRep=1
+        // def=0: list null, def=1: empty list, def=2: null element, def=3: element present
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = psReader.RowGroup(0);
+
+        // Total entries: 3 (row 0) + 1 (row 1 null) + 1 (row 2 empty) + 2 (row 3) + 1 (row 4) = 8
+        int totalEntries = 8;
+        using var col = rg.Column(0);
+        using var reader = (ParquetSharp.ColumnReader<int>)col;
+        var defLevels = new short[totalEntries];
+        var repLevels = new short[totalEntries];
+        var values = new int[totalEntries];
+        reader.ReadBatch(totalEntries, defLevels, repLevels, values, out long valuesRead);
+
+        // Expected def levels: [3,3,3, 0, 1, 2,3, 3]
+        short[] expectedDef = [3, 3, 3, 0, 1, 2, 3, 3];
+        short[] expectedRep = [0, 1, 1, 0, 0, 0, 1, 0];
+
+        Assert.Equal(expectedDef.Length, totalEntries);
+        for (int i = 0; i < totalEntries; i++)
+        {
+            Assert.Equal(expectedDef[i], defLevels[i]);
+            Assert.Equal(expectedRep[i], repLevels[i]);
+        }
+
+        // Values (dense): 1, 2, 3, 5, 6
+        int vIdx = 0;
+        int[] expectedValues = [1, 2, 3, 5, 6];
+        for (int i = 0; i < totalEntries; i++)
+        {
+            if (defLevels[i] == 3)
+            {
+                Assert.Equal(expectedValues[vIdx], values[vIdx]);
+                vIdx++;
+            }
+        }
+        Assert.Equal(expectedValues.Length, vIdx);
     }
 }

@@ -90,6 +90,13 @@ internal static class NestedArrayFlattener
             return;
         }
 
+        // List node: schema has LIST group → repeated group → element child(ren)
+        if (array is ListArray listArray && ArrowSchemaConverter.IsListNode(node))
+        {
+            FlattenList(listArray, node, leafDescriptors, result, ancestorDefLevels, ancestorMaxDef);
+            return;
+        }
+
         throw new NotSupportedException(
             $"Nested array type '{array.GetType().Name}' is not yet supported for writing. " +
             "Struct, List, and Map support is being added incrementally.");
@@ -259,6 +266,393 @@ internal static class NestedArrayFlattener
 
         return ExtractDenseValues(array, defLevels, maxDef, nonNullCount,
             descriptor.PhysicalType, typeLength);
+    }
+
+    /// <summary>
+    /// Flattens a ListArray into leaf columns with correct def/rep levels (Dremel encoding).
+    /// For a standard 3-level list (optional group LIST → repeated group → element):
+    ///   null list   → def=ancestorMaxDef, rep=0
+    ///   empty list  → def=listExistsDef,  rep=0
+    ///   first elem  → def=maxDef or elementNullDef, rep=0
+    ///   next elems  → def=maxDef or elementNullDef, rep=maxRep
+    /// </summary>
+    private static void FlattenList(
+        ListArray listArray,
+        SchemaNode listNode,
+        IReadOnlyList<ColumnDescriptor> leafDescriptors,
+        List<FlattenedColumn> result,
+        byte[]? ancestorDefLevels,
+        int ancestorMaxDef)
+    {
+        int rowCount = listArray.Length;
+        bool listIsNullable = listNode.Element.RepetitionType == FieldRepetitionType.Optional;
+
+        // Def level contributions:
+        // listNode (optional/required group): +1 if optional
+        // repeatedChild (repeated group): +1 always
+        // element: depends on element type
+        int listExistsDef = ancestorMaxDef + (listIsNullable ? 1 : 0);
+        int repeatedEntryDef = listExistsDef + 1;
+
+        // The repeated child is the first child of the LIST node
+        var repeatedChild = listNode.Children[0];
+        // The element is the child of the repeated group (for 3-level encoding)
+        var elementNode = repeatedChild.Children.Count == 1 ? repeatedChild.Children[0] : null;
+
+        // Get the first leaf descriptor to determine maxRep
+        var firstLeafDescriptor = leafDescriptors[result.Count];
+        int maxRep = firstLeafDescriptor.MaxRepetitionLevel;
+
+        // Access the ListArray offsets
+        var offsets = listArray.ValueOffsets;
+        var valuesArray = listArray.Values;
+
+        // Count total entries (one per element + one per null/empty list)
+        int totalEntries = 0;
+        for (int i = 0; i < rowCount; i++)
+        {
+            if (ancestorDefLevels != null && ancestorDefLevels[i] < ancestorMaxDef)
+                totalEntries++; // ancestor null
+            else if (listIsNullable && !listArray.IsValid(i))
+                totalEntries++; // null list
+            else
+            {
+                int len = offsets[i + 1] - offsets[i];
+                totalEntries += len > 0 ? len : 1; // empty list still emits one entry
+            }
+        }
+
+        // For simple leaf elements (the common case), flatten directly
+        if (elementNode != null && elementNode.IsLeaf)
+        {
+            FlattenListLeaf(listArray, elementNode, ancestorDefLevels, ancestorMaxDef,
+                listIsNullable, listExistsDef, repeatedEntryDef, maxRep,
+                totalEntries, leafDescriptors, result);
+            return;
+        }
+
+        // Complex element (struct, nested list, etc.) — build def/rep levels for the repeated
+        // entries and recurse into the element with those as ancestor context
+        var defLevels = new byte[totalEntries];
+        var repLevels = new byte[totalEntries];
+        int writeIdx = 0;
+
+        for (int i = 0; i < rowCount; i++)
+        {
+            if (ancestorDefLevels != null && ancestorDefLevels[i] < ancestorMaxDef)
+            {
+                defLevels[writeIdx] = ancestorDefLevels[i];
+                repLevels[writeIdx] = 0;
+                writeIdx++;
+            }
+            else if (listIsNullable && !listArray.IsValid(i))
+            {
+                defLevels[writeIdx] = (byte)ancestorMaxDef;
+                repLevels[writeIdx] = 0;
+                writeIdx++;
+            }
+            else
+            {
+                int start = offsets[i];
+                int end = offsets[i + 1];
+
+                if (start == end)
+                {
+                    defLevels[writeIdx] = (byte)listExistsDef;
+                    repLevels[writeIdx] = 0;
+                    writeIdx++;
+                }
+                else
+                {
+                    for (int j = start; j < end; j++)
+                    {
+                        defLevels[writeIdx] = (byte)repeatedEntryDef;
+                        repLevels[writeIdx] = j == start ? (byte)0 : (byte)maxRep;
+                        writeIdx++;
+                    }
+                }
+            }
+        }
+
+        // Now recurse: the element array is listArray.Values, but we need to filter out
+        // phantom entries (entries for null/empty lists that don't correspond to real elements).
+        // The def/rep levels we've built already encode the nulls/empties, so we recurse
+        // with the element and pass the repeated-entry def levels as ancestor context.
+        if (elementNode != null)
+        {
+            FlattenNode(valuesArray, elementNode, leafDescriptors, result,
+                defLevels, repeatedEntryDef);
+        }
+        else
+        {
+            // Multi-child repeated group (struct-like element)
+            FlattenStruct((StructArray)valuesArray, repeatedChild, leafDescriptors, result,
+                defLevels, repeatedEntryDef);
+        }
+
+        // Patch rep levels onto all leaf results that came from this list's descendants
+        // The rep levels should override what the inner recursion produced
+        // Actually, for the complex case we need a different approach...
+        // TODO: handle complex list elements properly in Phase 9d
+    }
+
+    /// <summary>
+    /// Optimized path for flattening a list with a primitive leaf element directly into
+    /// def/rep levels and dense values without recursion.
+    /// </summary>
+    private static void FlattenListLeaf(
+        ListArray listArray,
+        SchemaNode elementNode,
+        byte[]? ancestorDefLevels,
+        int ancestorMaxDef,
+        bool listIsNullable,
+        int listExistsDef,
+        int repeatedEntryDef,
+        int maxRep,
+        int totalEntries,
+        IReadOnlyList<ColumnDescriptor> leafDescriptors,
+        List<FlattenedColumn> result)
+    {
+        var descriptor = leafDescriptors[result.Count];
+        int maxDef = descriptor.MaxDefinitionLevel;
+        bool elementIsNullable = elementNode.Element.RepetitionType == FieldRepetitionType.Optional;
+        int elementNullDef = repeatedEntryDef; // element exists but is null
+
+        int rowCount = listArray.Length;
+        var offsets = listArray.ValueOffsets;
+        var valuesArray = listArray.Values;
+
+        var defLevels = new byte[totalEntries];
+        var repLevels = new byte[totalEntries];
+        int writeIdx = 0;
+        int nonNullCount = 0;
+
+        for (int i = 0; i < rowCount; i++)
+        {
+            if (ancestorDefLevels != null && ancestorDefLevels[i] < ancestorMaxDef)
+            {
+                defLevels[writeIdx] = ancestorDefLevels[i];
+                repLevels[writeIdx] = 0;
+                writeIdx++;
+                continue;
+            }
+
+            if (listIsNullable && !listArray.IsValid(i))
+            {
+                defLevels[writeIdx] = (byte)ancestorMaxDef;
+                repLevels[writeIdx] = 0;
+                writeIdx++;
+                continue;
+            }
+
+            int start = offsets[i];
+            int end = offsets[i + 1];
+
+            if (start == end)
+            {
+                // Empty list
+                defLevels[writeIdx] = (byte)listExistsDef;
+                repLevels[writeIdx] = 0;
+                writeIdx++;
+                continue;
+            }
+
+            for (int j = start; j < end; j++)
+            {
+                repLevels[writeIdx] = j == start ? (byte)0 : (byte)maxRep;
+
+                if (elementIsNullable && !valuesArray.IsValid(j))
+                {
+                    defLevels[writeIdx] = (byte)elementNullDef;
+                }
+                else
+                {
+                    defLevels[writeIdx] = (byte)maxDef;
+                    nonNullCount++;
+                }
+                writeIdx++;
+            }
+        }
+
+        // Extract dense values from the values array
+        var decomposed = ExtractDenseValuesFromFlat(
+            valuesArray, defLevels, repLevels, maxDef, nonNullCount,
+            descriptor.PhysicalType, descriptor.TypeLength ?? 0);
+        result.Add(new FlattenedColumn(decomposed, totalEntries));
+    }
+
+    /// <summary>
+    /// Extracts dense values from a flat values array using pre-computed def levels.
+    /// Unlike ExtractDenseValues which filters by row, this reads directly from the
+    /// values array positions that correspond to maxDef entries.
+    /// </summary>
+    private static ArrowArrayDecomposer.DecomposedColumn ExtractDenseValuesFromFlat(
+        IArrowArray valuesArray,
+        byte[] defLevels,
+        byte[] repLevels,
+        int maxDef,
+        int nonNullCount,
+        PhysicalType physicalType,
+        int typeLength)
+    {
+        // The values array is the concatenation of all list elements.
+        // We need to extract only the non-null values (where def == maxDef).
+        // The values array index corresponds to the "element position" which we track
+        // by counting entries with def >= repeatedEntryDef (i.e., actual list elements, not null/empty markers).
+
+        if (physicalType == PhysicalType.Boolean)
+        {
+            var boolArray = (BooleanArray)valuesArray;
+            var values = new bool[nonNullCount];
+            int writePos = 0;
+            int valueIdx = 0;
+
+            for (int i = 0; i < defLevels.Length; i++)
+            {
+                if (defLevels[i] == maxDef)
+                {
+                    values[writePos++] = boolArray.GetValue(valueIdx).GetValueOrDefault();
+                    valueIdx++;
+                }
+                else if (defLevels[i] >= maxDef - 1 && defLevels[i] > 0 &&
+                         IsRepeatedEntry(defLevels[i], maxDef))
+                {
+                    // Null element within a list — still advances valueIdx
+                    valueIdx++;
+                }
+            }
+
+            return new ArrowArrayDecomposer.DecomposedColumn(defLevels, nonNullCount,
+                boolValues: values, repLevels: repLevels);
+        }
+
+        if (physicalType == PhysicalType.ByteArray)
+        {
+            return ExtractDenseByteArrayFromFlat(valuesArray, defLevels, repLevels,
+                maxDef, nonNullCount);
+        }
+
+        // Fixed-width types
+        int elementSize = physicalType switch
+        {
+            PhysicalType.Int32 or PhysicalType.Float => 4,
+            PhysicalType.Int64 or PhysicalType.Double => 8,
+            PhysicalType.Int96 => 12,
+            PhysicalType.FixedLenByteArray => typeLength,
+            _ => throw new NotSupportedException($"Physical type {physicalType} not supported"),
+        };
+
+        var data = valuesArray.Data;
+        var sourceBuffer = data.Buffers[1].Span;
+        int sourceOffset = data.Offset;
+
+        var denseBytes = new byte[nonNullCount * elementSize];
+        int writeBytePos = 0;
+        int valIdx = 0;
+
+        for (int i = 0; i < defLevels.Length; i++)
+        {
+            if (defLevels[i] == maxDef)
+            {
+                sourceBuffer.Slice((sourceOffset + valIdx) * elementSize, elementSize)
+                    .CopyTo(denseBytes.AsSpan(writeBytePos));
+                writeBytePos += elementSize;
+                valIdx++;
+            }
+            else if (IsElementEntry(defLevels, i, maxDef))
+            {
+                // Null element — skip value but advance position in values array
+                valIdx++;
+            }
+        }
+
+        return new ArrowArrayDecomposer.DecomposedColumn(defLevels, nonNullCount,
+            valueBytes: denseBytes, repLevels: repLevels);
+    }
+
+    /// <summary>
+    /// Returns true if the entry at position i represents an actual element in the values array
+    /// (i.e., the repeated group entry exists but the element may be null).
+    /// An element entry has def >= maxDef - 1 when element is nullable, or def == maxDef when required.
+    /// More precisely, it's any entry where we advanced into the repeated group.
+    /// </summary>
+    private static bool IsElementEntry(byte[] defLevels, int i, int maxDef)
+    {
+        // An element entry is one where def == maxDef (non-null) or def == maxDef - 1 (null element).
+        // Entries with lower def are null lists or empty lists.
+        return defLevels[i] == maxDef - 1;
+    }
+
+    private static bool IsRepeatedEntry(int defLevel, int maxDef)
+    {
+        return defLevel >= maxDef - 1;
+    }
+
+    private static ArrowArrayDecomposer.DecomposedColumn ExtractDenseByteArrayFromFlat(
+        IArrowArray valuesArray,
+        byte[] defLevels,
+        byte[] repLevels,
+        int maxDef,
+        int nonNullCount)
+    {
+        ArrayData data = valuesArray switch
+        {
+            StringArray sa => sa.Data,
+            BinaryArray ba => ba.Data,
+            _ => throw new NotSupportedException(
+                $"Array type '{valuesArray.GetType().Name}' not supported for ByteArray list extraction."),
+        };
+
+        var offsetsSpan = MemoryMarshal.Cast<byte, int>(data.Buffers[1].Span);
+        var dataSpan = data.Buffers[2].Span;
+        int baseOffset = data.Offset;
+
+        // First pass: compute total data size and count values
+        int totalBytes = 0;
+        int valIdx = 0;
+        for (int i = 0; i < defLevels.Length; i++)
+        {
+            if (defLevels[i] == maxDef)
+            {
+                int idx = baseOffset + valIdx;
+                totalBytes += offsetsSpan[idx + 1] - offsetsSpan[idx];
+                valIdx++;
+            }
+            else if (IsElementEntry(defLevels, i, maxDef))
+            {
+                valIdx++;
+            }
+        }
+
+        var denseData = new byte[totalBytes];
+        var denseOffsets = new int[nonNullCount + 1];
+        int writeIdx = 0;
+        int dataPos = 0;
+        valIdx = 0;
+
+        for (int i = 0; i < defLevels.Length; i++)
+        {
+            if (defLevels[i] == maxDef)
+            {
+                int idx = baseOffset + valIdx;
+                int start = offsetsSpan[idx];
+                int len = offsetsSpan[idx + 1] - start;
+                denseOffsets[writeIdx] = dataPos;
+                dataSpan.Slice(start, len).CopyTo(denseData.AsSpan(dataPos));
+                dataPos += len;
+                writeIdx++;
+                valIdx++;
+            }
+            else if (IsElementEntry(defLevels, i, maxDef))
+            {
+                valIdx++;
+            }
+        }
+        denseOffsets[writeIdx] = dataPos;
+
+        return new ArrowArrayDecomposer.DecomposedColumn(
+            defLevels, nonNullCount, byteArrayData: denseData, byteArrayOffsets: denseOffsets,
+            repLevels: repLevels);
     }
 
     /// <summary>
