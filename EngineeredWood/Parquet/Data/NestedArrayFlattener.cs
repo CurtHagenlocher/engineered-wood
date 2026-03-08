@@ -437,7 +437,7 @@ internal static class NestedArrayFlattener
             // Extract dense values from the leaf array
             var decomposed = ExtractDenseValuesFromFlatIndexed(
                 leafArray, defLevels, repLevels, maxDef, nonNullCount,
-                descriptor.PhysicalType, descriptor.TypeLength ?? 0);
+                descriptor.PhysicalType, descriptor.TypeLength ?? 0, repeatedEntryDef);
             result.Add(new FlattenedColumn(decomposed, totalEntries));
         }
     }
@@ -569,12 +569,11 @@ internal static class NestedArrayFlattener
         int maxDef,
         int nonNullCount,
         PhysicalType physicalType,
-        int typeLength)
+        int typeLength,
+        int repeatedEntryDef)
     {
-        // This delegates to ExtractDenseValuesFromFlat which already handles
-        // sequential value extraction from a flat array
         return ExtractDenseValuesFromFlat(valuesArray, defLevels, repLevels,
-            maxDef, nonNullCount, physicalType, typeLength);
+            maxDef, nonNullCount, physicalType, typeLength, repeatedEntryDef);
     }
 
     /// <summary>
@@ -658,7 +657,7 @@ internal static class NestedArrayFlattener
         // Extract dense values from the values array
         var decomposed = ExtractDenseValuesFromFlat(
             valuesArray, defLevels, repLevels, maxDef, nonNullCount,
-            descriptor.PhysicalType, descriptor.TypeLength ?? 0);
+            descriptor.PhysicalType, descriptor.TypeLength ?? 0, repeatedEntryDef);
         result.Add(new FlattenedColumn(decomposed, totalEntries));
     }
 
@@ -830,7 +829,7 @@ internal static class NestedArrayFlattener
 
         var decomposed = ExtractDenseValuesFromFlat(
             leafArray, defLevels, repLevelsCopy, maxDef, nonNullCount,
-            descriptor.PhysicalType, descriptor.TypeLength ?? 0);
+            descriptor.PhysicalType, descriptor.TypeLength ?? 0, repeatedEntryDef);
         result.Add(new FlattenedColumn(decomposed, totalEntries));
     }
 
@@ -846,7 +845,8 @@ internal static class NestedArrayFlattener
         int maxDef,
         int nonNullCount,
         PhysicalType physicalType,
-        int typeLength)
+        int typeLength,
+        int repeatedEntryDef)
     {
         // The values array is the concatenation of all list elements.
         // We need to extract only the non-null values (where def == maxDef).
@@ -867,10 +867,9 @@ internal static class NestedArrayFlattener
                     values[writePos++] = boolArray.GetValue(valueIdx).GetValueOrDefault();
                     valueIdx++;
                 }
-                else if (defLevels[i] >= maxDef - 1 && defLevels[i] > 0 &&
-                         IsRepeatedEntry(defLevels[i], maxDef))
+                else if (defLevels[i] >= repeatedEntryDef)
                 {
-                    // Null element within a list — still advances valueIdx
+                    // Null element or intermediate null — still advances valueIdx
                     valueIdx++;
                 }
             }
@@ -882,7 +881,7 @@ internal static class NestedArrayFlattener
         if (physicalType == PhysicalType.ByteArray)
         {
             return ExtractDenseByteArrayFromFlat(valuesArray, defLevels, repLevels,
-                maxDef, nonNullCount);
+                maxDef, nonNullCount, repeatedEntryDef);
         }
 
         // Fixed-width types
@@ -912,7 +911,7 @@ internal static class NestedArrayFlattener
                 writeBytePos += elementSize;
                 valIdx++;
             }
-            else if (IsElementEntry(defLevels, i, maxDef))
+            else if (defLevels[i] >= repeatedEntryDef)
             {
                 // Null element — skip value but advance position in values array
                 valIdx++;
@@ -923,30 +922,13 @@ internal static class NestedArrayFlattener
             valueBytes: denseBytes, repLevels: repLevels);
     }
 
-    /// <summary>
-    /// Returns true if the entry at position i represents an actual element in the values array
-    /// (i.e., the repeated group entry exists but the element may be null).
-    /// An element entry has def >= maxDef - 1 when element is nullable, or def == maxDef when required.
-    /// More precisely, it's any entry where we advanced into the repeated group.
-    /// </summary>
-    private static bool IsElementEntry(byte[] defLevels, int i, int maxDef)
-    {
-        // An element entry is one where def == maxDef (non-null) or def == maxDef - 1 (null element).
-        // Entries with lower def are null lists or empty lists.
-        return defLevels[i] == maxDef - 1;
-    }
-
-    private static bool IsRepeatedEntry(int defLevel, int maxDef)
-    {
-        return defLevel >= maxDef - 1;
-    }
-
     private static ArrowArrayDecomposer.DecomposedColumn ExtractDenseByteArrayFromFlat(
         IArrowArray valuesArray,
         byte[] defLevels,
         byte[] repLevels,
         int maxDef,
-        int nonNullCount)
+        int nonNullCount,
+        int repeatedEntryDef)
     {
         ArrayData data = valuesArray switch
         {
@@ -971,7 +953,7 @@ internal static class NestedArrayFlattener
                 totalBytes += offsetsSpan[idx + 1] - offsetsSpan[idx];
                 valIdx++;
             }
-            else if (IsElementEntry(defLevels, i, maxDef))
+            else if (defLevels[i] >= repeatedEntryDef)
             {
                 valIdx++;
             }
@@ -996,7 +978,7 @@ internal static class NestedArrayFlattener
                 writeIdx++;
                 valIdx++;
             }
-            else if (IsElementEntry(defLevels, i, maxDef))
+            else if (defLevels[i] >= repeatedEntryDef)
             {
                 valIdx++;
             }

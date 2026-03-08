@@ -1131,4 +1131,188 @@ public class CrossReaderValidationTests : IDisposable
             Assert.Equal(expectedValRep[i], valRepLevels[i]);
         }
     }
+
+    // ----------------------------------------------------------------
+    //  ParquetSharp cross-reader: nested combination tests
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task PS_StructContainingList_V2()
+    {
+        // Schema: record (optional struct) → name (optional string), scores (optional list<optional int32>)
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: true));
+        var structType = new StructType(new[]
+        {
+            new Field("name", Apache.Arrow.Types.StringType.Default, nullable: true),
+            new Field("scores", listType, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("record", structType, nullable: true))
+            .Build();
+
+        // Row 0: struct present, name="alice", scores=[10, null]
+        // Row 1: struct null
+        // Row 2: struct present, name=null, scores=[30]
+        int count = 3;
+
+        var nameBuilder = new StringArray.Builder();
+        nameBuilder.Append("alice"); nameBuilder.AppendNull(); nameBuilder.AppendNull();
+
+        var scoresValBuilder = new Int32Array.Builder();
+        scoresValBuilder.Append(10); scoresValBuilder.AppendNull(); // row 0 scores
+        scoresValBuilder.Append(30); // row 2 scores
+
+        var scoresOffsetsBuilder = new ArrowBuffer.Builder<int>();
+        scoresOffsetsBuilder.Append(0); scoresOffsetsBuilder.Append(2);
+        scoresOffsetsBuilder.Append(2); scoresOffsetsBuilder.Append(3);
+
+        var scoresNullBitmap = new byte[1];
+        BitUtility.SetBit(scoresNullBitmap, 0, true);
+        BitUtility.SetBit(scoresNullBitmap, 1, false);
+        BitUtility.SetBit(scoresNullBitmap, 2, true);
+
+        var scoresArray = new ListArray(listType, count,
+            scoresOffsetsBuilder.Build(), scoresValBuilder.Build(),
+            new ArrowBuffer(scoresNullBitmap), nullCount: 1);
+
+        var structNullBitmap = new byte[1];
+        BitUtility.SetBit(structNullBitmap, 0, true);
+        BitUtility.SetBit(structNullBitmap, 1, false);
+        BitUtility.SetBit(structNullBitmap, 2, true);
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { nameBuilder.Build(), scoresArray },
+            new ArrowBuffer(structNullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var path = await WriteWithEW(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+        }, name: "ps_struct_list.parquet");
+
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = psReader.RowGroup(0);
+        Assert.Equal(count, (int)rg.MetaData.NumRows);
+
+        // Column 0: record.name (optional string in optional struct → maxDef=2)
+        // Row 0: def=2 (both present), Row 1: def=0 (struct null), Row 2: def=1 (name null)
+        using var nameCol = rg.Column(0);
+        using var nameReader = (ParquetSharp.ColumnReader<ParquetSharp.ByteArray>)nameCol;
+        var nameDefLevels = new short[count];
+        var nameRepLevels = new short[count];
+        var nameValues = new ParquetSharp.ByteArray[count];
+        nameReader.ReadBatch(count, nameDefLevels, nameRepLevels, nameValues, out _);
+
+        Assert.Equal(2, nameDefLevels[0]); // name present
+        Assert.Equal(0, nameDefLevels[1]); // struct null
+        Assert.Equal(1, nameDefLevels[2]); // struct present, name null
+
+        // Column 1: record.scores.list.element (opt struct → opt list → repeated → opt elem → maxDef=4, maxRep=1)
+        // Row 0: [10, null] → entries: def=4/rep=0, def=3/rep=1
+        // Row 1: struct null → def=0/rep=0
+        // Row 2: [30] → def=4/rep=0
+        // Total entries: 4
+        int totalEntries = 4;
+        using var scoresCol = rg.Column(1);
+        using var scoresReader = (ParquetSharp.ColumnReader<int>)scoresCol;
+        var scoresDefLevels = new short[totalEntries];
+        var scoresRepLevels = new short[totalEntries];
+        var scoresValues = new int[totalEntries];
+        scoresReader.ReadBatch(totalEntries, scoresDefLevels, scoresRepLevels, scoresValues, out _);
+
+        // Verify def/rep pattern
+        short[] expectedScoresDef = [4, 3, 0, 4];
+        short[] expectedScoresRep = [0, 1, 0, 0];
+        for (int i = 0; i < totalEntries; i++)
+        {
+            Assert.Equal(expectedScoresDef[i], scoresDefLevels[i]);
+            Assert.Equal(expectedScoresRep[i], scoresRepLevels[i]);
+        }
+    }
+
+    [Fact]
+    public async Task PS_ListOfStruct_V2()
+    {
+        // Schema: items (optional list<struct{x: optional int32, y: optional string}>)
+        var structType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: true),
+            new Field("y", Apache.Arrow.Types.StringType.Default, nullable: true),
+        });
+        var listType = new ListType(new Field("element", structType, nullable: false));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("items", listType, nullable: true))
+            .Build();
+
+        // Row 0: [{x:1, y:"a"}, {x:null, y:"b"}]
+        // Row 1: null
+        // Row 2: [{x:3, y:null}]
+        int count = 3;
+
+        var xBuilder = new Int32Array.Builder();
+        xBuilder.Append(1); xBuilder.AppendNull(); xBuilder.Append(3);
+        var yBuilder = new StringArray.Builder();
+        yBuilder.Append("a"); yBuilder.Append("b"); yBuilder.AppendNull();
+
+        var structValues = new StructArray(structType, 3,
+            new IArrowArray[] { xBuilder.Build(), yBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(2); offsetsBuilder.Append(3);
+
+        var listNullBitmap = new byte[1];
+        BitUtility.SetBit(listNullBitmap, 0, true);
+        BitUtility.SetBit(listNullBitmap, 1, false);
+        BitUtility.SetBit(listNullBitmap, 2, true);
+
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), structValues,
+            new ArrowBuffer(listNullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var path = await WriteWithEW(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+        }, name: "ps_list_struct.parquet");
+
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = psReader.RowGroup(0);
+        Assert.Equal(count, (int)rg.MetaData.NumRows);
+
+        // Column 0: items.list.element.x (opt list → repeated → req struct → opt int32 → maxDef=3, maxRep=1)
+        // Row 0: x=1/rep=0, x=null/rep=1; Row 1: null/rep=0; Row 2: x=3/rep=0
+        // Total entries = 4
+        int totalEntries = 4;
+        using var xCol = rg.Column(0);
+        using var xReader = (ParquetSharp.ColumnReader<int>)xCol;
+        var xDefLevels = new short[totalEntries];
+        var xRepLevels = new short[totalEntries];
+        var xValues = new int[totalEntries];
+        xReader.ReadBatch(totalEntries, xDefLevels, xRepLevels, xValues, out _);
+
+        short[] expectedXDef = [3, 2, 0, 3];  // 3=x present, 2=x null(struct exists), 0=list null
+        short[] expectedXRep = [0, 1, 0, 0];
+        for (int i = 0; i < totalEntries; i++)
+        {
+            Assert.Equal(expectedXDef[i], xDefLevels[i]);
+            Assert.Equal(expectedXRep[i], xRepLevels[i]);
+        }
+
+        // Column 1: items.list.element.y (same structure → maxDef=3, maxRep=1)
+        using var yCol = rg.Column(1);
+        using var yReader = (ParquetSharp.ColumnReader<ParquetSharp.ByteArray>)yCol;
+        var yDefLevels = new short[totalEntries];
+        var yRepLevels = new short[totalEntries];
+        var yValues = new ParquetSharp.ByteArray[totalEntries];
+        yReader.ReadBatch(totalEntries, yDefLevels, yRepLevels, yValues, out _);
+
+        short[] expectedYDef = [3, 3, 0, 2];  // 3=y present, 0=list null, 2=y null
+        short[] expectedYRep = [0, 1, 0, 0];
+        for (int i = 0; i < totalEntries; i++)
+        {
+            Assert.Equal(expectedYDef[i], yDefLevels[i]);
+            Assert.Equal(expectedYRep[i], yRepLevels[i]);
+        }
+    }
 }

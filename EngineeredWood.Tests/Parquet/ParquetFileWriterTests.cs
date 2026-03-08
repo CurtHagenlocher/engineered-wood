@@ -1682,6 +1682,353 @@ public class ParquetFileWriterTests : IDisposable
         Assert.Equal(1, len2);
     }
 
+    // --- Nested Types: Compression, Larger Datasets, More Types ---
+
+    [Theory]
+    [InlineData(CompressionCodec.Snappy, DataPageVersion.V2)]
+    [InlineData(CompressionCodec.Zstd, DataPageVersion.V2)]
+    [InlineData(CompressionCodec.Snappy, DataPageVersion.V1)]
+    public async Task Nested_Struct_WithCompression_RoundTrips(CompressionCodec codec, DataPageVersion pageVersion)
+    {
+        var structType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: true),
+            new Field("y", Apache.Arrow.Types.StringType.Default, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", structType, nullable: true))
+            .Build();
+
+        int count = 200;
+        var xBuilder = new Int32Array.Builder();
+        var yBuilder = new StringArray.Builder();
+        var nullBitmap = new byte[(count + 7) / 8];
+        var rng = new Random(42);
+
+        for (int i = 0; i < count; i++)
+        {
+            bool structValid = rng.NextDouble() > 0.15;
+            BitUtility.SetBit(nullBitmap, i, structValid);
+            if (rng.NextDouble() > 0.1) xBuilder.Append(i * 10); else xBuilder.AppendNull();
+            if (rng.NextDouble() > 0.1) yBuilder.Append($"val_{i}"); else yBuilder.AppendNull();
+        }
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { xBuilder.Build(), yBuilder.Build() },
+            new ArrowBuffer(nullBitmap),
+            Enumerable.Range(0, count).Count(i => !BitUtility.GetBit(nullBitmap, i)));
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var result = await WriteAndRead(batch, new ParquetWriteOptions
+        {
+            Codec = codec,
+            DataPageVersion = pageVersion,
+        });
+
+        Assert.Equal(count, result.Length);
+        var rs = (StructArray)result.Column(0);
+        var rx = (Int32Array)rs.Fields[0];
+        var ry = (StringArray)rs.Fields[1];
+
+        for (int i = 0; i < count; i++)
+        {
+            Assert.Equal(BitUtility.GetBit(nullBitmap, i), !rs.IsNull(i));
+        }
+    }
+
+    [Theory]
+    [InlineData(CompressionCodec.Snappy, DataPageVersion.V2)]
+    [InlineData(CompressionCodec.Zstd, DataPageVersion.V1)]
+    public async Task Nested_List_WithCompression_RoundTrips(CompressionCodec codec, DataPageVersion pageVersion)
+    {
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("values", listType, nullable: true))
+            .Build();
+
+        int count = 100;
+        var rng = new Random(99);
+        var allValues = new List<int?>();
+        var offsets = new List<int> { 0 };
+        var listValid = new byte[(count + 7) / 8];
+
+        for (int i = 0; i < count; i++)
+        {
+            if (rng.NextDouble() < 0.1)
+            {
+                // null list
+                offsets.Add(allValues.Count);
+            }
+            else
+            {
+                BitUtility.SetBit(listValid, i, true);
+                int len = rng.Next(0, 6);
+                for (int j = 0; j < len; j++)
+                {
+                    if (rng.NextDouble() < 0.1) allValues.Add(null);
+                    else allValues.Add(rng.Next(0, 1000));
+                }
+                offsets.Add(allValues.Count);
+            }
+        }
+
+        var valBuilder = new Int32Array.Builder();
+        foreach (var v in allValues)
+        {
+            if (v.HasValue) valBuilder.Append(v.Value); else valBuilder.AppendNull();
+        }
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        foreach (var o in offsets) offsetsBuilder.Append(o);
+
+        int nullCount = Enumerable.Range(0, count).Count(i => !BitUtility.GetBit(listValid, i));
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), valBuilder.Build(),
+            new ArrowBuffer(listValid), nullCount: nullCount);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var result = await WriteAndRead(batch, new ParquetWriteOptions
+        {
+            Codec = codec,
+            DataPageVersion = pageVersion,
+        });
+
+        Assert.Equal(count, result.Length);
+        var rl = (ListArray)result.Column(0);
+        for (int i = 0; i < count; i++)
+        {
+            Assert.Equal(BitUtility.GetBit(listValid, i), !rl.IsNull(i));
+        }
+    }
+
+    [Theory]
+    [InlineData(CompressionCodec.Snappy)]
+    [InlineData(CompressionCodec.Zstd)]
+    public async Task Nested_Map_WithCompression_RoundTrips(CompressionCodec codec)
+    {
+        var keyField = new Field("key", Apache.Arrow.Types.StringType.Default, nullable: false);
+        var valueField = new Field("value", Int32Type.Default, nullable: true);
+        var mapType = new MapType(keyField, valueField);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("data", mapType, nullable: true))
+            .Build();
+
+        // Row 0: {"a": 1}, Row 1: null, Row 2: {"b": 2, "c": null}
+        var keyBuilder = new StringArray.Builder();
+        keyBuilder.Append("a"); keyBuilder.Append("b"); keyBuilder.Append("c");
+        var valBuilder = new Int32Array.Builder();
+        valBuilder.Append(1); valBuilder.Append(2); valBuilder.AppendNull();
+
+        var kvStruct = new StructArray(
+            new StructType(new[] { keyField, valueField }), 3,
+            new IArrowArray[] { keyBuilder.Build(), valBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(1); offsetsBuilder.Append(1); offsetsBuilder.Append(3);
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+
+        var mapArray = new MapArray(mapType, 3,
+            offsetsBuilder.Build(), kvStruct,
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { mapArray }, 3);
+        var result = await WriteAndRead(batch, new ParquetWriteOptions { Codec = codec });
+
+        var rm = (MapArray)result.Column(0);
+        Assert.False(rm.IsNull(0));
+        Assert.True(rm.IsNull(1));
+        Assert.False(rm.IsNull(2));
+        Assert.Equal("a", ((StringArray)rm.Keys).GetString(rm.ValueOffsets[0]));
+    }
+
+    [Fact]
+    public async Task Nested_LargerDataset_StructAndList_RoundTrips()
+    {
+        // 500 rows: id (int32), info (optional struct{name: string, score: double}), tags (optional list<string>)
+        var structType = new StructType(new[]
+        {
+            new Field("name", Apache.Arrow.Types.StringType.Default, nullable: true),
+            new Field("score", DoubleType.Default, nullable: true),
+        });
+        var listType = new ListType(new Field("element", Apache.Arrow.Types.StringType.Default, nullable: false));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, nullable: false))
+            .Field(new Field("info", structType, nullable: true))
+            .Field(new Field("tags", listType, nullable: true))
+            .Build();
+
+        int count = 500;
+        var rng = new Random(123);
+        var idBuilder = new Int32Array.Builder();
+        var nameBuilder = new StringArray.Builder();
+        var scoreBuilder = new DoubleArray.Builder();
+        var structNullBitmap = new byte[(count + 7) / 8];
+
+        var tagValues = new List<string>();
+        var tagOffsets = new List<int> { 0 };
+        var tagNullBitmap = new byte[(count + 7) / 8];
+
+        bool[] structValid = new bool[count];
+        string?[] expectedNames = new string?[count];
+        double?[] expectedScores = new double?[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            idBuilder.Append(i);
+
+            structValid[i] = rng.NextDouble() > 0.15;
+            BitUtility.SetBit(structNullBitmap, i, structValid[i]);
+
+            if (rng.NextDouble() > 0.1)
+            {
+                string n = $"user_{i}";
+                nameBuilder.Append(n);
+                expectedNames[i] = n;
+            }
+            else { nameBuilder.AppendNull(); expectedNames[i] = null; }
+
+            if (rng.NextDouble() > 0.1)
+            {
+                double s = Math.Round(rng.NextDouble() * 100, 2);
+                scoreBuilder.Append(s);
+                expectedScores[i] = s;
+            }
+            else { scoreBuilder.AppendNull(); expectedScores[i] = null; }
+
+            if (rng.NextDouble() > 0.12)
+            {
+                BitUtility.SetBit(tagNullBitmap, i, true);
+                int tagCount = rng.Next(0, 4);
+                for (int j = 0; j < tagCount; j++)
+                    tagValues.Add($"tag_{i}_{j}");
+            }
+            tagOffsets.Add(tagValues.Count);
+        }
+
+        var tagValBuilder = new StringArray.Builder();
+        foreach (var t in tagValues) tagValBuilder.Append(t);
+        var tagOffsetsBuilder = new ArrowBuffer.Builder<int>();
+        foreach (var o in tagOffsets) tagOffsetsBuilder.Append(o);
+        int tagNullCount = Enumerable.Range(0, count).Count(i => !BitUtility.GetBit(tagNullBitmap, i));
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { nameBuilder.Build(), scoreBuilder.Build() },
+            new ArrowBuffer(structNullBitmap),
+            count - structValid.Count(v => v));
+
+        var tagArray = new ListArray(listType, count,
+            tagOffsetsBuilder.Build(), tagValBuilder.Build(),
+            new ArrowBuffer(tagNullBitmap), tagNullCount);
+
+        var batch = new RecordBatch(schema,
+            new IArrowArray[] { idBuilder.Build(), structArray, tagArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultId = (Int32Array)result.Column(0);
+        var resultStruct = (StructArray)result.Column(1);
+        var resultTags = (ListArray)result.Column(2);
+        var resultName = (StringArray)resultStruct.Fields[0];
+        var resultScore = (DoubleArray)resultStruct.Fields[1];
+
+        for (int i = 0; i < count; i++)
+        {
+            Assert.Equal(i, resultId.GetValue(i));
+            Assert.Equal(structValid[i], !resultStruct.IsNull(i));
+
+            if (structValid[i])
+            {
+                if (expectedNames[i] == null) Assert.True(resultName.IsNull(i));
+                else Assert.Equal(expectedNames[i], resultName.GetString(i));
+                if (expectedScores[i] == null) Assert.True(resultScore.IsNull(i));
+                else Assert.Equal(expectedScores[i], resultScore.GetValue(i));
+            }
+
+            Assert.Equal(BitUtility.GetBit(tagNullBitmap, i), !resultTags.IsNull(i));
+        }
+    }
+
+    [Fact]
+    public async Task Nested_Struct_WithBoolDoubleTimestamp_RoundTrips()
+    {
+        var structType = new StructType(new[]
+        {
+            new Field("flag", BooleanType.Default, nullable: true),
+            new Field("amount", DoubleType.Default, nullable: true),
+            new Field("ts", TimestampType.Default, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("rec", structType, nullable: true))
+            .Build();
+
+        int count = 20;
+        var flagBuilder = new BooleanArray.Builder();
+        var amountBuilder = new DoubleArray.Builder();
+        var tsBuilder = new TimestampArray.Builder(TimestampType.Default);
+        var nullBitmap = new byte[(count + 7) / 8];
+        var rng = new Random(77);
+
+        bool?[] expectedFlags = new bool?[count];
+        double?[] expectedAmounts = new double?[count];
+        bool[] structValid = new bool[count];
+
+        for (int i = 0; i < count; i++)
+        {
+            structValid[i] = rng.NextDouble() > 0.2;
+            BitUtility.SetBit(nullBitmap, i, structValid[i]);
+
+            if (rng.NextDouble() > 0.15)
+            {
+                bool v = rng.NextDouble() > 0.5;
+                flagBuilder.Append(v);
+                expectedFlags[i] = v;
+            }
+            else { flagBuilder.AppendNull(); expectedFlags[i] = null; }
+
+            if (rng.NextDouble() > 0.15)
+            {
+                double v = Math.Round(rng.NextDouble() * 1000, 2);
+                amountBuilder.Append(v);
+                expectedAmounts[i] = v;
+            }
+            else { amountBuilder.AppendNull(); expectedAmounts[i] = null; }
+
+            if (rng.NextDouble() > 0.15)
+                tsBuilder.Append(new DateTimeOffset(2025, 1, 1, 0, 0, 0, TimeSpan.Zero).AddHours(i));
+            else
+                tsBuilder.AppendNull();
+        }
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { flagBuilder.Build(), amountBuilder.Build(), tsBuilder.Build() },
+            new ArrowBuffer(nullBitmap),
+            count - structValid.Count(v => v));
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var rs = (StructArray)result.Column(0);
+        var rf = (BooleanArray)rs.Fields[0];
+        var ra = (DoubleArray)rs.Fields[1];
+        var rt = (TimestampArray)rs.Fields[2];
+
+        for (int i = 0; i < count; i++)
+        {
+            Assert.Equal(structValid[i], !rs.IsNull(i));
+            if (structValid[i])
+            {
+                if (expectedFlags[i] == null) Assert.True(rf.IsNull(i));
+                else Assert.Equal(expectedFlags[i], rf.GetValue(i));
+                if (expectedAmounts[i] == null) Assert.True(ra.IsNull(i));
+                else Assert.Equal(expectedAmounts[i], ra.GetValue(i));
+            }
+        }
+    }
+
     // --- Explicit V1 Tests (ensure V1 still works when selected) ---
 
     [Fact]
