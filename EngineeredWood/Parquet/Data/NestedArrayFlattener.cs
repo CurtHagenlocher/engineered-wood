@@ -338,28 +338,76 @@ internal static class NestedArrayFlattener
             return;
         }
 
-        // Complex element (struct, nested list, etc.) — build def/rep levels for the repeated
-        // entries and recurse into the element with those as ancestor context
-        var defLevels = new byte[totalEntries];
-        var repLevels = new byte[totalEntries];
-        int writeIdx = 0;
+        // Complex element (struct, nested list, etc.):
+        // For each leaf column in the element, build full def/rep levels that combine
+        // list-level entries (null/empty markers) with element-level nullability.
+        // The values array only contains actual elements, not phantom entries.
+        FlattenListComplexElement(
+            listArray, elementNode ?? repeatedChild, listIsNullable,
+            ancestorDefLevels, ancestorMaxDef, listExistsDef, repeatedEntryDef, maxRep,
+            totalEntries, leafDescriptors, result);
+    }
 
-        for (int i = 0; i < rowCount; i++)
+    /// <summary>
+    /// Flattens a list with a complex (non-leaf) element by iterating leaf descendants
+    /// and merging list-level def/rep levels with element-level nullability.
+    /// </summary>
+    private static void FlattenListComplexElement(
+        ListArray listArray,
+        SchemaNode elementNode,
+        bool listIsNullable,
+        byte[]? ancestorDefLevels,
+        int ancestorMaxDef,
+        int listExistsDef,
+        int repeatedEntryDef,
+        int maxRep,
+        int totalEntries,
+        IReadOnlyList<ColumnDescriptor> leafDescriptors,
+        List<FlattenedColumn> result)
+    {
+        int rowCount = listArray.Length;
+        var offsets = listArray.ValueOffsets;
+        var valuesArray = listArray.Values;
+
+        // Count leaf columns in the element subtree to know how many we need to produce
+        int leafCount = CountSchemaLeaves(elementNode);
+
+        for (int leafIdx = 0; leafIdx < leafCount; leafIdx++)
         {
-            if (ancestorDefLevels != null && ancestorDefLevels[i] < ancestorMaxDef)
+            var descriptor = leafDescriptors[result.Count];
+            int maxDef = descriptor.MaxDefinitionLevel;
+
+            // Get the leaf's path info to determine element-level nullability
+            var defLevels = new byte[totalEntries];
+            var repLevels = new byte[totalEntries];
+            int nonNullCount = 0;
+            int writeIdx = 0;
+
+            // We need to access the leaf values from the element array.
+            // Use GetLeafArray to extract the leaf array and its def level contributions.
+            var (leafArray, leafDefContributions) = GetLeafArrayAndDefInfo(
+                valuesArray, elementNode, leafIdx);
+
+            int valIdx = 0; // index into the values array (actual elements only)
+
+            for (int i = 0; i < rowCount; i++)
             {
-                defLevels[writeIdx] = ancestorDefLevels[i];
-                repLevels[writeIdx] = 0;
-                writeIdx++;
-            }
-            else if (listIsNullable && !listArray.IsValid(i))
-            {
-                defLevels[writeIdx] = (byte)ancestorMaxDef;
-                repLevels[writeIdx] = 0;
-                writeIdx++;
-            }
-            else
-            {
+                if (ancestorDefLevels != null && ancestorDefLevels[i] < ancestorMaxDef)
+                {
+                    defLevels[writeIdx] = ancestorDefLevels[i];
+                    repLevels[writeIdx] = 0;
+                    writeIdx++;
+                    continue;
+                }
+
+                if (listIsNullable && !listArray.IsValid(i))
+                {
+                    defLevels[writeIdx] = (byte)ancestorMaxDef;
+                    repLevels[writeIdx] = 0;
+                    writeIdx++;
+                    continue;
+                }
+
                 int start = offsets[i];
                 int end = offsets[i + 1];
 
@@ -368,39 +416,165 @@ internal static class NestedArrayFlattener
                     defLevels[writeIdx] = (byte)listExistsDef;
                     repLevels[writeIdx] = 0;
                     writeIdx++;
+                    continue;
                 }
-                else
+
+                for (int j = start; j < end; j++)
                 {
-                    for (int j = start; j < end; j++)
-                    {
-                        defLevels[writeIdx] = (byte)repeatedEntryDef;
-                        repLevels[writeIdx] = j == start ? (byte)0 : (byte)maxRep;
-                        writeIdx++;
-                    }
+                    repLevels[writeIdx] = j == start ? (byte)0 : (byte)maxRep;
+
+                    // Compute element-level def for this entry
+                    int elementDef = ComputeElementDef(leafDefContributions, leafArray, valIdx, repeatedEntryDef, maxDef);
+                    defLevels[writeIdx] = (byte)elementDef;
+                    if (elementDef == maxDef)
+                        nonNullCount++;
+
+                    valIdx++;
+                    writeIdx++;
+                }
+            }
+
+            // Extract dense values from the leaf array
+            var decomposed = ExtractDenseValuesFromFlatIndexed(
+                leafArray, defLevels, repLevels, maxDef, nonNullCount,
+                descriptor.PhysicalType, descriptor.TypeLength ?? 0);
+            result.Add(new FlattenedColumn(decomposed, totalEntries));
+        }
+    }
+
+    /// <summary>
+    /// Counts the number of leaf columns in a schema node subtree.
+    /// </summary>
+    private static int CountSchemaLeaves(SchemaNode node)
+    {
+        if (node.IsLeaf) return 1;
+        int count = 0;
+        foreach (var child in node.Children)
+            count += CountSchemaLeaves(child);
+        return count;
+    }
+
+    /// <summary>
+    /// Navigates to the nth leaf array within a complex element array and returns
+    /// the leaf array plus intermediate nullability information.
+    /// </summary>
+    private static (IArrowArray leafArray, LeafDefInfo defInfo) GetLeafArrayAndDefInfo(
+        IArrowArray elementArray,
+        SchemaNode elementNode,
+        int targetLeafIndex)
+    {
+        int currentLeafIndex = 0;
+        return GetLeafArrayRecursive(elementArray, elementNode, targetLeafIndex, ref currentLeafIndex);
+    }
+
+    private static (IArrowArray, LeafDefInfo) GetLeafArrayRecursive(
+        IArrowArray array,
+        SchemaNode node,
+        int targetLeafIndex,
+        ref int currentLeafIndex)
+    {
+        if (node.IsLeaf)
+        {
+            if (currentLeafIndex == targetLeafIndex)
+            {
+                bool isNullable = node.Element.RepetitionType == FieldRepetitionType.Optional;
+                return (array, new LeafDefInfo([], isNullable));
+            }
+            currentLeafIndex++;
+            return (null!, default);
+        }
+
+        if (array is StructArray structArray)
+        {
+            bool structIsNullable = node.Element.RepetitionType == FieldRepetitionType.Optional;
+
+            for (int i = 0; i < node.Children.Count; i++)
+            {
+                var childNode = node.Children[i];
+                var childArray = structArray.Fields[i];
+
+                var (leafArr, info) = GetLeafArrayRecursive(childArray, childNode, targetLeafIndex, ref currentLeafIndex);
+                if (leafArr != null)
+                {
+                    // Prepend struct nullability
+                    var ancestors = new List<(IArrowArray array, bool nullable)>();
+                    if (structIsNullable)
+                        ancestors.Add((structArray, true));
+                    ancestors.AddRange(info.Ancestors);
+                    return (leafArr, new LeafDefInfo(ancestors, info.LeafIsNullable));
                 }
             }
         }
 
-        // Now recurse: the element array is listArray.Values, but we need to filter out
-        // phantom entries (entries for null/empty lists that don't correspond to real elements).
-        // The def/rep levels we've built already encode the nulls/empties, so we recurse
-        // with the element and pass the repeated-entry def levels as ancestor context.
-        if (elementNode != null)
+        return (null!, default);
+    }
+
+    private readonly struct LeafDefInfo
+    {
+        /// <summary>Ancestor nullable arrays on the path from the element to the leaf.</summary>
+        public readonly IReadOnlyList<(IArrowArray array, bool nullable)> Ancestors;
+        public readonly bool LeafIsNullable;
+
+        public LeafDefInfo(IReadOnlyList<(IArrowArray, bool)> ancestors, bool leafIsNullable)
         {
-            FlattenNode(valuesArray, elementNode, leafDescriptors, result,
-                defLevels, repeatedEntryDef);
+            Ancestors = ancestors;
+            LeafIsNullable = leafIsNullable;
         }
-        else
+    }
+
+    /// <summary>
+    /// Computes the element-level definition level for a specific value index
+    /// within a complex list element, accounting for struct and child nullability.
+    /// </summary>
+    private static int ComputeElementDef(
+        LeafDefInfo defInfo,
+        IArrowArray leafArray,
+        int elementIndex,
+        int baseDef,
+        int maxDef)
+    {
+        int def = baseDef;
+
+        // Check each ancestor nullable node
+        foreach (var (ancestorArray, isNullable) in defInfo.Ancestors)
         {
-            // Multi-child repeated group (struct-like element)
-            FlattenStruct((StructArray)valuesArray, repeatedChild, leafDescriptors, result,
-                defLevels, repeatedEntryDef);
+            if (isNullable)
+            {
+                if (!ancestorArray.IsValid(elementIndex))
+                    return def; // ancestor null, stop here
+                def++;
+            }
         }
 
-        // Patch rep levels onto all leaf results that came from this list's descendants
-        // The rep levels should override what the inner recursion produced
-        // Actually, for the complex case we need a different approach...
-        // TODO: handle complex list elements properly in Phase 9d
+        // Check leaf nullability
+        if (defInfo.LeafIsNullable)
+        {
+            if (!leafArray.IsValid(elementIndex))
+                return def; // leaf null
+            def++;
+        }
+
+        return maxDef;
+    }
+
+    /// <summary>
+    /// Extracts dense values from a leaf array, using element indices derived from
+    /// the def level array. Values are read sequentially from the leaf array for
+    /// entries where def == maxDef.
+    /// </summary>
+    private static ArrowArrayDecomposer.DecomposedColumn ExtractDenseValuesFromFlatIndexed(
+        IArrowArray valuesArray,
+        byte[] defLevels,
+        byte[] repLevels,
+        int maxDef,
+        int nonNullCount,
+        PhysicalType physicalType,
+        int typeLength)
+    {
+        // This delegates to ExtractDenseValuesFromFlat which already handles
+        // sequential value extraction from a flat array
+        return ExtractDenseValuesFromFlat(valuesArray, defLevels, repLevels,
+            maxDef, nonNullCount, physicalType, typeLength);
     }
 
     /// <summary>

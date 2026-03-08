@@ -1526,6 +1526,162 @@ public class ParquetFileWriterTests : IDisposable
         Assert.True(rVals.IsNull(off2 + 1));
     }
 
+    // --- Nested Combination Tests ---
+
+    [Fact]
+    public async Task Nested_StructContainingList_RoundTrips()
+    {
+        // Schema: record (optional struct) → name (string), scores (optional list<int32>)
+        var listType = new ListType(new Field("element", Int32Type.Default, nullable: false));
+        var structType = new StructType(new[]
+        {
+            new Field("name", Apache.Arrow.Types.StringType.Default, nullable: true),
+            new Field("scores", listType, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("record", structType, nullable: true))
+            .Build();
+
+        int count = 4;
+        // Row 0: struct present, name="alice", scores=[90, 85]
+        // Row 1: struct null
+        // Row 2: struct present, name=null, scores=null
+        // Row 3: struct present, name="bob", scores=[95]
+
+        var nameBuilder = new StringArray.Builder();
+        nameBuilder.Append("alice");
+        nameBuilder.AppendNull(); // row 1 (struct null, but need placeholder)
+        nameBuilder.AppendNull(); // row 2 (name null)
+        nameBuilder.Append("bob");
+
+        // Scores: build as list
+        var scoresValuesBuilder = new Int32Array.Builder();
+        scoresValuesBuilder.Append(90); scoresValuesBuilder.Append(85); // row 0
+        scoresValuesBuilder.Append(95); // row 3
+
+        var scoresOffsetsBuilder = new ArrowBuffer.Builder<int>();
+        scoresOffsetsBuilder.Append(0); scoresOffsetsBuilder.Append(2);
+        scoresOffsetsBuilder.Append(2); scoresOffsetsBuilder.Append(2);
+        scoresOffsetsBuilder.Append(3);
+
+        var scoresNullBitmap = new byte[1];
+        BitUtility.SetBit(scoresNullBitmap, 0, true);  // row 0: scores valid
+        BitUtility.SetBit(scoresNullBitmap, 1, false);  // row 1: struct null (doesn't matter)
+        BitUtility.SetBit(scoresNullBitmap, 2, false);  // row 2: scores null
+        BitUtility.SetBit(scoresNullBitmap, 3, true);   // row 3: scores valid
+
+        var scoresArray = new ListArray(listType, count,
+            scoresOffsetsBuilder.Build(), scoresValuesBuilder.Build(),
+            new ArrowBuffer(scoresNullBitmap), nullCount: 2);
+
+        var structNullBitmap = new byte[1];
+        BitUtility.SetBit(structNullBitmap, 0, true);
+        BitUtility.SetBit(structNullBitmap, 1, false);
+        BitUtility.SetBit(structNullBitmap, 2, true);
+        BitUtility.SetBit(structNullBitmap, 3, true);
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { nameBuilder.Build(), scoresArray },
+            new ArrowBuffer(structNullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultStruct = (StructArray)result.Column(0);
+        var resultName = (StringArray)resultStruct.Fields[0];
+        var resultScores = (ListArray)resultStruct.Fields[1];
+
+        // Row 0: struct present
+        Assert.False(resultStruct.IsNull(0));
+        Assert.Equal("alice", resultName.GetString(0));
+        Assert.False(resultScores.IsNull(0));
+        var r0Scores = (Int32Array)resultScores.GetSlicedValues(0);
+        Assert.Equal(2, r0Scores.Length);
+        Assert.Equal(90, r0Scores.GetValue(0));
+        Assert.Equal(85, r0Scores.GetValue(1));
+
+        // Row 1: struct null
+        Assert.True(resultStruct.IsNull(1));
+
+        // Row 2: struct present, name null, scores null
+        Assert.False(resultStruct.IsNull(2));
+        Assert.True(resultName.IsNull(2));
+        Assert.True(resultScores.IsNull(2));
+
+        // Row 3: struct present
+        Assert.False(resultStruct.IsNull(3));
+        Assert.Equal("bob", resultName.GetString(3));
+        var r3Scores = (Int32Array)resultScores.GetSlicedValues(3);
+        Assert.Equal(1, r3Scores.Length);
+        Assert.Equal(95, r3Scores.GetValue(0));
+    }
+
+    [Fact]
+    public async Task Nested_ListOfStruct_RoundTrips()
+    {
+        // Schema: items (optional list<optional struct{x: int32, y: string}>)
+        var structType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: true),
+            new Field("y", Apache.Arrow.Types.StringType.Default, nullable: true),
+        });
+        var listType = new ListType(new Field("element", structType, nullable: true));
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("items", listType, nullable: true))
+            .Build();
+
+        // Row 0: [{x:1, y:"a"}, {x:2, y:null}]
+        // Row 1: null (list null)
+        // Row 2: [{x:null, y:"b"}]
+
+        // Build the struct values array (3 structs total)
+        var xBuilder = new Int32Array.Builder();
+        xBuilder.Append(1); xBuilder.Append(2); xBuilder.AppendNull();
+
+        var yBuilder = new StringArray.Builder();
+        yBuilder.Append("a"); yBuilder.AppendNull(); yBuilder.Append("b");
+
+        var structValues = new StructArray(structType, 3,
+            new IArrowArray[] { xBuilder.Build(), yBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(2); offsetsBuilder.Append(3);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+
+        int count = 3;
+        var listArray = new ListArray(listType, count,
+            offsetsBuilder.Build(), structValues,
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { listArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultList = (ListArray)result.Column(0);
+
+        // Row 0: [{x:1, y:"a"}, {x:2, y:null}]
+        Assert.False(resultList.IsNull(0));
+        // The list elements should be a StructArray
+        var off0 = resultList.ValueOffsets[0];
+        var len0 = resultList.ValueOffsets[1] - off0;
+        Assert.Equal(2, len0);
+
+        // Row 1: null
+        Assert.True(resultList.IsNull(1));
+
+        // Row 2: [{x:null, y:"b"}]
+        Assert.False(resultList.IsNull(2));
+        var off2 = resultList.ValueOffsets[2];
+        var len2 = resultList.ValueOffsets[3] - off2;
+        Assert.Equal(1, len2);
+    }
+
     // --- Explicit V1 Tests (ensure V1 still works when selected) ---
 
     [Fact]
