@@ -1,5 +1,6 @@
 using System.Buffers.Binary;
 using Apache.Arrow;
+using Apache.Arrow.Types;
 using EngineeredWood.IO;
 using EngineeredWood.Parquet.Data;
 using EngineeredWood.Parquet.Metadata;
@@ -22,6 +23,8 @@ public sealed class ParquetFileWriter : IAsyncDisposable
     private Apache.Arrow.Schema? _arrowSchema;
     private IReadOnlyList<SchemaElement>? _parquetSchema;
     private IReadOnlyList<ColumnDescriptor>? _columnDescriptors;
+    private SchemaDescriptor? _schemaDescriptor;
+    private bool _hasNestedColumns;
     private readonly List<RowGroup> _rowGroups = new();
     private long _totalRows;
     private bool _headerWritten;
@@ -45,7 +48,9 @@ public sealed class ParquetFileWriter : IAsyncDisposable
         {
             _arrowSchema = batch.Schema;
             _parquetSchema = ParquetSchemaConverter.ToParquetSchema(_arrowSchema);
-            _columnDescriptors = ParquetSchemaConverter.BuildColumnDescriptors(_parquetSchema);
+            _schemaDescriptor = new SchemaDescriptor(_parquetSchema);
+            _columnDescriptors = _schemaDescriptor.Columns;
+            _hasNestedColumns = HasNestedTypes(_arrowSchema);
             await WriteMagicAsync(cancellationToken).ConfigureAwait(false);
             _headerWritten = true;
         }
@@ -84,35 +89,42 @@ public sealed class ParquetFileWriter : IAsyncDisposable
         long totalCompressedSize = 0;
         long rowGroupStart = _output.Position;
 
-        for (int i = 0; i < _columnDescriptors!.Count; i++)
+        if (_hasNestedColumns)
         {
-            var descriptor = _columnDescriptors[i];
-            string columnPath = descriptor.DottedPath;
+            // Flatten nested Arrow arrays into leaf columns with pre-computed def/rep levels
+            var flattenedColumns = NestedArrayFlattener.Flatten(
+                batch, _schemaDescriptor!.Root, _columnDescriptors!);
 
-            var codec = _options.GetCodecForColumn(columnPath);
-            var encoding = _options.GetEncodingForColumn(columnPath);
-
-            var colWriter = new ColumnWriter(
-                descriptor,
-                codec: codec,
-                encoding: encoding,
-                targetPageSize: _options.TargetPageSize,
-                maxDictionarySize: _options.MaxDictionarySize,
-                pageVersion: _options.DataPageVersion,
-                strategy: _options.EncodingStrategy);
-
-            var array = batch.Column(i);
-            long columnOffset = _output.Position;
-            var meta = await colWriter.WriteAsync(array, _output, ct).ConfigureAwait(false);
-
-            columns.Add(new ColumnChunk
+            for (int i = 0; i < _columnDescriptors!.Count; i++)
             {
-                FileOffset = columnOffset,
-                MetaData = meta,
-            });
+                var descriptor = _columnDescriptors[i];
+                var flat = flattenedColumns[i];
 
-            totalByteSize += meta.TotalUncompressedSize;
-            totalCompressedSize += meta.TotalCompressedSize;
+                var colWriter = CreateColumnWriter(descriptor);
+                long columnOffset = _output.Position;
+                var meta = await colWriter.WritePreDecomposedAsync(
+                    flat.Decomposed, flat.NumValues, _output, ct).ConfigureAwait(false);
+
+                columns.Add(new ColumnChunk { FileOffset = columnOffset, MetaData = meta });
+                totalByteSize += meta.TotalUncompressedSize;
+                totalCompressedSize += meta.TotalCompressedSize;
+            }
+        }
+        else
+        {
+            // Flat schema — direct path (no flattening overhead)
+            for (int i = 0; i < _columnDescriptors!.Count; i++)
+            {
+                var descriptor = _columnDescriptors[i];
+                var colWriter = CreateColumnWriter(descriptor);
+                var array = batch.Column(i);
+                long columnOffset = _output.Position;
+                var meta = await colWriter.WriteAsync(array, _output, ct).ConfigureAwait(false);
+
+                columns.Add(new ColumnChunk { FileOffset = columnOffset, MetaData = meta });
+                totalByteSize += meta.TotalUncompressedSize;
+                totalCompressedSize += meta.TotalCompressedSize;
+            }
         }
 
         _rowGroups.Add(new RowGroup
@@ -125,6 +137,29 @@ public sealed class ParquetFileWriter : IAsyncDisposable
         });
 
         _totalRows += batch.Length;
+    }
+
+    private ColumnWriter CreateColumnWriter(ColumnDescriptor descriptor)
+    {
+        string columnPath = descriptor.DottedPath;
+        return new ColumnWriter(
+            descriptor,
+            codec: _options.GetCodecForColumn(columnPath),
+            encoding: _options.GetEncodingForColumn(columnPath),
+            targetPageSize: _options.TargetPageSize,
+            maxDictionarySize: _options.MaxDictionarySize,
+            pageVersion: _options.DataPageVersion,
+            strategy: _options.EncodingStrategy);
+    }
+
+    private static bool HasNestedTypes(Apache.Arrow.Schema schema)
+    {
+        foreach (var field in schema.FieldsList)
+        {
+            if (field.DataType is StructType or ListType or MapType)
+                return true;
+        }
+        return false;
     }
 
     private async ValueTask WriteFooterAsync(CancellationToken ct)

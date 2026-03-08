@@ -191,6 +191,61 @@ internal sealed class ColumnWriter
     }
 
     /// <summary>
+    /// Writes a pre-decomposed column (from NestedArrayFlattener) directly.
+    /// Used for nested schemas where def/rep levels are pre-computed by the flattener.
+    /// </summary>
+    public async ValueTask<Metadata.ColumnMetaData> WritePreDecomposedAsync(
+        ArrowArrayDecomposer.DecomposedColumn decomposed,
+        int numValues,
+        IOutputFile output,
+        CancellationToken ct = default)
+    {
+        var state = new WriteState();
+        bool isDictionary = _encoding == Encoding.RleDictionary || _encoding == Encoding.PlainDictionary;
+
+        if (isDictionary)
+        {
+            var dictResult = TryBuildDictionary(decomposed, numValues);
+
+            if (dictResult.HasValue)
+            {
+                state.DictionaryPageOffset = output.Position;
+                byte[] dictPage = dictResult.Value.encoder.EncodeDictionaryPage();
+                await WritePageAsync(output, PageType.DictionaryPage, dictPage, dictPage.Length,
+                    state, ct,
+                    dictPageHeader: new DictionaryPageHeader
+                    {
+                        NumValues = dictResult.Value.encoder.DictionarySize,
+                        Encoding = Encoding.PlainDictionary,
+                    }).ConfigureAwait(false);
+                state.Encodings.Add(Encoding.PlainDictionary);
+
+                byte[] indexData = dictResult.Value.encoder.EncodeIndices();
+                int indexBitWidth = dictResult.Value.encoder.GetIndexBitWidth();
+                state.DataPageOffset = output.Position;
+                await WriteIndexPagesAsync(indexData, indexBitWidth, decomposed, numValues,
+                    output, state, ct).ConfigureAwait(false);
+            }
+            else
+            {
+                var fallback = EncodingStrategyResolver.GetFallbackEncoding(_strategy, _column.PhysicalType);
+                state.DataPageOffset = output.Position;
+                await WriteEncodedPagesAsync(decomposed, numValues, fallback,
+                    output, state, ct).ConfigureAwait(false);
+            }
+        }
+        else
+        {
+            state.DataPageOffset = output.Position;
+            await WriteEncodedPagesAsync(decomposed, numValues, _encoding,
+                output, state, ct).ConfigureAwait(false);
+        }
+
+        var statistics = StatisticsCollector.Collect(decomposed, _column.PhysicalType, numValues);
+        return BuildColumnMetaData(numValues, state, statistics);
+    }
+
+    /// <summary>
     /// Sync convenience wrapper: writes to an in-memory buffer and returns the bytes.
     /// Kept for backward compatibility with unit tests.
     /// </summary>
@@ -426,13 +481,19 @@ internal sealed class ColumnWriter
             ? LevelEncoder.EncodeV1(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
 
-        int pageDataLen = defLevelBytes.Length + 1 + indexData.Length;
+        byte[] repLevelBytes = decomposed.RepLevels != null
+            ? LevelEncoder.EncodeV1(decomposed.RepLevels, _column.MaxRepetitionLevel)
+            : [];
+
+        int pageDataLen = repLevelBytes.Length + defLevelBytes.Length + 1 + indexData.Length;
         byte[] pageData = ArrayPool<byte>.Shared.Rent(pageDataLen);
         try
         {
-            defLevelBytes.CopyTo(pageData.AsSpan());
-            pageData[defLevelBytes.Length] = (byte)indexBitWidth;
-            indexData.CopyTo(pageData.AsSpan(defLevelBytes.Length + 1));
+            int pos = 0;
+            repLevelBytes.CopyTo(pageData.AsSpan(pos)); pos += repLevelBytes.Length;
+            defLevelBytes.CopyTo(pageData.AsSpan(pos)); pos += defLevelBytes.Length;
+            pageData[pos] = (byte)indexBitWidth; pos++;
+            indexData.CopyTo(pageData.AsSpan(pos));
 
             await WritePageAsync(output, PageType.DataPage, pageData, pageDataLen,
                 state, ct,
@@ -463,6 +524,10 @@ internal sealed class ColumnWriter
             ? LevelEncoder.EncodeV2(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
 
+        byte[] repLevelBytes = decomposed.RepLevels != null
+            ? LevelEncoder.EncodeV2(decomposed.RepLevels, _column.MaxRepetitionLevel)
+            : [];
+
         int valuesLen = 1 + indexData.Length;
         byte[] valuesData = ArrayPool<byte>.Shared.Rent(valuesLen);
         try
@@ -471,7 +536,7 @@ internal sealed class ColumnWriter
             indexData.CopyTo(valuesData.AsSpan(1));
 
             int numNulls = numValues - decomposed.NonNullCount;
-            await WriteV2PageAsync(output, defLevelBytes, [], valuesData, valuesLen,
+            await WriteV2PageAsync(output, defLevelBytes, repLevelBytes, valuesData, valuesLen,
                 numValues, numNulls, numValues,
                 Encoding.RleDictionary, state, ct).ConfigureAwait(false);
         }
@@ -498,24 +563,34 @@ internal sealed class ColumnWriter
                 ? LevelEncoder.EncodeV2(decomposed.DefLevels, _column.MaxDefinitionLevel)
                 : [];
 
+            byte[] repLevelBytes = decomposed.RepLevels != null
+                ? LevelEncoder.EncodeV2(decomposed.RepLevels, _column.MaxRepetitionLevel)
+                : [];
+
             int numNulls = numValues - decomposed.NonNullCount;
-            await WriteV2PageAsync(output, defLevelBytes, [], encodedValues, encodedValues.Length,
+            await WriteV2PageAsync(output, defLevelBytes, repLevelBytes, encodedValues, encodedValues.Length,
                 numValues, numNulls, numValues,
                 encoding, state, ct).ConfigureAwait(false);
             return;
         }
 
-        // V1 data page: def levels (with 4-byte length prefix) + encoded values
+        // V1 data page: rep levels + def levels (each with 4-byte length prefix) + encoded values
+        byte[] v1RepLevelBytes = decomposed.RepLevels != null
+            ? LevelEncoder.EncodeV1(decomposed.RepLevels, _column.MaxRepetitionLevel)
+            : [];
+
         byte[] v1DefLevelBytes = decomposed.DefLevels != null
             ? LevelEncoder.EncodeV1(decomposed.DefLevels, _column.MaxDefinitionLevel)
             : [];
 
-        int pageDataLen = v1DefLevelBytes.Length + encodedValues.Length;
+        int pageDataLen = v1RepLevelBytes.Length + v1DefLevelBytes.Length + encodedValues.Length;
         byte[] pageData = ArrayPool<byte>.Shared.Rent(pageDataLen);
         try
         {
-            v1DefLevelBytes.CopyTo(pageData.AsSpan());
-            encodedValues.CopyTo(pageData.AsSpan(v1DefLevelBytes.Length));
+            int pos = 0;
+            v1RepLevelBytes.CopyTo(pageData.AsSpan(pos)); pos += v1RepLevelBytes.Length;
+            v1DefLevelBytes.CopyTo(pageData.AsSpan(pos)); pos += v1DefLevelBytes.Length;
+            encodedValues.CopyTo(pageData.AsSpan(pos));
 
             await WritePageAsync(output, PageType.DataPage, pageData, pageDataLen,
                 state, ct,

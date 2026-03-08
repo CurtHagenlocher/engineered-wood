@@ -756,4 +756,195 @@ public class CrossReaderValidationTests : IDisposable
         for (int i = 0; i < 250; i++)
             Assert.Equal(i + 150, data1[i]);
     }
+
+    // ----------------------------------------------------------------
+    //  ParquetSharp cross-reader: struct tests
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task PS_Struct_NullableStruct_V2()
+    {
+        var structType = new StructType(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: true),
+            new Field("b", Int64Type.Default, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("struct_col", structType, nullable: true))
+            .Build();
+
+        int count = 10;
+        var aBuilder = new Int32Array.Builder();
+        var bBuilder = new Int64Array.Builder();
+        var nullBitmap = new byte[(count + 7) / 8];
+
+        // Same pattern as the read round-trip test:
+        // def=0 → struct null, def=1 → struct present + field null, def=2 → both present
+        bool[] structValid = [false, true, true, true, true, false, true, true, false, true];
+        int?[] expectedA = [null, null, 10, null, 40, null, null, 70, null, 90];
+        long?[] expectedB = [null, null, 100, null, 400, null, null, 700, null, 900];
+
+        for (int i = 0; i < count; i++)
+        {
+            BitUtility.SetBit(nullBitmap, i, structValid[i]);
+            if (expectedA[i] != null) aBuilder.Append(expectedA[i]!.Value);
+            else aBuilder.AppendNull();
+            if (expectedB[i] != null) bBuilder.Append(expectedB[i]!.Value);
+            else bBuilder.AppendNull();
+        }
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { aBuilder.Build(), bBuilder.Build() },
+            new ArrowBuffer(nullBitmap),
+            count - structValid.Count(v => v));
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var path = await WriteWithEW(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+        }, name: "ps_struct.parquet");
+
+        // Read back via ParquetSharp low-level API
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = psReader.RowGroup(0);
+        Assert.Equal(count, (int)rg.MetaData.NumRows);
+
+        // Column 0: struct_col.a (int32, maxDef=2)
+        using var aCol = rg.Column(0);
+        using var aReader = (ParquetSharp.ColumnReader<int>)aCol;
+        var aDefLevels = new short[count];
+        var aValues = new int[count];
+        long aRead = aReader.ReadBatch(count, aDefLevels, null, aValues, out _);
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!structValid[i])
+                Assert.Equal(0, aDefLevels[i]); // struct null
+            else if (expectedA[i] == null)
+                Assert.Equal(1, aDefLevels[i]); // struct present, field null
+            else
+                Assert.Equal(2, aDefLevels[i]); // both present
+        }
+
+        // Verify actual values (dense — only where def==2)
+        int aIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (aDefLevels[i] == 2)
+                Assert.Equal(expectedA[i], aValues[aIdx++]);
+        }
+
+        // Column 1: struct_col.b (int64, maxDef=2)
+        using var bCol = rg.Column(1);
+        using var bReader = (ParquetSharp.ColumnReader<long>)bCol;
+        var bDefLevels = new short[count];
+        var bValues = new long[count];
+        bReader.ReadBatch(count, bDefLevels, null, bValues, out _);
+
+        int bIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (bDefLevels[i] == 2)
+                Assert.Equal(expectedB[i], bValues[bIdx++]);
+        }
+    }
+
+    [Fact]
+    public async Task PS_Struct_NestedStruct_V2()
+    {
+        // outer (optional) → x (required int32), inner (optional) → y (required int64)
+        var innerType = new StructType(new[]
+        {
+            new Field("y", Int64Type.Default, nullable: false),
+        });
+        var outerType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: false),
+            new Field("inner", innerType, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("outer", outerType, nullable: true))
+            .Build();
+
+        int count = 5;
+        bool[] outerValid = [false, true, true, true, false];
+        int[] xValues = [0, 10, 20, 30, 0];
+        bool[] innerValid = [false, true, false, true, false];
+        long[] yValues = [0, 100, 0, 300, 0];
+
+        var xBuilder = new Int32Array.Builder();
+        var yBuilder = new Int64Array.Builder();
+        var innerNullBitmap = new byte[(count + 7) / 8];
+        var outerNullBitmap = new byte[(count + 7) / 8];
+
+        for (int i = 0; i < count; i++)
+        {
+            BitUtility.SetBit(outerNullBitmap, i, outerValid[i]);
+            BitUtility.SetBit(innerNullBitmap, i, innerValid[i]);
+            xBuilder.Append(xValues[i]);
+            yBuilder.Append(yValues[i]);
+        }
+
+        var innerArray = new StructArray(innerType, count,
+            new IArrowArray[] { yBuilder.Build() },
+            new ArrowBuffer(innerNullBitmap),
+            count - innerValid.Count(v => v));
+
+        var outerArray = new StructArray(outerType, count,
+            new IArrowArray[] { xBuilder.Build(), innerArray },
+            new ArrowBuffer(outerNullBitmap),
+            count - outerValid.Count(v => v));
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { outerArray }, count);
+        var path = await WriteWithEW(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+        }, name: "ps_nested_struct.parquet");
+
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = psReader.RowGroup(0);
+        Assert.Equal(count, (int)rg.MetaData.NumRows);
+
+        // Column 0: outer.x (required child of optional struct → maxDef=1)
+        // def=0 → outer null, def=1 → x present (x is required so no separate null level)
+        using var xCol = rg.Column(0);
+        using var xReader = (ParquetSharp.ColumnReader<int>)xCol;
+        var xDefLevels = new short[count];
+        var xVals = new int[count];
+        xReader.ReadBatch(count, xDefLevels, null, xVals, out _);
+
+        int xIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!outerValid[i])
+                Assert.Equal(0, xDefLevels[i]);
+            else
+            {
+                Assert.Equal(1, xDefLevels[i]);
+                Assert.Equal(xValues[i], xVals[xIdx++]);
+            }
+        }
+
+        // Column 1: outer.inner.y (required child of optional inner, which is child of optional outer → maxDef=2)
+        // def=0 → outer null, def=1 → inner null, def=2 → y present
+        using var yCol = rg.Column(1);
+        using var yReader = (ParquetSharp.ColumnReader<long>)yCol;
+        var yDefLevels = new short[count];
+        var yVals = new long[count];
+        yReader.ReadBatch(count, yDefLevels, null, yVals, out _);
+
+        int yIdx = 0;
+        for (int i = 0; i < count; i++)
+        {
+            if (!outerValid[i])
+                Assert.Equal(0, yDefLevels[i]);
+            else if (!innerValid[i])
+                Assert.Equal(1, yDefLevels[i]);
+            else
+            {
+                Assert.Equal(2, yDefLevels[i]);
+                Assert.Equal(yValues[i], yVals[yIdx++]);
+            }
+        }
+    }
 }

@@ -651,6 +651,382 @@ public class ParquetFileWriterTests : IDisposable
 
     // --- Explicit V1 Tests (ensure V1 still works when selected) ---
 
+    // --- Struct Write Tests ---
+
+    [Fact]
+    public async Task Struct_NullableStruct_NullableChildren_RoundTrips()
+    {
+        // Schema: struct_col (optional) → a (optional int32), b (optional string)
+        var structType = new StructType(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: true),
+            new Field("b", Apache.Arrow.Types.StringType.Default, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("struct_col", structType, nullable: true))
+            .Build();
+
+        int count = 10;
+        // Build child arrays
+        var aBuilder = new Int32Array.Builder();
+        var bBuilder = new StringArray.Builder();
+        var structNullBitmap = new byte[(count + 7) / 8];
+
+        // Row layout:
+        // 0: struct null
+        // 1: struct present, a null, b null
+        // 2: struct present, a=10, b="hello"
+        // 3: struct present, a null, b="world"
+        // 4: struct present, a=40, b null
+        // 5: struct null
+        // 6: struct present, a=60, b="test"
+        // 7: struct present, a=70, b="foo"
+        // 8: struct null
+        // 9: struct present, a=90, b="bar"
+
+        int?[] expectedA = [null, null, 10, null, 40, null, 60, 70, null, 90];
+        string?[] expectedB = [null, null, "hello", "world", null, null, "test", "foo", null, "bar"];
+        bool[] structValid = [false, true, true, true, true, false, true, true, false, true];
+
+        for (int i = 0; i < count; i++)
+        {
+            if (structValid[i])
+                BitUtility.SetBit(structNullBitmap, i, true);
+
+            if (expectedA[i] != null) aBuilder.Append(expectedA[i]!.Value);
+            else aBuilder.AppendNull();
+
+            if (expectedB[i] != null) bBuilder.Append(expectedB[i]);
+            else bBuilder.AppendNull();
+        }
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { aBuilder.Build(), bBuilder.Build() },
+            new ArrowBuffer(structNullBitmap),
+            count - structValid.Count(v => v));
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        Assert.Single(result.Schema.FieldsList);
+        Assert.IsType<StructType>(result.Schema.FieldsList[0].DataType);
+
+        var resultStruct = (StructArray)result.Column(0);
+        Assert.Equal(2, resultStruct.Fields.Count);
+
+        var resultA = (Int32Array)resultStruct.Fields[0];
+        var resultB = (StringArray)resultStruct.Fields[1];
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!structValid[i])
+            {
+                Assert.True(resultStruct.IsNull(i), $"Row {i}: struct should be null");
+                Assert.True(resultA.IsNull(i), $"Row {i}: a should be null (struct null)");
+                Assert.True(resultB.IsNull(i), $"Row {i}: b should be null (struct null)");
+            }
+            else if (expectedA[i] == null)
+            {
+                Assert.True(resultA.IsNull(i), $"Row {i}: a should be null");
+            }
+            else
+            {
+                Assert.Equal(expectedA[i], resultA.GetValue(i));
+            }
+
+            if (structValid[i])
+            {
+                if (expectedB[i] == null)
+                    Assert.True(resultB.IsNull(i), $"Row {i}: b should be null");
+                else
+                    Assert.Equal(expectedB[i], resultB.GetString(i));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Struct_RequiredStruct_NullableChildren_RoundTrips()
+    {
+        // Schema: struct_col (required) → x (optional int32), y (optional double)
+        var structType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: true),
+            new Field("y", DoubleType.Default, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("struct_col", structType, nullable: false))
+            .Build();
+
+        int count = 8;
+        var xBuilder = new Int32Array.Builder();
+        var yBuilder = new DoubleArray.Builder();
+
+        int?[] expectedX = [1, null, 3, null, 5, 6, null, 8];
+        double?[] expectedY = [1.1, 2.2, null, null, 5.5, null, 7.7, 8.8];
+
+        for (int i = 0; i < count; i++)
+        {
+            if (expectedX[i] != null) xBuilder.Append(expectedX[i]!.Value);
+            else xBuilder.AppendNull();
+
+            if (expectedY[i] != null) yBuilder.Append(expectedY[i]!.Value);
+            else yBuilder.AppendNull();
+        }
+
+        // Required struct: no null bitmap needed (all valid)
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { xBuilder.Build(), yBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultStruct = (StructArray)result.Column(0);
+        var resultX = (Int32Array)resultStruct.Fields[0];
+        var resultY = (DoubleArray)resultStruct.Fields[1];
+
+        for (int i = 0; i < count; i++)
+        {
+            Assert.False(resultStruct.IsNull(i), $"Row {i}: required struct should never be null");
+            if (expectedX[i] == null)
+                Assert.True(resultX.IsNull(i));
+            else
+                Assert.Equal(expectedX[i], resultX.GetValue(i));
+
+            if (expectedY[i] == null)
+                Assert.True(resultY.IsNull(i));
+            else
+                Assert.Equal(expectedY[i], resultY.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task Struct_NestedStructInStruct_RoundTrips()
+    {
+        // Schema: outer (optional) → x (required int32), inner (optional) → y (required int64)
+        var innerType = new StructType(new[]
+        {
+            new Field("y", Int64Type.Default, nullable: false),
+        });
+        var outerType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: false),
+            new Field("inner", innerType, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("outer", outerType, nullable: true))
+            .Build();
+
+        int count = 5;
+        // Row layout:
+        // 0: outer null
+        // 1: outer present, x=10, inner present, y=100
+        // 2: outer present, x=20, inner null
+        // 3: outer present, x=30, inner present, y=300
+        // 4: outer null
+
+        bool[] outerValid = [false, true, true, true, false];
+        int[] xValues = [0, 10, 20, 30, 0]; // 0s are placeholders for null outer rows
+        bool[] innerValid = [false, true, false, true, false];
+        long[] yValues = [0, 100, 0, 300, 0];
+
+        var xBuilder = new Int32Array.Builder();
+        var yBuilder = new Int64Array.Builder();
+
+        for (int i = 0; i < count; i++)
+        {
+            xBuilder.Append(xValues[i]);
+            yBuilder.Append(yValues[i]);
+        }
+
+        var innerNullBitmap = new byte[(count + 7) / 8];
+        var outerNullBitmap = new byte[(count + 7) / 8];
+        for (int i = 0; i < count; i++)
+        {
+            BitUtility.SetBit(innerNullBitmap, i, innerValid[i]);
+            BitUtility.SetBit(outerNullBitmap, i, outerValid[i]);
+        }
+
+        var innerArray = new StructArray(innerType, count,
+            new IArrowArray[] { yBuilder.Build() },
+            new ArrowBuffer(innerNullBitmap),
+            count - innerValid.Count(v => v));
+
+        var outerArray = new StructArray(outerType, count,
+            new IArrowArray[] { xBuilder.Build(), innerArray },
+            new ArrowBuffer(outerNullBitmap),
+            count - outerValid.Count(v => v));
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { outerArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultOuter = (StructArray)result.Column(0);
+        Assert.Equal(2, resultOuter.Fields.Count);
+
+        var resultX = (Int32Array)resultOuter.Fields[0];
+        var resultInner = (StructArray)resultOuter.Fields[1];
+        var resultY = (Int64Array)resultInner.Fields[0];
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!outerValid[i])
+            {
+                Assert.True(resultOuter.IsNull(i), $"Row {i}: outer should be null");
+                continue;
+            }
+
+            Assert.False(resultOuter.IsNull(i));
+            Assert.Equal(xValues[i], resultX.GetValue(i));
+
+            if (!innerValid[i])
+            {
+                Assert.True(resultInner.IsNull(i), $"Row {i}: inner should be null");
+            }
+            else
+            {
+                Assert.False(resultInner.IsNull(i));
+                Assert.Equal(yValues[i], resultY.GetValue(i));
+            }
+        }
+    }
+
+    [Fact]
+    public async Task Struct_V1_NullableStruct_RoundTrips()
+    {
+        var structType = new StructType(new[]
+        {
+            new Field("val", Int32Type.Default, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("s", structType, nullable: true))
+            .Build();
+
+        int count = 6;
+        bool[] structValid = [true, false, true, true, false, true];
+        int?[] expectedVal = [42, null, null, 99, null, 7];
+
+        var valBuilder = new Int32Array.Builder();
+        var nullBitmap = new byte[(count + 7) / 8];
+        for (int i = 0; i < count; i++)
+        {
+            BitUtility.SetBit(nullBitmap, i, structValid[i]);
+            if (expectedVal[i] != null) valBuilder.Append(expectedVal[i]!.Value);
+            else valBuilder.AppendNull();
+        }
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { valBuilder.Build() },
+            new ArrowBuffer(nullBitmap),
+            count - structValid.Count(v => v));
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArray }, count);
+        var result = await WriteAndRead(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V1,
+        });
+
+        var resultStruct = (StructArray)result.Column(0);
+        var resultVal = (Int32Array)resultStruct.Fields[0];
+
+        for (int i = 0; i < count; i++)
+        {
+            if (!structValid[i])
+            {
+                Assert.True(resultStruct.IsNull(i));
+                continue;
+            }
+            if (expectedVal[i] == null)
+                Assert.True(resultVal.IsNull(i));
+            else
+                Assert.Equal(expectedVal[i], resultVal.GetValue(i));
+        }
+    }
+
+    [Fact]
+    public async Task Struct_MixedWithFlatColumns_RoundTrips()
+    {
+        // Schema: id (int32), info (optional struct) → name (string), score (double), active (bool)
+        var structType = new StructType(new[]
+        {
+            new Field("name", Apache.Arrow.Types.StringType.Default, nullable: true),
+            new Field("score", DoubleType.Default, nullable: true),
+        });
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, nullable: false))
+            .Field(new Field("info", structType, nullable: true))
+            .Field(new Field("active", BooleanType.Default, nullable: true))
+            .Build();
+
+        int count = 8;
+        var idBuilder = new Int32Array.Builder();
+        var nameBuilder = new StringArray.Builder();
+        var scoreBuilder = new DoubleArray.Builder();
+        var activeBuilder = new BooleanArray.Builder();
+        var structNullBitmap = new byte[(count + 7) / 8];
+
+        bool[] structValid = [true, true, false, true, false, true, true, false];
+        string?[] expectedNames = ["alice", null, null, "dave", null, null, "gina", null];
+        double?[] expectedScores = [95.0, 82.5, null, null, null, 70.0, 88.0, null];
+        bool?[] expectedActive = [true, false, null, true, true, null, false, true];
+
+        for (int i = 0; i < count; i++)
+        {
+            idBuilder.Append(i);
+            BitUtility.SetBit(structNullBitmap, i, structValid[i]);
+            if (expectedNames[i] != null) nameBuilder.Append(expectedNames[i]);
+            else nameBuilder.AppendNull();
+            if (expectedScores[i] != null) scoreBuilder.Append(expectedScores[i]!.Value);
+            else scoreBuilder.AppendNull();
+            if (expectedActive[i] != null) activeBuilder.Append(expectedActive[i]!.Value);
+            else activeBuilder.AppendNull();
+        }
+
+        var structArray = new StructArray(structType, count,
+            new IArrowArray[] { nameBuilder.Build(), scoreBuilder.Build() },
+            new ArrowBuffer(structNullBitmap),
+            count - structValid.Count(v => v));
+
+        var batch = new RecordBatch(schema,
+            new IArrowArray[] { idBuilder.Build(), structArray, activeBuilder.Build() }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        Assert.Equal(3, result.Schema.FieldsList.Count);
+
+        var resultId = (Int32Array)result.Column(0);
+        var resultStruct = (StructArray)result.Column(1);
+        var resultActive = (BooleanArray)result.Column(2);
+
+        var resultName = (StringArray)resultStruct.Fields[0];
+        var resultScore = (DoubleArray)resultStruct.Fields[1];
+
+        for (int i = 0; i < count; i++)
+        {
+            Assert.Equal(i, resultId.GetValue(i));
+
+            if (!structValid[i])
+            {
+                Assert.True(resultStruct.IsNull(i));
+            }
+            else
+            {
+                Assert.False(resultStruct.IsNull(i));
+                if (expectedNames[i] == null) Assert.True(resultName.IsNull(i));
+                else Assert.Equal(expectedNames[i], resultName.GetString(i));
+                if (expectedScores[i] == null) Assert.True(resultScore.IsNull(i));
+                else Assert.Equal(expectedScores[i], resultScore.GetValue(i));
+            }
+
+            if (expectedActive[i] == null) Assert.True(resultActive.IsNull(i));
+            else Assert.Equal(expectedActive[i], resultActive.GetValue(i));
+        }
+    }
+
+    // --- Explicit V1 Tests (ensure V1 still works when selected) ---
+
     [Fact]
     public async Task V1_Explicit_Int32_Nullable_RoundTrips()
     {

@@ -20,6 +20,9 @@ internal static class ArrowArrayDecomposer
         /// <summary>Definition levels (maxDefLevel for non-null, 0 for null). Null if column is required.</summary>
         public readonly byte[]? DefLevels;
 
+        /// <summary>Repetition levels. Null for non-repeated (flat or struct-only) columns.</summary>
+        public readonly byte[]? RepLevels;
+
         /// <summary>Number of non-null values.</summary>
         public readonly int NonNullCount;
 
@@ -41,9 +44,11 @@ internal static class ArrowArrayDecomposer
             bool[]? boolValues = null,
             byte[]? valueBytes = null,
             byte[]? byteArrayData = null,
-            int[]? byteArrayOffsets = null)
+            int[]? byteArrayOffsets = null,
+            byte[]? repLevels = null)
         {
             DefLevels = defLevels;
+            RepLevels = repLevels;
             NonNullCount = nonNullCount;
             BoolValues = boolValues;
             ValueBytes = valueBytes;

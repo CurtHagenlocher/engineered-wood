@@ -28,14 +28,39 @@ internal static class ParquetSchemaConverter
 
         foreach (var field in arrowSchema.FieldsList)
         {
-            elements.Add(ToSchemaElement(field));
+            AddFieldElements(field, elements);
         }
 
         return elements;
     }
 
     /// <summary>
-    /// Converts a single Arrow field to a Parquet SchemaElement.
+    /// Recursively adds schema elements for a field. For struct fields, emits a group
+    /// element followed by child elements. For leaf fields, emits a single element.
+    /// </summary>
+    private static void AddFieldElements(Field field, List<SchemaElement> elements)
+    {
+        if (field.DataType is StructType structType)
+        {
+            // Group node for struct
+            elements.Add(new SchemaElement
+            {
+                Name = field.Name,
+                NumChildren = structType.Fields.Count,
+                RepetitionType = field.IsNullable ? FieldRepetitionType.Optional : FieldRepetitionType.Required,
+            });
+
+            foreach (var childField in structType.Fields)
+                AddFieldElements(childField, elements);
+        }
+        else
+        {
+            elements.Add(ToSchemaElement(field));
+        }
+    }
+
+    /// <summary>
+    /// Converts a single primitive Arrow field to a Parquet SchemaElement.
     /// </summary>
     public static SchemaElement ToSchemaElement(Field field)
     {
@@ -56,37 +81,14 @@ internal static class ParquetSchemaConverter
 
     /// <summary>
     /// Builds a list of <see cref="ColumnDescriptor"/> from the schema elements.
+    /// Uses <see cref="SchemaDescriptor"/> to reconstruct the tree and correctly
+    /// compute definition/repetition levels for nested schemas.
     /// </summary>
     public static IReadOnlyList<ColumnDescriptor> BuildColumnDescriptors(
         IReadOnlyList<SchemaElement> schema)
     {
-        var descriptors = new List<ColumnDescriptor>();
-
-        // Skip the root element (index 0)
-        for (int i = 1; i < schema.Count; i++)
-        {
-            var element = schema[i];
-            if (!element.Type.HasValue) continue; // skip group nodes
-
-            var node = new SchemaNode
-            {
-                Element = element,
-                Children = [],
-            };
-
-            descriptors.Add(new ColumnDescriptor
-            {
-                Path = [element.Name],
-                PhysicalType = element.Type.Value,
-                TypeLength = element.TypeLength,
-                MaxDefinitionLevel = element.RepetitionType == FieldRepetitionType.Optional ? 1 : 0,
-                MaxRepetitionLevel = 0,
-                SchemaElement = element,
-                SchemaNode = node,
-            });
-        }
-
-        return descriptors;
+        var descriptor = new SchemaDescriptor(schema);
+        return descriptor.Columns;
     }
 
     private static (PhysicalType physical, LogicalType? logical, ConvertedType? converted,
