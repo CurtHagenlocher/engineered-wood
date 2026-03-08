@@ -100,4 +100,250 @@ empty_schema = {
 print("Generating empty file...")
 write_avro("empty.avro", empty_schema, [], codec='null')
 
+# --- Enum ---
+enum_schema = {
+    "type": "record",
+    "name": "EnumTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "color", "type": {
+            "type": "enum",
+            "name": "Color",
+            "symbols": ["RED", "GREEN", "BLUE"]
+        }},
+    ]
+}
+
+enum_records = [
+    {"id": i, "color": ["RED", "GREEN", "BLUE"][i % 3]}
+    for i in range(30)
+]
+
+print("Generating enum files...")
+write_avro("enum.avro", enum_schema, enum_records, codec='null')
+
+# --- Array (list) ---
+array_schema = {
+    "type": "record",
+    "name": "ArrayTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "tags", "type": {"type": "array", "items": "string"}},
+        {"name": "scores", "type": {"type": "array", "items": "int"}},
+    ]
+}
+
+array_records = [
+    {"id": i, "tags": [f"tag_{j}" for j in range(i % 4)], "scores": list(range(i % 5))}
+    for i in range(20)
+]
+
+print("Generating array files...")
+write_avro("array.avro", array_schema, array_records, codec='null')
+
+# --- Map ---
+map_schema = {
+    "type": "record",
+    "name": "MapTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "labels", "type": {"type": "map", "values": "string"}},
+        {"name": "counts", "type": {"type": "map", "values": "int"}},
+    ]
+}
+
+map_records = [
+    {
+        "id": i,
+        "labels": {f"key_{j}": f"val_{j}" for j in range(i % 3)},
+        "counts": {f"c_{j}": j * 10 for j in range(i % 4)},
+    }
+    for i in range(20)
+]
+
+print("Generating map files...")
+write_avro("map.avro", map_schema, map_records, codec='null')
+
+# --- Fixed ---
+fixed_schema = {
+    "type": "record",
+    "name": "FixedTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "hash", "type": {"type": "fixed", "name": "Hash", "size": 16}},
+    ]
+}
+
+fixed_records = [
+    {"id": i, "hash": bytes([(i + j) % 256 for j in range(16)])}
+    for i in range(20)
+]
+
+print("Generating fixed files...")
+write_avro("fixed.avro", fixed_schema, fixed_records, codec='null')
+
+# --- Nested record (struct) ---
+struct_schema = {
+    "type": "record",
+    "name": "StructTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "address", "type": {
+            "type": "record",
+            "name": "Address",
+            "fields": [
+                {"name": "street", "type": "string"},
+                {"name": "city", "type": "string"},
+                {"name": "zip", "type": "int"},
+            ]
+        }},
+    ]
+}
+
+struct_records = [
+    {"id": i, "address": {"street": f"{i} Main St", "city": f"City_{i}", "zip": 10000 + i}}
+    for i in range(20)
+]
+
+print("Generating struct files...")
+write_avro("struct.avro", struct_schema, struct_records, codec='null')
+
+# --- Logical types ---
+import datetime
+
+logical_schema = {
+    "type": "record",
+    "name": "LogicalTypes",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "date_col", "type": {"type": "int", "logicalType": "date"}},
+        {"name": "time_millis_col", "type": {"type": "int", "logicalType": "time-millis"}},
+        {"name": "time_micros_col", "type": {"type": "long", "logicalType": "time-micros"}},
+        {"name": "ts_millis_col", "type": {"type": "long", "logicalType": "timestamp-millis"}},
+        {"name": "ts_micros_col", "type": {"type": "long", "logicalType": "timestamp-micros"}},
+    ]
+}
+
+logical_records = []
+base_date = datetime.date(2024, 1, 1)
+for i in range(20):
+    d = base_date + datetime.timedelta(days=i)
+    epoch = datetime.date(1970, 1, 1)
+    days_since_epoch = (d - epoch).days
+    millis_of_day = (i * 3600 + i * 60 + i) * 1000  # h:m:s in millis
+    micros_of_day = millis_of_day * 1000
+    ts_millis = days_since_epoch * 86400000 + millis_of_day
+    ts_micros = ts_millis * 1000
+
+    logical_records.append({
+        "id": i,
+        "date_col": days_since_epoch,
+        "time_millis_col": millis_of_day,
+        "time_micros_col": micros_of_day,
+        "ts_millis_col": ts_millis,
+        "ts_micros_col": ts_micros,
+    })
+
+print("Generating logical type files...")
+write_avro("logical_types.avro", logical_schema, logical_records, codec='null')
+
+# --- Nullable enum ---
+nullable_enum_schema = {
+    "type": "record",
+    "name": "NullableEnumTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "color", "type": ["null", {
+            "type": "enum",
+            "name": "Color2",
+            "symbols": ["RED", "GREEN", "BLUE"]
+        }]},
+    ]
+}
+
+nullable_enum_records = [
+    {"id": i, "color": None if i % 3 == 0 else ["RED", "GREEN", "BLUE"][i % 3]}
+    for i in range(15)
+]
+
+print("Generating nullable enum files...")
+write_avro("nullable_enum.avro", nullable_enum_schema, nullable_enum_records, codec='null')
+
+# --- Decimal (bytes-based) ---
+import decimal as dec
+
+decimal_bytes_schema = {
+    "type": "record",
+    "name": "DecimalBytesTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "amount", "type": {"type": "bytes", "logicalType": "decimal", "precision": 10, "scale": 2}},
+    ]
+}
+
+decimal_bytes_records = [
+    {"id": i, "amount": dec.Decimal(f"{i * 100 + i}.{i:02d}")}
+    for i in range(20)
+]
+
+print("Generating decimal (bytes) files...")
+write_avro("decimal_bytes.avro", decimal_bytes_schema, decimal_bytes_records, codec='null')
+
+# --- Decimal (fixed-based) ---
+decimal_fixed_schema = {
+    "type": "record",
+    "name": "DecimalFixedTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "price", "type": {
+            "type": "fixed",
+            "name": "Price",
+            "size": 8,
+            "logicalType": "decimal",
+            "precision": 16,
+            "scale": 4,
+        }},
+    ]
+}
+
+decimal_fixed_records = [
+    {"id": i, "amount": dec.Decimal(f"{i * 1000 + i}.{i:04d}")}
+    for i in range(20)
+]
+# fastavro uses "amount" as the field name in the record but schema says "price"
+decimal_fixed_records2 = [
+    {"id": i, "price": dec.Decimal(f"{i * 1000 + i}.{i:04d}")}
+    for i in range(20)
+]
+
+print("Generating decimal (fixed) files...")
+write_avro("decimal_fixed.avro", decimal_fixed_schema, decimal_fixed_records2, codec='null')
+
+# --- UUID ---
+import uuid
+
+uuid_schema = {
+    "type": "record",
+    "name": "UuidTest",
+    "fields": [
+        {"name": "id", "type": "int"},
+        {"name": "uid", "type": {"type": "string", "logicalType": "uuid"}},
+    ]
+}
+
+uuid_records = [
+    {"id": i, "uid": str(uuid.UUID(int=i + 1))}
+    for i in range(20)
+]
+
+print("Generating UUID files...")
+write_avro("uuid.avro", uuid_schema, uuid_records, codec='null')
+
+# --- LZ4 compression ---
+print("Generating LZ4 compressed files...")
+try:
+    write_avro("primitives_lz4.avro", primitives_schema, primitives_records, codec='lz4')
+except Exception as e:
+    print(f"  LZ4 not available: {e}")
+
 print("Done!")

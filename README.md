@@ -1,6 +1,6 @@
 # EngineeredWood
 
-A .NET library for reading and writing columnar file formats — **Apache Parquet** and **Apache ORC** — as Apache Arrow `RecordBatch` objects, optimized for cloud storage.
+A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, and **Apache Avro** — as Apache Arrow `RecordBatch` objects, optimized for cloud storage.
 
 ## What
 
@@ -28,6 +28,7 @@ src/
   EngineeredWood.Core/          Shared abstractions: I/O, compression, Arrow helpers
   EngineeredWood.Parquet/       Parquet reader and writer
   EngineeredWood.Orc/           ORC reader and writer
+  EngineeredWood.Avro/          Avro reader and writer
   EngineeredWood.Azure/         Azure Blob Storage backends
 test/
   EngineeredWood.Parquet.Tests/         xUnit tests for Parquet
@@ -35,6 +36,8 @@ test/
   EngineeredWood.Parquet.Compatibility/ 92-file cross-tool validation
   EngineeredWood.Orc.Tests/             xUnit tests for ORC
   EngineeredWood.Orc.Benchmarks/        BenchmarkDotNet suites for ORC
+  EngineeredWood.Avro.Tests/            xUnit tests for Avro
+  EngineeredWood.Avro.Benchmarks/       BenchmarkDotNet suites for Avro
 ```
 
 ## Features — Parquet
@@ -114,19 +117,60 @@ All 19 ORC types are supported for both reading and writing:
 | DICTIONARY | yes | — |
 | DICTIONARY_V2 | yes | yes |
 
+## Features — Avro
+
+### Reading
+
+- Object Container File (OCF) reading with sync and async APIs
+- Fluent builder API (`AvroReaderBuilder`)
+- Schema evolution: field matching by name/alias, type promotion, default value insertion
+- Field projection by index or skip-by-name
+- Streaming via `IAsyncEnumerable<RecordBatch>`
+
+### Writing
+
+- Arrow `RecordBatch` → Avro OCF with codec selection
+- Sync and async writers
+- Explicit Avro schema or auto-inferred from Arrow schema
+
+### Streaming (non-OCF)
+
+- Push-based decoder for framed messages (`AvroDecoder`)
+- Row-level encoder with per-message framing (`AvroEncoder`)
+- Wire formats: Single Object Encoding (SOE), Confluent Schema Registry, Apicurio Registry, raw binary
+- Schema fingerprinting: CRC-64-AVRO (Rabin), MD5, SHA-256
+- `SchemaStore` for schema-by-fingerprint lookup
+
+### Types
+
+- **Primitives**: null, boolean, int, long, float, double, bytes, string
+- **Named**: record (→ StructArray), enum (→ DictionaryArray), fixed (→ FixedSizeBinaryArray)
+- **Complex**: array (→ ListArray), map (→ MapArray), union (nullable → nullable field, general → DenseUnionArray)
+- **Logical types**: date, time-millis/micros, timestamp-millis/micros/nanos (UTC and local), decimal (bytes and fixed with precision/scale → Decimal128), uuid
+
+### Compression
+
+| Codec | Read | Write |
+|---|---|---|
+| null (uncompressed) | yes | yes |
+| deflate | yes | yes |
+| snappy (with CRC32C) | yes | yes |
+| zstandard | yes | yes |
+| lz4 | yes | yes |
+
 ## Shared infrastructure
 
 ### Compression
 
-| Codec | Library | Parquet | ORC |
-|---|---|---|---|
-| Snappy | [Snappier](https://github.com/brantburnett/Snappier) — pure managed | yes (default) | yes |
-| Zstd | [ZstdSharp](https://github.com/oleg-st/ZstdSharp) — pure managed | yes | yes (default) |
-| LZ4 / LZ4_RAW | [K4os.Compression.LZ4](https://github.com/MiloszKrajewski/K4os.Compression.LZ4) | yes | yes |
-| Gzip / Zlib | System.IO.Compression | yes | yes |
-| Brotli | System.IO.Compression | yes | — |
-| Deflate | System.IO.Compression | — | yes |
-| Uncompressed | — | yes | yes |
+| Codec | Library | Parquet | ORC | Avro |
+|---|---|---|---|---|
+| Snappy | [Snappier](https://github.com/brantburnett/Snappier) — pure managed | yes (default) | yes | yes |
+| Zstd | [ZstdSharp](https://github.com/oleg-st/ZstdSharp) — pure managed | yes | yes (default) | yes |
+| LZ4 / LZ4_RAW | [K4os.Compression.LZ4](https://github.com/MiloszKrajewski/K4os.Compression.LZ4) | yes | yes | yes |
+| Gzip / Zlib | System.IO.Compression | yes | yes | — |
+| Brotli | System.IO.Compression | yes | — | — |
+| Deflate | System.IO.Compression | — | yes | yes |
+| Uncompressed | — | yes | yes | yes |
 
 ### I/O backends
 
@@ -193,6 +237,32 @@ await writer.WriteBatchAsync(recordBatch);
 await writer.CloseAsync();
 ```
 
+### Avro — Reading
+
+```csharp
+using var stream = File.OpenRead("data.avro");
+using var reader = new AvroReaderBuilder()
+    .WithBatchSize(4096)
+    .Build(stream);
+
+foreach (var batch in reader)
+{
+    // batch is an Apache.Arrow.RecordBatch
+}
+```
+
+### Avro — Writing
+
+```csharp
+using var stream = File.Create("output.avro");
+using var writer = new AvroWriterBuilder(arrowSchema)
+    .WithCompression(AvroCodec.Snappy)
+    .Build(stream);
+
+writer.Write(recordBatch);
+writer.Finish();
+```
+
 ## Building
 
 ```
@@ -208,4 +278,4 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) for a detailed guide to the source code, 
 
 ## License
 
-TBD
+Licensed under the [Apache License, Version 2.0](LICENSE).

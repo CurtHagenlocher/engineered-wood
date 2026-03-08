@@ -1,0 +1,96 @@
+using Apache.Arrow;
+using Apache.Arrow.Arrays;
+using Apache.Arrow.Types;
+using BenchmarkDotNet.Attributes;
+
+namespace EngineeredWood.Avro.Benchmarks;
+
+[MemoryDiagnoser]
+public class WriteBenchmarks
+{
+    private Apache.Arrow.Schema _schema = null!;
+    private RecordBatch _batch = null!;
+
+    [GlobalSetup]
+    public void Setup()
+    {
+        const int rowCount = 10_000;
+        var rng = new Random(42);
+
+        var intBuilder = new Int32Array.Builder();
+        var longBuilder = new Int64Array.Builder();
+        var doubleBuilder = new DoubleArray.Builder();
+        var stringBuilder = new StringArray.Builder();
+        var boolBuilder = new BooleanArray.Builder();
+
+        for (int i = 0; i < rowCount; i++)
+        {
+            intBuilder.Append(rng.Next());
+            longBuilder.Append(rng.NextInt64());
+            doubleBuilder.Append(rng.NextDouble() * 1000);
+            stringBuilder.Append($"value_{rng.Next(0, 10000)}");
+            boolBuilder.Append(rng.Next(2) == 0);
+        }
+
+        _schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("int_col", Int32Type.Default, false))
+            .Field(new Field("long_col", Int64Type.Default, false))
+            .Field(new Field("double_col", DoubleType.Default, false))
+            .Field(new Field("string_col", StringType.Default, false))
+            .Field(new Field("bool_col", BooleanType.Default, false))
+            .Build();
+
+        _batch = new RecordBatch(_schema,
+            [intBuilder.Build(), longBuilder.Build(), doubleBuilder.Build(),
+             stringBuilder.Build(), boolBuilder.Build()],
+            rowCount);
+    }
+
+    [Benchmark(Baseline = true)]
+    public long WritePrimitives_Uncompressed()
+    {
+        using var ms = new MemoryStream();
+        using var writer = new AvroWriterBuilder(_schema)
+            .WithCompression(AvroCodec.Null)
+            .Build(ms);
+        writer.Write(_batch);
+        writer.Finish();
+        return ms.Length;
+    }
+
+    [Benchmark]
+    public long WritePrimitives_Snappy()
+    {
+        using var ms = new MemoryStream();
+        using var writer = new AvroWriterBuilder(_schema)
+            .WithCompression(AvroCodec.Snappy)
+            .Build(ms);
+        writer.Write(_batch);
+        writer.Finish();
+        return ms.Length;
+    }
+
+    [Benchmark]
+    public long WritePrimitives_Deflate()
+    {
+        using var ms = new MemoryStream();
+        using var writer = new AvroWriterBuilder(_schema)
+            .WithCompression(AvroCodec.Deflate)
+            .Build(ms);
+        writer.Write(_batch);
+        writer.Finish();
+        return ms.Length;
+    }
+
+    [Benchmark]
+    public long WritePrimitives_Zstandard()
+    {
+        using var ms = new MemoryStream();
+        using var writer = new AvroWriterBuilder(_schema)
+            .WithCompression(AvroCodec.Zstandard)
+            .Build(ms);
+        writer.Write(_batch);
+        writer.Finish();
+        return ms.Length;
+    }
+}

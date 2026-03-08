@@ -13,6 +13,7 @@ public sealed class AvroWriterBuilder
     private string _recordName = "Record";
     private string? _recordNamespace;
     private AvroSchema? _explicitAvroSchema;
+    private FingerprintStrategy? _fingerprintStrategy;
 
     public AvroWriterBuilder(Apache.Arrow.Schema arrowSchema)
     {
@@ -44,19 +45,63 @@ public sealed class AvroWriterBuilder
     /// <summary>Build a synchronous OCF writer targeting the given stream.</summary>
     public AvroWriter Build(Stream output)
     {
-        AvroRecordSchema avroRecord;
+        var avroRecord = ResolveAvroSchema();
+        var ocf = new OcfWriter(output, _codec);
+        return new AvroWriter(ocf, _arrowSchema, avroRecord);
+    }
+
+    /// <summary>Build an asynchronous OCF writer targeting the given stream.</summary>
+    public async ValueTask<AvroAsyncWriter> BuildAsync(Stream output, CancellationToken ct = default)
+    {
+        var avroRecord = ResolveAvroSchema();
+        var ocf = new OcfWriterAsync(output, _codec);
+        await ocf.WriteHeaderAsync(avroRecord, ct).ConfigureAwait(false);
+        return new AvroAsyncWriter(ocf, _arrowSchema, avroRecord);
+    }
+
+    /// <summary>
+    /// Sets a fingerprint strategy for building an <see cref="AvroEncoder"/> (SOE, Confluent, or Apicurio).
+    /// </summary>
+    public AvroWriterBuilder WithFingerprintStrategy(FingerprintStrategy strategy)
+    {
+        _fingerprintStrategy = strategy ?? throw new ArgumentNullException(nameof(strategy));
+        return this;
+    }
+
+    /// <summary>
+    /// Build an <see cref="AvroEncoder"/> for row-level encoding with wire format framing.
+    /// Requires <see cref="WithFingerprintStrategy"/> to be called first.
+    /// </summary>
+    public AvroEncoder BuildEncoder()
+    {
+        if (_fingerprintStrategy is null)
+            throw new InvalidOperationException(
+                "A fingerprint strategy must be set via WithFingerprintStrategy() before calling BuildEncoder().");
+
+        var avroRecord = ResolveAvroSchema();
+        var avroSchema = ResolveAvroSchemaObject(avroRecord);
+
+        return new AvroEncoder(_arrowSchema, avroSchema, avroRecord, _fingerprintStrategy);
+    }
+
+    private AvroRecordSchema ResolveAvroSchema()
+    {
         if (_explicitAvroSchema != null)
         {
             if (_explicitAvroSchema.Parsed is not AvroRecordSchema r)
                 throw new InvalidOperationException("Explicit Avro schema must be a record.");
-            avroRecord = r;
-        }
-        else
-        {
-            avroRecord = ArrowSchemaConverter.FromArrow(_arrowSchema, _recordName, _recordNamespace);
+            return r;
         }
 
-        var ocf = new OcfWriter(output, _codec);
-        return new AvroWriter(ocf, _arrowSchema, avroRecord);
+        return ArrowSchemaConverter.FromArrow(_arrowSchema, _recordName, _recordNamespace);
+    }
+
+    private AvroSchema ResolveAvroSchemaObject(AvroRecordSchema avroRecord)
+    {
+        if (_explicitAvroSchema != null)
+            return _explicitAvroSchema;
+
+        var json = AvroSchemaWriter.ToJson(avroRecord);
+        return new AvroSchema(json);
     }
 }

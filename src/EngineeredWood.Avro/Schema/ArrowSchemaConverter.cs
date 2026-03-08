@@ -56,7 +56,7 @@ internal static class ArrowSchemaConverter
 
             case AvroFixedSchema f:
                 if (f.LogicalType == "decimal")
-                    return (new Decimal128Type(38, 18), false); // default precision/scale
+                    return (new Decimal128Type(f.Precision ?? 38, f.Scale ?? 0), false);
                 return (new FixedSizeBinaryType(f.Size), false);
 
             case AvroUnionSchema u:
@@ -97,6 +97,8 @@ internal static class ArrowSchemaConverter
                 "local-timestamp-millis" => new TimestampType(TimeUnit.Millisecond, (string?)null),
                 "local-timestamp-micros" => new TimestampType(TimeUnit.Microsecond, (string?)null),
                 "local-timestamp-nanos" => new TimestampType(TimeUnit.Nanosecond, (string?)null),
+                "decimal" => new Decimal128Type(p.Precision ?? 38, p.Scale ?? 0),
+                "uuid" => StringType.Default, // UUID is a string logical type per Avro spec
                 _ => ToArrowBasePrimitive(p.Type), // Unknown logical type: fall through to base
             };
         }
@@ -160,10 +162,14 @@ internal static class ArrowSchemaConverter
             => new AvroPrimitiveSchema(AvroType.Long) { LogicalType = "local-timestamp-micros" },
         TimestampType ts when ts.Timezone == null && ts.Unit == TimeUnit.Nanosecond
             => new AvroPrimitiveSchema(AvroType.Long) { LogicalType = "local-timestamp-nanos" },
+        Decimal128Type dec => new AvroFixedSchema("decimal", null, dec.ByteWidth)
+            { LogicalType = "decimal", Precision = dec.Precision, Scale = dec.Scale },
         FixedSizeBinaryType fb => new AvroFixedSchema("fixed", null, fb.ByteWidth),
+        DictionaryType dt => new AvroEnumSchema("Enum", null, []),
         StructType st => FromArrowStruct(st),
         ListType lt => new AvroArraySchema(FromArrowField(lt.ValueField)),
         MapType mt => new AvroMapSchema(FromArrowField(mt.ValueField)),
+        UnionType ut => new AvroUnionSchema(ut.Fields.Select(f => FromArrowType(f.DataType)).ToList()),
         _ => throw new NotSupportedException($"Arrow type {type} is not yet supported for Avro conversion."),
     };
 
@@ -175,6 +181,8 @@ internal static class ArrowSchemaConverter
         return avroType;
     }
 
+    private static int _structCounter;
+
     private static AvroRecordSchema FromArrowStruct(StructType st)
     {
         var fields = new List<AvroFieldNode>();
@@ -185,6 +193,7 @@ internal static class ArrowSchemaConverter
                 avroType = new AvroUnionSchema([AvroPrimitiveSchema.Null, avroType]);
             fields.Add(new AvroFieldNode(f.Name, avroType));
         }
-        return new AvroRecordSchema("Record", null, fields);
+        var name = $"Struct{Interlocked.Increment(ref _structCounter)}";
+        return new AvroRecordSchema(name, null, fields);
     }
 }

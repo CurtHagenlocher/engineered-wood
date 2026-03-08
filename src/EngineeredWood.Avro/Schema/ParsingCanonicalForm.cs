@@ -3,17 +3,21 @@ using System.Text.Json;
 namespace EngineeredWood.Avro.Schema;
 
 /// <summary>
-/// Serializes an <see cref="AvroSchemaNode"/> tree back to JSON.
+/// Computes the Parsing Canonical Form (PCF) of an Avro schema per the Avro specification.
+/// The PCF is a normalized JSON representation used to compute schema fingerprints.
 /// </summary>
-internal static class AvroSchemaWriter
+internal static class ParsingCanonicalForm
 {
-    public static string ToJson(AvroSchemaNode node)
+    /// <summary>
+    /// Returns the Parsing Canonical Form JSON string for the given schema node.
+    /// </summary>
+    public static string ToCanonicalJson(AvroSchemaNode schema)
     {
         using var ms = new MemoryStream();
-        using (var writer = new Utf8JsonWriter(ms))
+        using (var writer = new Utf8JsonWriter(ms, new JsonWriterOptions { Indented = false }))
         {
             var namedTypes = new HashSet<string>();
-            WriteNode(writer, node, namedTypes);
+            WriteNode(writer, schema, namedTypes);
         }
         return System.Text.Encoding.UTF8.GetString(ms.ToArray());
     }
@@ -23,14 +27,17 @@ internal static class AvroSchemaWriter
         switch (node)
         {
             case AvroPrimitiveSchema p:
-                WritePrimitive(writer, p);
+                writer.WriteStringValue(PrimitiveTypeName(p.Type));
                 break;
+
             case AvroRecordSchema r:
                 WriteRecord(writer, r, namedTypes);
                 break;
+
             case AvroEnumSchema e:
                 WriteEnum(writer, e, namedTypes);
                 break;
+
             case AvroArraySchema a:
                 writer.WriteStartObject();
                 writer.WriteString("type", "array");
@@ -38,6 +45,7 @@ internal static class AvroSchemaWriter
                 WriteNode(writer, a.Items, namedTypes);
                 writer.WriteEndObject();
                 break;
+
             case AvroMapSchema m:
                 writer.WriteStartObject();
                 writer.WriteString("type", "map");
@@ -45,9 +53,11 @@ internal static class AvroSchemaWriter
                 WriteNode(writer, m.Values, namedTypes);
                 writer.WriteEndObject();
                 break;
+
             case AvroFixedSchema f:
                 WriteFixed(writer, f, namedTypes);
                 break;
+
             case AvroUnionSchema u:
                 writer.WriteStartArray();
                 foreach (var branch in u.Branches)
@@ -57,52 +67,28 @@ internal static class AvroSchemaWriter
         }
     }
 
-    private static void WritePrimitive(Utf8JsonWriter writer, AvroPrimitiveSchema p)
-    {
-        if (p.LogicalType != null)
-        {
-            writer.WriteStartObject();
-            writer.WriteString("type", PrimitiveTypeName(p.Type));
-            writer.WriteString("logicalType", p.LogicalType);
-            if (p.Precision.HasValue)
-                writer.WriteNumber("precision", p.Precision.Value);
-            if (p.Scale.HasValue)
-                writer.WriteNumber("scale", p.Scale.Value);
-            writer.WriteEndObject();
-        }
-        else
-        {
-            writer.WriteStringValue(PrimitiveTypeName(p.Type));
-        }
-    }
-
     private static void WriteRecord(Utf8JsonWriter writer, AvroRecordSchema r, HashSet<string> namedTypes)
     {
         if (!namedTypes.Add(r.FullName))
         {
-            // Already defined — emit as a reference
+            // Already defined — emit as a reference by full name
             writer.WriteStringValue(r.FullName);
             return;
         }
 
         writer.WriteStartObject();
+        // Canonical order for records: name, type, fields
+        writer.WriteString("name", r.FullName);
         writer.WriteString("type", "record");
-        writer.WriteString("name", r.Name);
-        if (r.Namespace != null)
-            writer.WriteString("namespace", r.Namespace);
-
         writer.WriteStartArray("fields");
         foreach (var field in r.Fields)
         {
             writer.WriteStartObject();
+            // Canonical order for fields: name, type
             writer.WriteString("name", field.Name);
             writer.WritePropertyName("type");
             WriteNode(writer, field.Schema, namedTypes);
-            if (field.Default.HasValue)
-            {
-                writer.WritePropertyName("default");
-                field.Default.Value.WriteTo(writer);
-            }
+            // No default, doc, aliases, order in canonical form
             writer.WriteEndObject();
         }
         writer.WriteEndArray();
@@ -118,16 +104,13 @@ internal static class AvroSchemaWriter
         }
 
         writer.WriteStartObject();
+        // Canonical order for enums: name, type, symbols
+        writer.WriteString("name", e.FullName);
         writer.WriteString("type", "enum");
-        writer.WriteString("name", e.Name);
-        if (e.Namespace != null)
-            writer.WriteString("namespace", e.Namespace);
         writer.WriteStartArray("symbols");
         foreach (var sym in e.Symbols)
             writer.WriteStringValue(sym);
         writer.WriteEndArray();
-        if (e.Default != null)
-            writer.WriteString("default", e.Default);
         writer.WriteEndObject();
     }
 
@@ -140,19 +123,10 @@ internal static class AvroSchemaWriter
         }
 
         writer.WriteStartObject();
+        // Canonical order for fixed: name, type, size
+        writer.WriteString("name", f.FullName);
         writer.WriteString("type", "fixed");
-        writer.WriteString("name", f.Name);
-        if (f.Namespace != null)
-            writer.WriteString("namespace", f.Namespace);
         writer.WriteNumber("size", f.Size);
-        if (f.LogicalType != null)
-        {
-            writer.WriteString("logicalType", f.LogicalType);
-            if (f.Precision.HasValue)
-                writer.WriteNumber("precision", f.Precision.Value);
-            if (f.Scale.HasValue)
-                writer.WriteNumber("scale", f.Scale.Value);
-        }
         writer.WriteEndObject();
     }
 

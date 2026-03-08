@@ -1,4 +1,5 @@
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
 using Apache.Arrow.Types;
 
 namespace EngineeredWood.Avro.Tests;
@@ -242,6 +243,248 @@ public class AvroRoundTripTests
         return result;
     }
 
+    [Fact]
+    public void RoundTrip_EnumColumn()
+    {
+        var dictType = new DictionaryType(Int32Type.Default, StringType.Default, false);
+        var arrowSchema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("color", dictType, false))
+            .Build();
+
+        var dictBuilder = new StringArray.Builder();
+        dictBuilder.Append("RED");
+        dictBuilder.Append("GREEN");
+        dictBuilder.Append("BLUE");
+        var dictionary = dictBuilder.Build();
+
+        var indexBuilder = new Int32Array.Builder();
+        indexBuilder.Append(0); // RED
+        indexBuilder.Append(1); // GREEN
+        indexBuilder.Append(2); // BLUE
+        indexBuilder.Append(0); // RED
+        var indices = indexBuilder.Build();
+
+        var dictArray = new DictionaryArray(dictType, indices, dictionary);
+        var batch = new RecordBatch(arrowSchema, [dictArray], 4);
+
+        // Must provide Avro schema explicitly since Arrow DictionaryType doesn't carry symbols
+        var avroSchemaJson = """
+        {
+            "type": "record",
+            "name": "Test",
+            "fields": [
+                {"name": "color", "type": {"type": "enum", "name": "Color", "symbols": ["RED", "GREEN", "BLUE"]}}
+            ]
+        }
+        """;
+
+        using var ms = new MemoryStream();
+        using (var writer = new AvroWriterBuilder(arrowSchema)
+            .WithAvroSchema(new AvroSchema(avroSchemaJson))
+            .Build(ms))
+        {
+            writer.Write(batch);
+            writer.Finish();
+        }
+
+        ms.Position = 0;
+        using var reader = new AvroReaderBuilder().Build(ms);
+        var result = reader.ReadNextBatch()!;
+
+        Assert.Equal(4, result.Length);
+        var resultDict = (DictionaryArray)result.Column(0);
+        var resultIndices = (Int32Array)resultDict.Indices;
+        Assert.Equal(0, resultIndices.GetValue(0));
+        Assert.Equal(1, resultIndices.GetValue(1));
+        Assert.Equal(2, resultIndices.GetValue(2));
+        Assert.Equal(0, resultIndices.GetValue(3));
+    }
+
+    [Fact]
+    public void RoundTrip_ArrayColumn()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("tags", new ListType(StringType.Default), false))
+            .Build();
+
+        var valueBuilder = new StringArray.Builder();
+        var offsetBuilder = new List<int> { 0 };
+
+        // Row 0: ["a", "b"]
+        valueBuilder.Append("a");
+        valueBuilder.Append("b");
+        offsetBuilder.Add(2);
+
+        // Row 1: []
+        offsetBuilder.Add(2);
+
+        // Row 2: ["c"]
+        valueBuilder.Append("c");
+        offsetBuilder.Add(3);
+
+        var listArray = new ListArray(new ListType(StringType.Default),
+            3, ToOffsetBuffer(offsetBuilder),
+            valueBuilder.Build(), ArrowBuffer.Empty);
+        var batch = new RecordBatch(schema, [listArray], 3);
+        var result = WriteAndRead(schema, batch, AvroCodec.Null);
+
+        Assert.Equal(3, result.Length);
+        var resultList = (ListArray)result.Column(0);
+        Assert.Equal(2, resultList.GetValueLength(0)); // ["a", "b"]
+        Assert.Equal(0, resultList.GetValueLength(1)); // []
+        Assert.Equal(1, resultList.GetValueLength(2)); // ["c"]
+
+        var values = (StringArray)resultList.Values;
+        Assert.Equal("a", values.GetString(0));
+        Assert.Equal("b", values.GetString(1));
+        Assert.Equal("c", values.GetString(2));
+    }
+
+    [Fact]
+    public void RoundTrip_MapColumn()
+    {
+        var mapType = new MapType(StringType.Default, Int32Type.Default);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("labels", mapType, false))
+            .Build();
+
+        var keyBuilder = new StringArray.Builder();
+        var valueBuilder = new Int32Array.Builder();
+        var offsets = new List<int> { 0 };
+
+        // Row 0: {"x": 1, "y": 2}
+        keyBuilder.Append("x");
+        valueBuilder.Append(1);
+        keyBuilder.Append("y");
+        valueBuilder.Append(2);
+        offsets.Add(2);
+
+        // Row 1: {}
+        offsets.Add(2);
+
+        // Row 2: {"z": 3}
+        keyBuilder.Append("z");
+        valueBuilder.Append(3);
+        offsets.Add(3);
+
+        var structType = new StructType([
+            new Field("key", StringType.Default, false),
+            new Field("value", Int32Type.Default, true),
+        ]);
+        var structArray = new StructArray(structType, 3,
+            [keyBuilder.Build(), valueBuilder.Build()], ArrowBuffer.Empty);
+
+        var mapArray = new MapArray(mapType, 3,
+            ToOffsetBuffer(offsets), structArray, ArrowBuffer.Empty);
+        var batch = new RecordBatch(schema, [mapArray], 3);
+        var result = WriteAndRead(schema, batch, AvroCodec.Null);
+
+        Assert.Equal(3, result.Length);
+        var resultMap = (MapArray)result.Column(0);
+        Assert.Equal(2, resultMap.GetValueLength(0));
+        Assert.Equal(0, resultMap.GetValueLength(1));
+        Assert.Equal(1, resultMap.GetValueLength(2));
+    }
+
+    [Fact]
+    public void RoundTrip_FixedColumn()
+    {
+        var fixedType = new FixedSizeBinaryType(4);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("hash", fixedType, false))
+            .Build();
+
+        var values = new byte[] { 1, 2, 3, 4, 5, 6, 7, 8 }; // 2 values of size 4
+        var data = new ArrayData(fixedType, 2, 0, 0,
+            [ArrowBuffer.Empty, new ArrowBuffer(values)]);
+        var fixedArray = ArrowArrayFactory.BuildArray(data);
+
+        var batch = new RecordBatch(schema, [fixedArray], 2);
+        var result = WriteAndRead(schema, batch, AvroCodec.Null);
+
+        Assert.Equal(2, result.Length);
+        var resultFixed = (FixedSizeBinaryArray)result.Column(0);
+        Assert.Equal(new byte[] { 1, 2, 3, 4 }, resultFixed.GetBytes(0).ToArray());
+        Assert.Equal(new byte[] { 5, 6, 7, 8 }, resultFixed.GetBytes(1).ToArray());
+    }
+
+    [Fact]
+    public void RoundTrip_StructColumn()
+    {
+        var structType = new StructType([
+            new Field("city", StringType.Default, false),
+            new Field("zip", Int32Type.Default, false),
+        ]);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("address", structType, false))
+            .Build();
+
+        var cityBuilder = new StringArray.Builder();
+        cityBuilder.Append("NYC");
+        cityBuilder.Append("LA");
+        var zipBuilder = new Int32Array.Builder();
+        zipBuilder.Append(10001);
+        zipBuilder.Append(90001);
+
+        var structArray = new StructArray(structType, 2,
+            [cityBuilder.Build(), zipBuilder.Build()], ArrowBuffer.Empty);
+        var batch = new RecordBatch(schema, [structArray], 2);
+        var result = WriteAndRead(schema, batch, AvroCodec.Null);
+
+        Assert.Equal(2, result.Length);
+        var resultStruct = (StructArray)result.Column(0);
+        var cities = (StringArray)resultStruct.Fields[0];
+        var zips = (Int32Array)resultStruct.Fields[1];
+        Assert.Equal("NYC", cities.GetString(0));
+        Assert.Equal("LA", cities.GetString(1));
+        Assert.Equal(10001, zips.GetValue(0));
+        Assert.Equal(90001, zips.GetValue(1));
+    }
+
+    [Fact]
+    public void RoundTrip_DateColumn()
+    {
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("d", Date32Type.Default, false))
+            .Build();
+
+        var builder = new Date32Array.Builder();
+        builder.Append(new DateOnly(2024, 1, 15));
+        builder.Append(new DateOnly(1970, 1, 1));
+        builder.Append(new DateOnly(2000, 6, 30));
+
+        var batch = new RecordBatch(schema, [builder.Build()], 3);
+        var result = WriteAndRead(schema, batch, AvroCodec.Null);
+
+        Assert.Equal(3, result.Length);
+        var src = (Date32Array)batch.Column(0);
+        var dst = (Date32Array)result.Column(0);
+        for (int i = 0; i < 3; i++)
+            Assert.Equal(src.GetDateOnly(i), dst.GetDateOnly(i));
+    }
+
+    [Fact]
+    public void RoundTrip_TimestampColumn()
+    {
+        var tsType = new TimestampType(TimeUnit.Millisecond, (string?)null);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("ts", tsType, false))
+            .Build();
+
+        var builder = new TimestampArray.Builder(tsType);
+        builder.Append(DateTimeOffset.UnixEpoch);
+        builder.Append(new DateTimeOffset(2024, 6, 15, 12, 30, 0, TimeSpan.Zero));
+
+        var batch = new RecordBatch(schema, [builder.Build()], 2);
+        var result = WriteAndRead(schema, batch, AvroCodec.Null);
+
+        Assert.Equal(2, result.Length);
+        var src = (TimestampArray)batch.Column(0);
+        var dst = (TimestampArray)result.Column(0);
+        Assert.Equal(src.GetValue(0), dst.GetValue(0));
+        Assert.Equal(src.GetValue(1), dst.GetValue(1));
+    }
+
     private static void AssertBatchesEqual(RecordBatch expected, RecordBatch actual)
     {
         Assert.Equal(expected.Length, actual.Length);
@@ -280,5 +523,13 @@ public class AvroRoundTripTests
                 }
             }
         }
+    }
+
+    private static ArrowBuffer ToOffsetBuffer(List<int> offsets)
+    {
+        var bytes = new byte[offsets.Count * 4];
+        for (int i = 0; i < offsets.Count; i++)
+            BitConverter.TryWriteBytes(bytes.AsSpan(i * 4), offsets[i]);
+        return new ArrowBuffer(bytes);
     }
 }

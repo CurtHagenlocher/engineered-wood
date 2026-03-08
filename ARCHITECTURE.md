@@ -24,6 +24,11 @@ src/
     Encoders/                     RLE v1/v2, boolean, dictionary encoders
     Readers/                      Per-type column readers
     Writers/                      Per-type column writers
+  EngineeredWood.Avro/            Avro format implementation (~34 source files)
+    Schema/                       Schema parsing, resolution, fingerprinting
+    Container/                    OCF read/write (sync + async)
+    Data/                         RecordBatch assembly/encoding
+    Encoding/                     AvroBinaryReader/Writer (ref struct)
   EngineeredWood.Azure/           Azure Blob Storage backends
     IO/Azure/                     AzureBlobRandomAccessFile, AzureBlobSequentialFile
 test/
@@ -32,6 +37,8 @@ test/
   EngineeredWood.Parquet.Compatibility/  92-file cross-tool validation
   EngineeredWood.Orc.Tests/              xUnit tests for ORC
   EngineeredWood.Orc.Benchmarks/         BenchmarkDotNet suites for ORC
+  EngineeredWood.Avro.Tests/             xUnit tests for Avro
+  EngineeredWood.Avro.Benchmarks/        BenchmarkDotNet suites for Avro
 parquet-testing/                         Git submodule with 100+ Parquet sample files
 ```
 
@@ -183,6 +190,81 @@ Dictionary encoding is attempted first (unless disabled or Boolean). Cardinality
 
 ---
 
+## Avro (`EngineeredWood.Avro`)
+
+EngineeredWood.Avro reads and writes Apache Avro Object Container Files (OCF) and framed streaming messages, producing Arrow `RecordBatch` objects.
+
+### Schema
+
+The schema layer parses Avro JSON schemas into an `AvroSchemaNode` tree, supporting all Avro types: primitives (null, boolean, int, long, float, double, bytes, string), named types (record, enum, fixed), and complex types (array, map, union). Logical types include date, time-millis/micros, timestamp-millis/micros/nanos (UTC and local variants), decimal (bytes and fixed, with precision/scale), and uuid.
+
+- **`AvroSchemaParser`** — Recursive JSON parser with named type resolution and self-referencing schema support.
+- **`AvroSchemaWriter`** — Serializes schema tree back to JSON, including logical type parameters (e.g. decimal precision/scale).
+- **`ArrowSchemaConverter`** — Bidirectional Avro ↔ Arrow type mapping. Handles Decimal128Type, DictionaryType (for enums), unions (nullable → nullable field, general → DenseUnion), and all temporal types.
+- **`SchemaResolver`** — Schema evolution per Avro spec: field matching by name/alias, type promotion (int→long/float/double, long→float/double, float→double, string↔bytes), default value insertion for missing reader fields, writer field skipping.
+- **`ParsingCanonicalForm`** — Computes PCF (normalized JSON) for fingerprinting.
+- **`RabinFingerprint`** — CRC-64-AVRO with precomputed 256-entry lookup table.
+
+### Container layer
+
+- **`OcfReader` / `OcfReaderAsync`** — Read OCF header (magic, metadata, sync marker), decompress blocks, yield raw data spans.
+- **`OcfWriter` / `OcfWriterAsync`** — Write OCF header, compress and frame data blocks.
+
+### Read pipeline
+
+```
+AvroReaderBuilder
+  ├─ Build(Stream) → AvroReader (sync, IEnumerable<RecordBatch>)
+  └─ BuildAsync(Stream) → AvroAsyncReader (async, IAsyncEnumerable<RecordBatch>)
+       └─ OcfReader reads blocks
+            └─ RecordBatchAssembler.DecodeBlock()
+                 ├─ AvroBinaryReader (ref struct, zero-alloc varint/LE primitives)
+                 ├─ Per-type builders: primitive, Date32, Timestamp, Enum, Fixed,
+                 │   Decimal (fixed/bytes), Array, Map, Struct, DenseUnion
+                 ├─ NullableBuilder wraps builders for ["null", T] unions
+                 └─ PromotingBuilders for schema evolution (8 promotion types)
+```
+
+### Write pipeline
+
+```
+AvroWriterBuilder
+  ├─ Build(Stream) → AvroWriter (sync)
+  └─ BuildAsync(Stream) → AvroAsyncWriter (async)
+       └─ OcfWriter writes blocks
+            └─ RecordBatchEncoder.Encode()
+                 ├─ AvroBinaryWriter (varint, LE float/double, length-prefixed bytes)
+                 └─ Per-type dispatch: primitive, logical types, enum, fixed,
+                     decimal (fixed/bytes), array, map, struct, DenseUnion
+```
+
+### Streaming encode/decode
+
+For framed (non-OCF) messages, the library supports multiple wire formats:
+
+- **Single Object Encoding (SOE)** — `[0xC3, 0x01]` + 8-byte LE Rabin fingerprint + datum
+- **Confluent** — `[0x00]` + 4-byte BE schema ID + datum
+- **Apicurio** — `[0x00]` + 8-byte BE global ID + datum
+- **Raw binary** — Bare datum (requires pre-set fingerprint)
+
+`AvroEncoder` encodes `RecordBatch` rows into `EncodedRows` with per-row message framing. `AvroDecoder` is a push-based streaming decoder that looks up schemas in a `SchemaStore` and auto-flushes on batch limit or schema switch.
+
+### Compression
+
+| Codec | Library | Notes |
+|---|---|---|
+| Null | — | Passthrough |
+| Deflate | System.IO.Compression | Raw deflate (RFC 1951) |
+| Snappy | Snappier (via Core) | Snappy block + 4-byte big-endian CRC32C |
+| Zstandard | ZstdSharp.Port (via Core) | Frame format with embedded size |
+| LZ4 | K4os.Compression.LZ4 (via Core) | 4-byte LE uncompressed size prefix + LZ4 block |
+
+### Projection
+
+Field projection is supported via `WithProjection(int[])` (select by index) or `WithSkipFields(string[])` (exclude by name). Both construct a projected reader schema and leverage the schema resolution mechanism to skip unwanted fields during decode.
+
+---
+
 ## ORC (`EngineeredWood.Orc`)
 
 ### Metadata
@@ -282,7 +364,8 @@ Pattern match ordering matters: `Decimal32/64/128/256Type` all inherit from `Fix
 
 - **Parquet:** `TestData.cs` locates the `parquet-testing/data/` submodule by walking up from `AppContext.BaseDirectory`. Sweep tests iterate all sample files, skip encrypted/malformed, collect failures, assert none. The `EngineeredWood.Parquet.Compatibility` project downloads 92 files from fastparquet, parquet-dotnet, parquet-tools, and HuggingFace and validates all row groups. Decoder/encoder tests use both unit-level checks and round-trip verification against ParquetSharp.
 - **ORC:** Test data files (.orc) are included directly in the test project. `CrossValidationTests` validates round-trip correctness against PyArrow's ORC implementation when available.
+- **Avro:** Test data generated by a Python script (`generate_test_data.py`) using fastavro. Cross-validation tests verify both directions: fastavro writes → EngineeredWood reads, and EngineeredWood writes → fastavro reads. Coverage includes all types (primitives, nullable, enum, array, map, fixed, struct, decimal, uuid), all codecs (null, deflate, snappy, zstandard, lz4), schema evolution, projection, and dense unions.
 
 ## Benchmarks
 
-`EngineeredWood.Parquet.Benchmarks` and `EngineeredWood.Orc.Benchmarks` contain BenchmarkDotNet suites for metadata parsing, row group reads, row group writes, and individual encodings.
+`EngineeredWood.Parquet.Benchmarks`, `EngineeredWood.Orc.Benchmarks`, and `EngineeredWood.Avro.Benchmarks` contain BenchmarkDotNet suites for reads, writes, and encodings.

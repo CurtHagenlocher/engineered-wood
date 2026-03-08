@@ -1,4 +1,3 @@
-using System.Collections;
 using Apache.Arrow;
 using EngineeredWood.Avro.Container;
 using EngineeredWood.Avro.Data;
@@ -7,11 +6,12 @@ using EngineeredWood.Avro.Schema;
 namespace EngineeredWood.Avro;
 
 /// <summary>
-/// Reads Avro Object Container Files into Arrow RecordBatches.
+/// Asynchronously reads Avro Object Container Files into Arrow RecordBatches.
+/// Block I/O is async; decoding (block data to RecordBatch) is synchronous.
 /// </summary>
-public sealed class AvroReader : IEnumerable<RecordBatch>, IDisposable
+public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDisposable
 {
-    private readonly OcfReader _ocf;
+    private readonly OcfReaderAsync _ocf;
     private readonly RecordBatchAssembler _assembler;
     private readonly int _batchSize;
 
@@ -27,7 +27,7 @@ public sealed class AvroReader : IEnumerable<RecordBatch>, IDisposable
     /// <summary>Arbitrary metadata from the OCF header.</summary>
     public IReadOnlyDictionary<string, byte[]> Metadata => _ocf.Metadata;
 
-    internal AvroReader(OcfReader ocf, int batchSize, AvroSchema? readerSchema = null)
+    internal AvroAsyncReader(OcfReaderAsync ocf, int batchSize, AvroSchema? readerSchema = null)
     {
         _ocf = ocf;
         _batchSize = batchSize;
@@ -37,7 +37,6 @@ public sealed class AvroReader : IEnumerable<RecordBatch>, IDisposable
 
         if (readerSchema != null)
         {
-            // Schema evolution: resolve writer schema against reader schema
             if (readerSchema.Parsed is not AvroRecordSchema readerRecord)
                 throw new InvalidOperationException("Reader schema must be a record type.");
 
@@ -52,24 +51,25 @@ public sealed class AvroReader : IEnumerable<RecordBatch>, IDisposable
         }
     }
 
-    /// <summary>Read the next batch, or null on EOF.</summary>
-    public RecordBatch? ReadNextBatch()
+    /// <summary>Read the next batch asynchronously, or null on EOF.</summary>
+    public async ValueTask<RecordBatch?> ReadNextBatchAsync(CancellationToken ct = default)
     {
-        var block = _ocf.ReadBlock();
+        var block = await _ocf.ReadBlockAsync(ct).ConfigureAwait(false);
         if (block == null) return null;
 
         var (data, objectCount) = block.Value;
         return _assembler.DecodeBlock(data, checked((int)objectCount));
     }
 
-    public IEnumerator<RecordBatch> GetEnumerator()
+    /// <summary>Enumerates all batches in the OCF stream.</summary>
+    public async IAsyncEnumerator<RecordBatch> GetAsyncEnumerator(
+        CancellationToken ct = default)
     {
         RecordBatch? batch;
-        while ((batch = ReadNextBatch()) != null)
+        while ((batch = await ReadNextBatchAsync(ct).ConfigureAwait(false)) != null)
             yield return batch;
     }
 
-    IEnumerator IEnumerable.GetEnumerator() => GetEnumerator();
-
-    public void Dispose() => _ocf.Dispose();
+    /// <inheritdoc />
+    public ValueTask DisposeAsync() => _ocf.DisposeAsync();
 }

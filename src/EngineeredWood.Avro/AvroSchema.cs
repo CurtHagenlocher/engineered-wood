@@ -28,6 +28,44 @@ public sealed class AvroSchema
         throw new InvalidOperationException("Only record schemas can be converted to Arrow schemas.");
     }
 
+    /// <summary>
+    /// Computes a fingerprint of this schema using the specified algorithm.
+    /// The fingerprint is computed over the Parsing Canonical Form (PCF) of the schema.
+    /// </summary>
+    public SchemaFingerprint ComputeFingerprint(FingerprintAlgorithm algorithm = FingerprintAlgorithm.Rabin)
+    {
+        var pcf = ParsingCanonicalForm.ToCanonicalJson(Parsed);
+        var pcfBytes = System.Text.Encoding.UTF8.GetBytes(pcf);
+
+        return algorithm switch
+        {
+            FingerprintAlgorithm.Rabin => new SchemaFingerprint.Rabin(RabinFingerprint.Compute(pcfBytes)),
+            FingerprintAlgorithm.MD5 => new SchemaFingerprint.MD5(System.Security.Cryptography.MD5.HashData(pcfBytes)),
+            FingerprintAlgorithm.SHA256 => new SchemaFingerprint.SHA256(System.Security.Cryptography.SHA256.HashData(pcfBytes)),
+            _ => throw new ArgumentOutOfRangeException(nameof(algorithm)),
+        };
+    }
+
+    /// <summary>
+    /// Create a projected copy keeping only the specified top-level record field indices.
+    /// </summary>
+    public AvroSchema Project(ReadOnlySpan<int> fieldIndices)
+    {
+        if (Parsed is not AvroRecordSchema record)
+            throw new InvalidOperationException("Only record schemas can be projected.");
+
+        var projectedFields = new List<AvroFieldNode>();
+        foreach (int idx in fieldIndices)
+        {
+            if (idx < 0 || idx >= record.Fields.Count)
+                throw new ArgumentOutOfRangeException(nameof(fieldIndices), $"Field index {idx} out of range.");
+            projectedFields.Add(record.Fields[idx]);
+        }
+
+        var projectedRecord = new AvroRecordSchema(record.Name, record.Namespace, projectedFields);
+        return new AvroSchema(AvroSchemaWriter.ToJson(projectedRecord));
+    }
+
     /// <summary>Create an Avro schema from an Arrow schema.</summary>
     public static AvroSchema FromArrowSchema(
         Apache.Arrow.Schema schema,

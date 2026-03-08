@@ -88,7 +88,14 @@ internal static class AvroSchemaParser
         {
             var logicalType = logicalEl.GetString();
             var baseSchema = ParseTypeName(typeName, namedTypes, enclosingNamespace);
-            return new AvroPrimitiveSchema(baseSchema.Type) { LogicalType = logicalType };
+            return new AvroPrimitiveSchema(baseSchema.Type)
+            {
+                LogicalType = logicalType,
+                Precision = logicalType == "decimal" && obj.TryGetProperty("precision", out var precEl)
+                    ? precEl.GetInt32() : null,
+                Scale = logicalType == "decimal" && obj.TryGetProperty("scale", out var scaleEl)
+                    ? scaleEl.GetInt32() : null,
+            };
         }
 
         // Check for primitive type as object (e.g. {"type": "string"})
@@ -197,10 +204,15 @@ internal static class AvroSchemaParser
         var fullName = ns != null ? $"{ns}.{name}" : name;
         var size = obj.GetProperty("size").GetInt32();
 
+        var logicalType = obj.TryGetProperty("logicalType", out var ltEl) ? ltEl.GetString() : null;
         var schema = new AvroFixedSchema(name, ns, size)
         {
             Aliases = ParseStringArray(obj, "aliases"),
-            LogicalType = obj.TryGetProperty("logicalType", out var ltEl) ? ltEl.GetString() : null,
+            LogicalType = logicalType,
+            Precision = logicalType == "decimal" && obj.TryGetProperty("precision", out var precEl)
+                ? precEl.GetInt32() : null,
+            Scale = logicalType == "decimal" && obj.TryGetProperty("scale", out var scaleEl)
+                ? scaleEl.GetInt32() : null,
         };
 
         namedTypes[fullName] = schema;

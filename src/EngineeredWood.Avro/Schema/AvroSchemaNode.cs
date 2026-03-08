@@ -36,6 +36,12 @@ internal sealed class AvroPrimitiveSchema : AvroSchemaNode
 {
     public override AvroType Type { get; }
 
+    /// <summary>Decimal precision (total digits). Only meaningful when LogicalType is "decimal".</summary>
+    public int? Precision { get; init; }
+
+    /// <summary>Decimal scale (digits after decimal point). Only meaningful when LogicalType is "decimal".</summary>
+    public int? Scale { get; init; }
+
     public AvroPrimitiveSchema(AvroType type)
     {
         Type = type;
@@ -139,6 +145,12 @@ internal sealed class AvroFixedSchema : AvroSchemaNode
     public string FullName => Namespace != null ? $"{Namespace}.{Name}" : Name;
     public int Size { get; }
     public IReadOnlyList<string> Aliases { get; init; } = [];
+
+    /// <summary>Decimal precision (total digits). Only meaningful when LogicalType is "decimal".</summary>
+    public int? Precision { get; init; }
+
+    /// <summary>Decimal scale (digits after decimal point). Only meaningful when LogicalType is "decimal".</summary>
+    public int? Scale { get; init; }
 
     public AvroFixedSchema(string name, string? ns, int size)
     {

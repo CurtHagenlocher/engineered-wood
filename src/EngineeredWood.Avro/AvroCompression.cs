@@ -18,6 +18,9 @@ internal static class AvroCompression
         if (codec == AvroCodec.Snappy)
             return CompressSnappy(data);
 
+        if (codec == AvroCodec.Lz4)
+            return CompressLz4(data);
+
         var coreCodec = ToCoreCodec(codec);
         int maxLen = Compressor.GetMaxCompressedLength(coreCodec, data.Length);
         var output = new byte[maxLen];
@@ -32,6 +35,9 @@ internal static class AvroCompression
 
         if (codec == AvroCodec.Snappy)
             return DecompressSnappy(data);
+
+        if (codec == AvroCodec.Lz4)
+            return DecompressLz4(data);
 
         if (codec == AvroCodec.Zstandard)
             return DecompressZstd(data);
@@ -56,6 +62,30 @@ internal static class AvroCompression
         int size = checked((int)Decompressor.GetDecompressedLength(CompressionCodec.Zstd, data));
         var output = new byte[size];
         Decompressor.Decompress(CompressionCodec.Zstd, data, output);
+        return output;
+    }
+
+    /// <summary>
+    /// Avro LZ4 = 4-byte LE uncompressed size + LZ4 block data.
+    /// Compatible with Python lz4.block.compress(store_size=True).
+    /// </summary>
+    private static byte[] CompressLz4(ReadOnlySpan<byte> data)
+    {
+        int maxLen = Compressor.GetMaxCompressedLength(CompressionCodec.Lz4, data.Length);
+        var output = new byte[4 + maxLen]; // 4-byte size prefix + compressed data
+        BinaryPrimitives.WriteInt32LittleEndian(output, data.Length);
+        int written = Compressor.Compress(CompressionCodec.Lz4, data, output.AsSpan(4));
+        return output.AsSpan(0, 4 + written).ToArray();
+    }
+
+    private static byte[] DecompressLz4(ReadOnlySpan<byte> data)
+    {
+        if (data.Length < 4)
+            throw new InvalidDataException("LZ4 data too short for size header.");
+
+        int uncompressedSize = BinaryPrimitives.ReadInt32LittleEndian(data);
+        var output = new byte[uncompressedSize];
+        Decompressor.Decompress(CompressionCodec.Lz4, data[4..], output);
         return output;
     }
 
@@ -121,6 +151,7 @@ internal static class AvroCompression
         AvroCodec.Deflate => "deflate",
         AvroCodec.Snappy => "snappy",
         AvroCodec.Zstandard => "zstandard",
+        AvroCodec.Lz4 => "lz4",
         _ => throw new ArgumentOutOfRangeException(nameof(codec)),
     };
 
@@ -130,6 +161,7 @@ internal static class AvroCompression
         "deflate" => AvroCodec.Deflate,
         "snappy" => AvroCodec.Snappy,
         "zstandard" => AvroCodec.Zstandard,
+        "lz4" => AvroCodec.Lz4,
         _ => throw new NotSupportedException($"Unknown Avro codec: '{name}'"),
     };
 }

@@ -13,4 +13,6 @@ public enum AvroCodec
     Snappy,
     /// <summary>Facebook Zstandard compression.</summary>
     Zstandard,
+    /// <summary>LZ4 block compression with 4-byte LE uncompressed size prefix.</summary>
+    Lz4,
 }
