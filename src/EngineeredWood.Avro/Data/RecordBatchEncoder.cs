@@ -1,5 +1,7 @@
+using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Arrays;
+using Apache.Arrow.Scalars;
 using Apache.Arrow.Types;
 using EngineeredWood.Avro.Encoding;
 using EngineeredWood.Avro.Schema;
@@ -107,6 +109,9 @@ internal sealed class RecordBatchEncoder
             case AvroFixedSchema f when f.LogicalType == "decimal":
                 EncodeDecimalFixed(writer, array, row, f.Size);
                 break;
+            case AvroFixedSchema f when f.LogicalType == "duration" && f.Size == 12:
+                EncodeDuration(writer, array, row);
+                break;
             case AvroFixedSchema f:
                 EncodeFixed(writer, array, row, f.Size);
                 break;
@@ -178,6 +183,9 @@ internal sealed class RecordBatchEncoder
             case "time-micros":
                 writer.WriteLong(((Time64Array)array).GetValue(row)!.Value);
                 break;
+            case "time-nanos":
+                writer.WriteLong(((Time64Array)array).GetValue(row)!.Value);
+                break;
             case "timestamp-millis" or "local-timestamp-millis":
                 writer.WriteLong(((TimestampArray)array).GetValue(row)!.Value);
                 break;
@@ -212,6 +220,22 @@ internal sealed class RecordBatchEncoder
     {
         var fixedArray = (FixedSizeBinaryArray)array;
         writer.WriteFixed(fixedArray.GetBytes(row));
+    }
+
+    /// <summary>
+    /// Encodes an Arrow MonthDayNanosecondInterval as Avro duration
+    /// (fixed 12 bytes: months u32 LE, days u32 LE, millis u32 LE).
+    /// </summary>
+    private static void EncodeDuration(AvroBinaryWriter writer, IArrowArray array, int row)
+    {
+        var intervalArray = (MonthDayNanosecondIntervalArray)array;
+        var val = intervalArray.GetValue(row)!.Value;
+
+        Span<byte> output = stackalloc byte[12];
+        BinaryPrimitives.WriteUInt32LittleEndian(output, (uint)val.Months);
+        BinaryPrimitives.WriteUInt32LittleEndian(output[4..], (uint)val.Days);
+        BinaryPrimitives.WriteUInt32LittleEndian(output[8..], (uint)(val.Nanoseconds / 1_000_000));
+        writer.WriteFixed(output);
     }
 
     private static void EncodeArray(AvroBinaryWriter writer, IArrowArray array, int row, AvroArraySchema schema)
@@ -265,7 +289,14 @@ internal sealed class RecordBatchEncoder
     {
         var fixedArray = (FixedSizeBinaryArray)array;
         var leBytes = fixedArray.GetBytes(row); // 16-byte little-endian
-        writer.WriteBytes(Decimal128ToAvroBytes(leBytes));
+
+        // Convert LE to BE and trim in-place on the stack
+        Span<byte> bigEndian = stackalloc byte[16];
+        for (int i = 0; i < 16; i++)
+            bigEndian[i] = leBytes[15 - i];
+
+        int start = TrimLeadingSignBytes(bigEndian);
+        writer.WriteBytes(bigEndian[start..]);
     }
 
     /// <summary>Converts 16-byte little-endian Arrow Decimal128 to big-endian for Avro fixed encoding.</summary>
@@ -279,26 +310,22 @@ internal sealed class RecordBatchEncoder
             bigEndian[bigEndian.Length - 1 - i] = leBytes[i];
     }
 
-    /// <summary>Converts 16-byte little-endian Arrow Decimal128 to minimal big-endian bytes for Avro bytes encoding.</summary>
-    private static ReadOnlySpan<byte> Decimal128ToAvroBytes(ReadOnlySpan<byte> leBytes)
+    /// <summary>
+    /// Returns the start index after trimming redundant leading sign-extension bytes.
+    /// The span must be big-endian two's complement.
+    /// </summary>
+    private static int TrimLeadingSignBytes(ReadOnlySpan<byte> bigEndian)
     {
-        // Convert LE to BE (full 16 bytes)
-        Span<byte> bigEndian = stackalloc byte[16];
-        for (int i = 0; i < 16; i++)
-            bigEndian[i] = leBytes[15 - i];
-
-        // Trim redundant leading bytes (matching sign extension)
         bool isNegative = (bigEndian[0] & 0x80) != 0;
         byte signByte = isNegative ? (byte)0xFF : (byte)0x00;
         int start = 0;
-        while (start < 15 && bigEndian[start] == signByte)
+        while (start < bigEndian.Length - 1 && bigEndian[start] == signByte)
         {
-            // Keep at least one byte, and don't trim if next byte's sign bit differs
             if ((bigEndian[start + 1] & 0x80) != (signByte & 0x80))
                 break;
             start++;
         }
-        return bigEndian[start..].ToArray();
+        return start;
     }
 
     private static void EncodeStruct(AvroBinaryWriter writer, IArrowArray array, int row, AvroRecordSchema schema)

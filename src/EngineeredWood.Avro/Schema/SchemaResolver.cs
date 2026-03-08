@@ -8,6 +8,7 @@ namespace EngineeredWood.Avro.Schema;
 /// </summary>
 internal static class SchemaResolver
 {
+    private const int MaxSchemaDepth = 64;
     /// <summary>
     /// Resolves a writer record schema against a reader record schema.
     /// </summary>
@@ -73,7 +74,7 @@ internal static class SchemaResolver
             int ri = writerActions[wi].ReaderFieldIndex;
             var writerFieldSchema = UnwrapNullable(writerSchema.Fields[wi].Schema);
             var readerFieldSchema = UnwrapNullable(readerSchema.Fields[ri].Schema);
-            promotions[ri] = DetectPromotion(writerFieldSchema, readerFieldSchema);
+            promotions[ri] = DetectPromotion(writerFieldSchema, readerFieldSchema, 0);
         }
 
         return new SchemaResolution(
@@ -102,8 +103,21 @@ internal static class SchemaResolver
         var w = UnwrapNullable(writerSchema);
         var r = UnwrapNullable(readerSchema);
 
-        // Same type: always OK
-        if (w.Type == r.Type) return;
+        // Same type: validate further for enums
+        if (w.Type == r.Type)
+        {
+            if (w is AvroEnumSchema we && r is AvroEnumSchema re)
+            {
+                var readerSymbolSet = new HashSet<string>(re.Symbols, StringComparer.Ordinal);
+                foreach (var sym in we.Symbols)
+                {
+                    if (!readerSymbolSet.Contains(sym) && re.Default == null)
+                        throw new InvalidOperationException(
+                            $"Writer enum symbol '{sym}' for field '{fieldName}' is not in reader schema and reader has no default.");
+                }
+            }
+            return;
+        }
 
         // Check type promotions
         if (IsPromotable(w.Type, r.Type)) return;
@@ -135,8 +149,12 @@ internal static class SchemaResolver
     /// Detects the type promotion needed for a matched field pair.
     /// Returns null if no promotion is needed (same types).
     /// </summary>
-    private static TypePromotion? DetectPromotion(AvroSchemaNode writerSchema, AvroSchemaNode readerSchema)
+    private static TypePromotion? DetectPromotion(AvroSchemaNode writerSchema, AvroSchemaNode readerSchema, int depth)
     {
+        if (depth >= MaxSchemaDepth)
+            throw new NotSupportedException(
+                "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
+
         if (writerSchema.Type == readerSchema.Type)
         {
             // Same type — check for nested record resolution
@@ -144,15 +162,21 @@ internal static class SchemaResolver
                 return new TypePromotion(PromotionKind.NestedRecord, wr, rr);
             if (writerSchema is AvroArraySchema wa && readerSchema is AvroArraySchema ra)
             {
-                var itemPromotion = DetectPromotion(UnwrapNullable(wa.Items), UnwrapNullable(ra.Items));
+                var itemPromotion = DetectPromotion(UnwrapNullable(wa.Items), UnwrapNullable(ra.Items), depth + 1);
                 if (itemPromotion != null)
                     return new TypePromotion(PromotionKind.ArrayElement, wa, ra);
             }
             if (writerSchema is AvroMapSchema wm && readerSchema is AvroMapSchema rm)
             {
-                var valPromotion = DetectPromotion(UnwrapNullable(wm.Values), UnwrapNullable(rm.Values));
+                var valPromotion = DetectPromotion(UnwrapNullable(wm.Values), UnwrapNullable(rm.Values), depth + 1);
                 if (valPromotion != null)
                     return new TypePromotion(PromotionKind.MapValue, wm, rm);
+            }
+            if (writerSchema is AvroEnumSchema we && readerSchema is AvroEnumSchema re)
+            {
+                // Check if symbol lists differ (different count or different order/content)
+                if (!we.Symbols.SequenceEqual(re.Symbols, StringComparer.Ordinal))
+                    return new TypePromotion(PromotionKind.EnumRemap, we, re);
             }
             return null;
         }
@@ -193,6 +217,7 @@ internal enum PromotionKind
     NestedRecord,
     ArrayElement,
     MapValue,
+    EnumRemap,
 }
 
 /// <summary>Describes a type promotion for a field.</summary>

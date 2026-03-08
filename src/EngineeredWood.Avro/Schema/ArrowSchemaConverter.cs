@@ -8,13 +8,15 @@ namespace EngineeredWood.Avro.Schema;
 /// </summary>
 internal static class ArrowSchemaConverter
 {
+    private const int MaxSchemaDepth = 64;
+
     /// <summary>Converts an Avro record schema to an Arrow Schema.</summary>
     public static Apache.Arrow.Schema ToArrow(AvroRecordSchema record)
     {
         var builder = new Apache.Arrow.Schema.Builder();
         foreach (var field in record.Fields)
         {
-            var (arrowType, nullable) = ToArrowType(field.Schema);
+            var (arrowType, nullable) = ToArrowType(field.Schema, 0);
             builder.Field(new Field(field.Name, arrowType, nullable));
         }
         return builder.Build();
@@ -24,8 +26,12 @@ internal static class ArrowSchemaConverter
     /// Converts an Avro schema node to an Arrow type.
     /// Returns the type and whether it is nullable.
     /// </summary>
-    public static (IArrowType type, bool nullable) ToArrowType(AvroSchemaNode node)
+    public static (IArrowType type, bool nullable) ToArrowType(AvroSchemaNode node, int depth = 0)
     {
+        if (depth >= MaxSchemaDepth)
+            throw new NotSupportedException(
+                "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
+
         switch (node)
         {
             case AvroPrimitiveSchema p:
@@ -35,7 +41,7 @@ internal static class ArrowSchemaConverter
                 var fields = new List<Field>();
                 foreach (var f in r.Fields)
                 {
-                    var (ft, fn) = ToArrowType(f.Schema);
+                    var (ft, fn) = ToArrowType(f.Schema, depth + 1);
                     fields.Add(new Field(f.Name, ft, fn));
                 }
                 return (new StructType(fields), false);
@@ -45,11 +51,11 @@ internal static class ArrowSchemaConverter
                 return (new DictionaryType(Int32Type.Default, StringType.Default, false), false);
 
             case AvroArraySchema a:
-                var (itemType, itemNullable) = ToArrowType(a.Items);
+                var (itemType, itemNullable) = ToArrowType(a.Items, depth + 1);
                 return (new ListType(new Field("item", itemType, itemNullable)), false);
 
             case AvroMapSchema m:
-                var (valType, valNullable) = ToArrowType(m.Values);
+                var (valType, valNullable) = ToArrowType(m.Values, depth + 1);
                 return (new MapType(
                     new Field("key", StringType.Default, false),
                     new Field("value", valType, valNullable)), false);
@@ -57,12 +63,14 @@ internal static class ArrowSchemaConverter
             case AvroFixedSchema f:
                 if (f.LogicalType == "decimal")
                     return (new Decimal128Type(f.Precision ?? 38, f.Scale ?? 0), false);
+                if (f.LogicalType == "duration" && f.Size == 12)
+                    return (new IntervalType(IntervalUnit.MonthDayNanosecond), false);
                 return (new FixedSizeBinaryType(f.Size), false);
 
             case AvroUnionSchema u:
                 if (u.IsNullable(out var inner, out _))
                 {
-                    var (innerType, _) = ToArrowType(inner);
+                    var (innerType, _) = ToArrowType(inner, depth + 1);
                     return (innerType, true);
                 }
                 // General union → DenseUnion
@@ -70,7 +78,7 @@ internal static class ArrowSchemaConverter
                 var typeIds = new int[u.Branches.Count];
                 for (int i = 0; i < u.Branches.Count; i++)
                 {
-                    var (bt, bn) = ToArrowType(u.Branches[i]);
+                    var (bt, bn) = ToArrowType(u.Branches[i], depth + 1);
                     unionFields.Add(new Field($"branch{i}", bt, bn));
                     typeIds[i] = i;
                 }
@@ -91,6 +99,7 @@ internal static class ArrowSchemaConverter
                 "date" => Date32Type.Default,
                 "time-millis" => new Time32Type(TimeUnit.Millisecond),
                 "time-micros" => new Time64Type(TimeUnit.Microsecond),
+                "time-nanos" => new Time64Type(TimeUnit.Nanosecond),
                 "timestamp-millis" => new TimestampType(TimeUnit.Millisecond, "UTC"),
                 "timestamp-micros" => new TimestampType(TimeUnit.Microsecond, "UTC"),
                 "timestamp-nanos" => new TimestampType(TimeUnit.Nanosecond, "UTC"),
@@ -150,6 +159,8 @@ internal static class ArrowSchemaConverter
             => new AvroPrimitiveSchema(AvroType.Int) { LogicalType = "time-millis" },
         Time64Type t when t.Unit == TimeUnit.Microsecond
             => new AvroPrimitiveSchema(AvroType.Long) { LogicalType = "time-micros" },
+        Time64Type t when t.Unit == TimeUnit.Nanosecond
+            => new AvroPrimitiveSchema(AvroType.Long) { LogicalType = "time-nanos" },
         TimestampType ts when ts.Timezone != null && ts.Unit == TimeUnit.Millisecond
             => new AvroPrimitiveSchema(AvroType.Long) { LogicalType = "timestamp-millis" },
         TimestampType ts when ts.Timezone != null && ts.Unit == TimeUnit.Microsecond
@@ -162,6 +173,8 @@ internal static class ArrowSchemaConverter
             => new AvroPrimitiveSchema(AvroType.Long) { LogicalType = "local-timestamp-micros" },
         TimestampType ts when ts.Timezone == null && ts.Unit == TimeUnit.Nanosecond
             => new AvroPrimitiveSchema(AvroType.Long) { LogicalType = "local-timestamp-nanos" },
+        IntervalType it when it.Unit == IntervalUnit.MonthDayNanosecond
+            => new AvroFixedSchema("duration", null, 12) { LogicalType = "duration" },
         Decimal128Type dec => new AvroFixedSchema("decimal", null, dec.ByteWidth)
             { LogicalType = "decimal", Precision = dec.Precision, Scale = dec.Scale },
         FixedSizeBinaryType fb => new AvroFixedSchema("fixed", null, fb.ByteWidth),

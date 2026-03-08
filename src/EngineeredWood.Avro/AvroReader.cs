@@ -15,6 +15,10 @@ public sealed class AvroReader : IEnumerable<RecordBatch>, IDisposable
     private readonly RecordBatchAssembler _assembler;
     private readonly int _batchSize;
 
+    private byte[]? _pendingBlock;
+    private int _pendingOffset;
+    private int _pendingRemaining;
+
     /// <summary>The Arrow schema for all batches produced by this reader.</summary>
     public Apache.Arrow.Schema Schema { get; }
 
@@ -55,11 +59,28 @@ public sealed class AvroReader : IEnumerable<RecordBatch>, IDisposable
     /// <summary>Read the next batch, or null on EOF.</summary>
     public RecordBatch? ReadNextBatch()
     {
-        var block = _ocf.ReadBlock();
-        if (block == null) return null;
+        if (_pendingRemaining <= 0)
+        {
+            var block = _ocf.ReadBlock();
+            if (block == null) return null;
 
-        var (data, objectCount) = block.Value;
-        return _assembler.DecodeBlock(data, checked((int)objectCount));
+            var (data, objectCount) = block.Value;
+            _pendingBlock = data;
+            _pendingOffset = 0;
+            _pendingRemaining = checked((int)objectCount);
+        }
+
+        int rowsToRead = Math.Min(_batchSize, _pendingRemaining);
+        var (batch, bytesConsumed) = _assembler.Decode(
+            _pendingBlock.AsSpan(_pendingOffset), rowsToRead);
+
+        _pendingOffset += bytesConsumed;
+        _pendingRemaining -= rowsToRead;
+
+        if (_pendingRemaining <= 0)
+            _pendingBlock = null;
+
+        return batch;
     }
 
     public IEnumerator<RecordBatch> GetEnumerator()

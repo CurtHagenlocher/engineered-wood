@@ -25,6 +25,8 @@ internal static class AvroCompression
         int maxLen = Compressor.GetMaxCompressedLength(coreCodec, data.Length);
         var output = new byte[maxLen];
         int written = Compressor.Compress(coreCodec, data, output);
+        if (written == output.Length)
+            return output;
         return output.AsSpan(0, written).ToArray();
     }
 
@@ -72,10 +74,14 @@ internal static class AvroCompression
     private static byte[] CompressLz4(ReadOnlySpan<byte> data)
     {
         int maxLen = Compressor.GetMaxCompressedLength(CompressionCodec.Lz4, data.Length);
-        var output = new byte[4 + maxLen]; // 4-byte size prefix + compressed data
-        BinaryPrimitives.WriteInt32LittleEndian(output, data.Length);
-        int written = Compressor.Compress(CompressionCodec.Lz4, data, output.AsSpan(4));
-        return output.AsSpan(0, 4 + written).ToArray();
+        // Compress into a temporary buffer, then allocate exact-sized result
+        Span<byte> temp = maxLen <= 4096 ? stackalloc byte[maxLen] : new byte[maxLen];
+        int written = Compressor.Compress(CompressionCodec.Lz4, data, temp);
+
+        var result = new byte[4 + written];
+        BinaryPrimitives.WriteInt32LittleEndian(result, data.Length);
+        temp[..written].CopyTo(result.AsSpan(4));
+        return result;
     }
 
     private static byte[] DecompressLz4(ReadOnlySpan<byte> data)
@@ -95,14 +101,16 @@ internal static class AvroCompression
     private static byte[] CompressSnappy(ReadOnlySpan<byte> data)
     {
         int maxLen = Compressor.GetMaxCompressedLength(CompressionCodec.Snappy, data.Length);
-        var output = new byte[maxLen + 4]; // +4 for CRC
-        int written = Compressor.Compress(CompressionCodec.Snappy, data, output);
+        // Compress into a temporary buffer, then allocate exact-sized result
+        Span<byte> temp = maxLen <= 4096 ? stackalloc byte[maxLen] : new byte[maxLen];
+        int written = Compressor.Compress(CompressionCodec.Snappy, data, temp);
 
-        // Append CRC32C of uncompressed data (big-endian)
+        // Allocate exact-sized output: compressed data + 4-byte CRC
+        var result = new byte[written + 4];
+        temp[..written].CopyTo(result);
         uint crc = Crc32C(data);
-        BinaryPrimitives.WriteUInt32BigEndian(output.AsSpan(written), crc);
-
-        return output.AsSpan(0, written + 4).ToArray();
+        BinaryPrimitives.WriteUInt32BigEndian(result.AsSpan(written), crc);
+        return result;
     }
 
     private static byte[] DecompressSnappy(ReadOnlySpan<byte> data)

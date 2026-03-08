@@ -15,6 +15,10 @@ public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDispo
     private readonly RecordBatchAssembler _assembler;
     private readonly int _batchSize;
 
+    private byte[]? _pendingBlock;
+    private int _pendingOffset;
+    private int _pendingRemaining;
+
     /// <summary>The Arrow schema for all batches produced by this reader.</summary>
     public Apache.Arrow.Schema Schema { get; }
 
@@ -54,11 +58,28 @@ public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDispo
     /// <summary>Read the next batch asynchronously, or null on EOF.</summary>
     public async ValueTask<RecordBatch?> ReadNextBatchAsync(CancellationToken ct = default)
     {
-        var block = await _ocf.ReadBlockAsync(ct).ConfigureAwait(false);
-        if (block == null) return null;
+        if (_pendingRemaining <= 0)
+        {
+            var block = await _ocf.ReadBlockAsync(ct).ConfigureAwait(false);
+            if (block == null) return null;
 
-        var (data, objectCount) = block.Value;
-        return _assembler.DecodeBlock(data, checked((int)objectCount));
+            var (data, objectCount) = block.Value;
+            _pendingBlock = data;
+            _pendingOffset = 0;
+            _pendingRemaining = checked((int)objectCount);
+        }
+
+        int rowsToRead = Math.Min(_batchSize, _pendingRemaining);
+        var (batch, bytesConsumed) = _assembler.Decode(
+            _pendingBlock.AsSpan(_pendingOffset), rowsToRead);
+
+        _pendingOffset += bytesConsumed;
+        _pendingRemaining -= rowsToRead;
+
+        if (_pendingRemaining <= 0)
+            _pendingBlock = null;
+
+        return batch;
     }
 
     /// <summary>Enumerates all batches in the OCF stream.</summary>

@@ -1,5 +1,9 @@
+using System.Buffers.Binary;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
+using Apache.Arrow.Arrays;
+using Apache.Arrow.Scalars;
 using Apache.Arrow.Types;
 using EngineeredWood.Avro.Encoding;
 using EngineeredWood.Avro.Schema;
@@ -11,6 +15,7 @@ namespace EngineeredWood.Avro.Data;
 /// </summary>
 internal sealed class RecordBatchAssembler
 {
+    private const int MaxSchemaDepth = 64;
     private readonly AvroRecordSchema _writerSchema;
     private readonly Apache.Arrow.Schema _arrowSchema;
     private readonly SchemaResolution? _resolution;
@@ -137,7 +142,7 @@ internal sealed class RecordBatchAssembler
 
             if (promotion != null)
             {
-                builders[ri] = CreatePromotingBuilder(field, readerFieldSchema, promotion);
+                builders[ri] = CreatePromotingBuilder(field, readerFieldSchema, promotion, 0);
             }
             else
             {
@@ -152,7 +157,7 @@ internal sealed class RecordBatchAssembler
                         break;
                     }
                 }
-                builders[ri] = CreateBuilder(field, avroSchemaForBuilder);
+                builders[ri] = CreateBuilder(field, avroSchemaForBuilder, 0);
             }
         }
 
@@ -163,8 +168,12 @@ internal sealed class RecordBatchAssembler
     /// Creates a builder that reads using writer encoding but stores in reader type.
     /// </summary>
     private static IColumnBuilder CreatePromotingBuilder(
-        Field field, AvroSchemaNode readerSchema, TypePromotion promotion)
+        Field field, AvroSchemaNode readerSchema, TypePromotion promotion, int depth)
     {
+        if (depth >= MaxSchemaDepth)
+            throw new NotSupportedException(
+                "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
+
         // Handle nullable wrapper
         bool isNullable = readerSchema is AvroUnionSchema union && union.IsNullable(out _, out _);
         int nullIndex = 0;
@@ -181,12 +190,62 @@ internal sealed class RecordBatchAssembler
             PromotionKind.FloatToDouble => new PromotingFloatToDoubleBuilder(),
             PromotionKind.StringToBytes => new PromotingStringToBytesBuilder(),
             PromotionKind.BytesToString => new PromotingBytesToStringBuilder(),
-            _ => CreateBuilder(field, readerSchema), // Nested record etc. — use standard builder
+            PromotionKind.NestedRecord => CreateResolvingStructBuilder(field, promotion, depth + 1),
+            PromotionKind.EnumRemap => new RemappingEnumBuilder(
+                (AvroEnumSchema)promotion.WriterSchema!, (AvroEnumSchema)promotion.ReaderSchema!),
+            _ => CreateBuilder(field, readerSchema, depth),
         };
 
         if (isNullable)
             return new NullableBuilder(inner, nullIndex);
         return inner;
+    }
+
+    /// <summary>
+    /// Creates a <see cref="ResolvingStructBuilder"/> that reads wire data in writer field order
+    /// but produces a StructArray in reader field order, handling field additions, removals,
+    /// and nested type promotions.
+    /// </summary>
+    private static IColumnBuilder CreateResolvingStructBuilder(Field field, TypePromotion promotion, int depth)
+    {
+        var writerRecord = (AvroRecordSchema)promotion.WriterSchema!;
+        var readerRecord = (AvroRecordSchema)promotion.ReaderSchema!;
+
+        // Resolve the nested schemas to get field mappings
+        var nestedResolution = SchemaResolver.Resolve(writerRecord, readerRecord);
+
+        // Create child builders for each reader field (in reader order)
+        var readerBuilders = new IColumnBuilder[readerRecord.Fields.Count];
+        for (int ri = 0; ri < readerRecord.Fields.Count; ri++)
+        {
+            var readerFieldSchema = readerRecord.Fields[ri].Schema;
+            var (arrowType, nullable) = ArrowSchemaConverter.ToArrowType(readerFieldSchema, depth);
+            var childField = new Field(readerRecord.Fields[ri].Name, arrowType, nullable);
+            var nestedPromotion = nestedResolution.Promotions[ri];
+
+            if (nestedPromotion != null)
+            {
+                readerBuilders[ri] = CreatePromotingBuilder(childField, readerFieldSchema, nestedPromotion, depth);
+            }
+            else
+            {
+                // Find the writer field that maps to this reader field, if any
+                AvroSchemaNode avroSchemaForBuilder = readerFieldSchema;
+                for (int wi = 0; wi < writerRecord.Fields.Count; wi++)
+                {
+                    if (!nestedResolution.WriterActions[wi].Skip &&
+                        nestedResolution.WriterActions[wi].ReaderFieldIndex == ri)
+                    {
+                        avroSchemaForBuilder = writerRecord.Fields[wi].Schema;
+                        break;
+                    }
+                }
+                readerBuilders[ri] = CreateBuilder(childField, avroSchemaForBuilder, depth);
+            }
+        }
+
+        return new ResolvingStructBuilder(
+            writerRecord, readerRecord, nestedResolution, readerBuilders);
     }
 
     private static IList<IColumnBuilder> CreateBuilders(AvroRecordSchema avroSchema, Apache.Arrow.Schema arrowSchema)
@@ -196,16 +255,20 @@ internal sealed class RecordBatchAssembler
         {
             var field = arrowSchema.FieldsList[i];
             var avroFieldSchema = avroSchema.Fields[i].Schema;
-            builders.Add(CreateBuilder(field, avroFieldSchema));
+            builders.Add(CreateBuilder(field, avroFieldSchema, 0));
         }
         return builders;
     }
 
-    private static IColumnBuilder CreateBuilder(Field field, AvroSchemaNode avroSchema)
+    private static IColumnBuilder CreateBuilder(Field field, AvroSchemaNode avroSchema, int depth)
     {
+        if (depth >= MaxSchemaDepth)
+            throw new NotSupportedException(
+                "Avro schema exceeds maximum nesting depth. Recursive schemas cannot be represented in Arrow.");
+
         // Handle nullable unions
         if (avroSchema is AvroUnionSchema union && union.IsNullable(out var inner, out int nullIndex))
-            return new NullableBuilder(CreateBuilderForType(field.DataType, inner), nullIndex);
+            return new NullableBuilder(CreateBuilderForType(field.DataType, inner, depth + 1), nullIndex);
 
         // Handle general unions → DenseUnion
         if (avroSchema is AvroUnionSchema generalUnion)
@@ -215,15 +278,15 @@ internal sealed class RecordBatchAssembler
             for (int i = 0; i < generalUnion.Branches.Count; i++)
             {
                 var branchField = unionType.Fields[i];
-                branchBuilders[i] = CreateBuilderForType(branchField.DataType, generalUnion.Branches[i]);
+                branchBuilders[i] = CreateBuilderForType(branchField.DataType, generalUnion.Branches[i], depth + 1);
             }
             return new DenseUnionBuilder(generalUnion, branchBuilders);
         }
 
-        return CreateBuilderForType(field.DataType, avroSchema);
+        return CreateBuilderForType(field.DataType, avroSchema, depth);
     }
 
-    private static IColumnBuilder CreateBuilderForType(IArrowType type, AvroSchemaNode avroSchema)
+    private static IColumnBuilder CreateBuilderForType(IArrowType type, AvroSchemaNode avroSchema, int depth)
     {
         // Check for logical types on primitives
         if (avroSchema is AvroPrimitiveSchema { LogicalType: not null } p)
@@ -233,19 +296,20 @@ internal sealed class RecordBatchAssembler
                 "date" => new Date32Builder(),
                 "time-millis" => new Time32MillisBuilder(),
                 "time-micros" => new Time64MicrosBuilder(),
+                "time-nanos" => new Time64NanosBuilder(),
                 "timestamp-millis" or "local-timestamp-millis" => new TimestampBuilder(),
                 "timestamp-micros" or "local-timestamp-micros" => new TimestampBuilder(),
                 "timestamp-nanos" or "local-timestamp-nanos" => new TimestampBuilder(),
                 "decimal" => new DecimalBytesBuilder(p.Precision ?? 38, p.Scale ?? 0),
                 "uuid" => new StringBuilder(), // UUID is a string logical type
-                _ => CreateBuilderForBaseType(type, avroSchema),
+                _ => CreateBuilderForBaseType(type, avroSchema, depth),
             };
         }
 
-        return CreateBuilderForBaseType(type, avroSchema);
+        return CreateBuilderForBaseType(type, avroSchema, depth);
     }
 
-    private static IColumnBuilder CreateBuilderForBaseType(IArrowType type, AvroSchemaNode avroSchema)
+    private static IColumnBuilder CreateBuilderForBaseType(IArrowType type, AvroSchemaNode avroSchema, int depth)
     {
         switch (avroSchema)
         {
@@ -271,22 +335,24 @@ internal sealed class RecordBatchAssembler
 
             case AvroFixedSchema f when f.LogicalType == "decimal":
                 return new DecimalFixedBuilder(f.Size, f.Precision ?? 38, f.Scale ?? 0);
+            case AvroFixedSchema f when f.LogicalType == "duration" && f.Size == 12:
+                return new DurationBuilder();
             case AvroFixedSchema f:
                 return new FixedBuilder(f.Size);
 
             case AvroArraySchema a:
             {
-                var (itemArrowType, itemNullable) = ArrowSchemaConverter.ToArrowType(a.Items);
+                var (itemArrowType, itemNullable) = ArrowSchemaConverter.ToArrowType(a.Items, depth + 1);
                 var itemBuilder = CreateBuilder(
-                    new Field("item", itemArrowType, itemNullable), a.Items);
+                    new Field("item", itemArrowType, itemNullable), a.Items, depth + 1);
                 return new ArrayBuilder(itemBuilder);
             }
 
             case AvroMapSchema m:
             {
-                var (valArrowType, valNullable) = ArrowSchemaConverter.ToArrowType(m.Values);
+                var (valArrowType, valNullable) = ArrowSchemaConverter.ToArrowType(m.Values, depth + 1);
                 var valBuilder = CreateBuilder(
-                    new Field("value", valArrowType, valNullable), m.Values);
+                    new Field("value", valArrowType, valNullable), m.Values, depth + 1);
                 return new MapBuilder(valBuilder);
             }
 
@@ -295,8 +361,8 @@ internal sealed class RecordBatchAssembler
                 var childBuilders = new List<(string name, IColumnBuilder builder)>();
                 foreach (var f in r.Fields)
                 {
-                    var (ft, fn) = ArrowSchemaConverter.ToArrowType(f.Schema);
-                    childBuilders.Add((f.Name, CreateBuilder(new Field(f.Name, ft, fn), f.Schema)));
+                    var (ft, fn) = ArrowSchemaConverter.ToArrowType(f.Schema, depth + 1);
+                    childBuilders.Add((f.Name, CreateBuilder(new Field(f.Name, ft, fn), f.Schema, depth + 1)));
                 }
                 return new StructBuilder(childBuilders);
             }
@@ -351,6 +417,63 @@ internal sealed class NullableBuilder : IColumnBuilder
 
     public void AppendNull() => _inner.AppendNull();
     public IArrowArray Build(Field field) => _inner.Build(field);
+}
+
+// ─── Validity bitmap accumulator ───
+
+/// <summary>
+/// Compact validity bitmap that stores 1 bit per value instead of 8 bytes (List&lt;bool&gt;).
+/// Tracks null count inline to avoid a second pass.
+/// </summary>
+internal struct ValidityTracker
+{
+    private byte[] _bitmap;
+    private int _count;
+    private int _nullCount;
+
+    public ValidityTracker() : this(64) { }
+
+    public ValidityTracker(int initialCapacity)
+    {
+        _bitmap = new byte[(initialCapacity + 7) / 8];
+        _count = 0;
+        _nullCount = 0;
+    }
+
+    public int Count => _count;
+    public int NullCount => _nullCount;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void AppendValid()
+    {
+        int byteIndex = _count / 8;
+        if (byteIndex >= _bitmap.Length)
+            Grow();
+        _bitmap[byteIndex] |= (byte)(1 << (_count % 8));
+        _count++;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void AppendNull()
+    {
+        int byteIndex = _count / 8;
+        if (byteIndex >= _bitmap.Length)
+            Grow();
+        // bit is already 0
+        _count++;
+        _nullCount++;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private void Grow()
+    {
+        int newSize = Math.Max(_bitmap.Length * 2, 8);
+        var newBitmap = new byte[newSize];
+        _bitmap.CopyTo(newBitmap, 0);
+        _bitmap = newBitmap;
+    }
+
+    public ArrowBuffer BuildBitmap() => new(_bitmap.AsMemory(0, (_count + 7) / 8));
 }
 
 // ─── Primitive builders ───
@@ -444,6 +567,7 @@ internal sealed class Time32MillisBuilder : IColumnBuilder
     private readonly Apache.Arrow.Time32Array.Builder _builder = new(new Time32Type(TimeUnit.Millisecond));
     public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadInt());
     public void AppendNull() => _builder.AppendNull();
+    public void AppendDefault(int value) => _builder.Append(value);
     public IArrowArray Build(Field field) => _builder.Build();
 }
 
@@ -452,15 +576,48 @@ internal sealed class Time64MicrosBuilder : IColumnBuilder
     private readonly Apache.Arrow.Time64Array.Builder _builder = new(new Time64Type(TimeUnit.Microsecond));
     public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadLong());
     public void AppendNull() => _builder.AppendNull();
+    public void AppendDefault(long value) => _builder.Append(value);
+    public IArrowArray Build(Field field) => _builder.Build();
+}
+
+internal sealed class Time64NanosBuilder : IColumnBuilder
+{
+    private readonly Apache.Arrow.Time64Array.Builder _builder = new(new Time64Type(TimeUnit.Nanosecond));
+    public void Append(ref AvroBinaryReader reader) => _builder.Append(reader.ReadLong());
+    public void AppendNull() => _builder.AppendNull();
+    public void AppendDefault(long value) => _builder.Append(value);
+    public IArrowArray Build(Field field) => _builder.Build();
+}
+
+/// <summary>
+/// Reads Avro duration (fixed 12 bytes: months u32 LE, days u32 LE, millis u32 LE)
+/// into Arrow MonthDayNanosecondIntervalArray (months, days, nanoseconds).
+/// </summary>
+internal sealed class DurationBuilder : IColumnBuilder
+{
+    private readonly MonthDayNanosecondIntervalArray.Builder _builder = new();
+
+    public void Append(ref AvroBinaryReader reader)
+    {
+        var bytes = reader.ReadFixed(12);
+        uint months = BinaryPrimitives.ReadUInt32LittleEndian(bytes);
+        uint days = BinaryPrimitives.ReadUInt32LittleEndian(bytes[4..]);
+        uint millis = BinaryPrimitives.ReadUInt32LittleEndian(bytes[8..]);
+        _builder.Append(new MonthDayNanosecondInterval(
+            checked((int)months), checked((int)days), (long)millis * 1_000_000));
+    }
+
+    public void AppendNull() => _builder.AppendNull();
     public IArrowArray Build(Field field) => _builder.Build();
 }
 
 internal sealed class TimestampBuilder : IColumnBuilder
 {
     private readonly List<long> _values = new();
-    private readonly List<bool> _validity = new();
-    public void Append(ref AvroBinaryReader reader) { _values.Add(reader.ReadLong()); _validity.Add(true); }
-    public void AppendNull() { _values.Add(0); _validity.Add(false); }
+    private ValidityTracker _validity = new();
+    public void Append(ref AvroBinaryReader reader) { _values.Add(reader.ReadLong()); _validity.AppendValid(); }
+    public void AppendNull() { _values.Add(0); _validity.AppendNull(); }
+    public void AppendDefault(long value) { _values.Add(value); _validity.AppendValid(); }
     public IArrowArray Build(Field field)
     {
         int count = _values.Count;
@@ -468,19 +625,8 @@ internal sealed class TimestampBuilder : IColumnBuilder
         for (int i = 0; i < count; i++)
             BitConverter.TryWriteBytes(valueBuffer.AsSpan(i * 8), _values[i]);
 
-        int nullBitmapLength = (count + 7) / 8;
-        var nullBitmap = new byte[nullBitmapLength];
-        int nullCount = 0;
-        for (int i = 0; i < count; i++)
-        {
-            if (_validity[i])
-                nullBitmap[i / 8] |= (byte)(1 << (i % 8));
-            else
-                nullCount++;
-        }
-
-        var data = new ArrayData(field.DataType, count, nullCount,
-            0, [new ArrowBuffer(nullBitmap), new ArrowBuffer(valueBuffer)]);
+        var data = new ArrayData(field.DataType, count, _validity.NullCount,
+            0, [_validity.BuildBitmap(), new ArrowBuffer(valueBuffer)]);
         return ArrowArrayFactory.BuildArray(data);
     }
 }
@@ -490,91 +636,139 @@ internal sealed class TimestampBuilder : IColumnBuilder
 internal sealed class EnumBuilder : IColumnBuilder
 {
     private readonly IReadOnlyList<string> _symbols;
-    private readonly List<int> _indices = new();
-    private readonly List<bool> _validity = new();
+    private readonly Int32Array.Builder _indexBuilder = new();
 
     public EnumBuilder(IReadOnlyList<string> symbols) => _symbols = symbols;
 
-    public void Append(ref AvroBinaryReader reader)
-    {
-        _indices.Add(reader.ReadInt());
-        _validity.Add(true);
-    }
-
-    public void AppendNull()
-    {
-        _indices.Add(0);
-        _validity.Add(false);
-    }
-
-    public void AppendDefault(int index)
-    {
-        _indices.Add(index);
-        _validity.Add(true);
-    }
+    public void Append(ref AvroBinaryReader reader) => _indexBuilder.Append(reader.ReadInt());
+    public void AppendNull() => _indexBuilder.AppendNull();
+    public void AppendDefault(int index) => _indexBuilder.Append(index);
 
     public IArrowArray Build(Field field)
     {
-        // Build the dictionary (all symbols)
         var dictBuilder = new StringArray.Builder();
         foreach (var sym in _symbols)
             dictBuilder.Append(sym);
-        var dictionary = dictBuilder.Build();
 
-        // Build the indices
-        var indexBuilder = new Int32Array.Builder();
-        for (int i = 0; i < _indices.Count; i++)
+        return new DictionaryArray((DictionaryType)field.DataType,
+            _indexBuilder.Build(), dictBuilder.Build());
+    }
+}
+
+/// <summary>
+/// Reads enum indices using the writer's symbol list and remaps them to the reader's symbol indices.
+/// Per the Avro spec, writer symbols are mapped to reader symbol positions by name.
+/// </summary>
+internal sealed class RemappingEnumBuilder : IColumnBuilder
+{
+    private readonly IReadOnlyList<string> _readerSymbols;
+    private readonly int[] _writerToReaderIndex;
+    private readonly Int32Array.Builder _indexBuilder = new();
+
+    public RemappingEnumBuilder(AvroEnumSchema writerSchema, AvroEnumSchema readerSchema)
+    {
+        _readerSymbols = readerSchema.Symbols;
+
+        // Build reader symbol lookup
+        var readerLookup = new Dictionary<string, int>(StringComparer.Ordinal);
+        for (int i = 0; i < readerSchema.Symbols.Count; i++)
+            readerLookup[readerSchema.Symbols[i]] = i;
+
+        // Resolve the default index (if reader has a default symbol)
+        int defaultIndex = -1;
+        if (readerSchema.Default != null)
         {
-            if (_validity[i]) indexBuilder.Append(_indices[i]);
-            else indexBuilder.AppendNull();
+            if (!readerLookup.TryGetValue(readerSchema.Default, out defaultIndex))
+                throw new InvalidOperationException(
+                    $"Reader enum default '{readerSchema.Default}' is not in reader symbol list.");
         }
-        var indices = indexBuilder.Build();
 
-        return new DictionaryArray((DictionaryType)field.DataType, indices, dictionary);
+        // Build remap table
+        _writerToReaderIndex = new int[writerSchema.Symbols.Count];
+        for (int wi = 0; wi < writerSchema.Symbols.Count; wi++)
+        {
+            if (readerLookup.TryGetValue(writerSchema.Symbols[wi], out int ri))
+            {
+                _writerToReaderIndex[wi] = ri;
+            }
+            else if (defaultIndex >= 0)
+            {
+                _writerToReaderIndex[wi] = defaultIndex;
+            }
+            else
+            {
+                throw new InvalidOperationException(
+                    $"Writer enum symbol '{writerSchema.Symbols[wi]}' is not in reader schema and reader has no default.");
+            }
+        }
+    }
+
+    public void Append(ref AvroBinaryReader reader)
+    {
+        int writerIndex = reader.ReadInt();
+        _indexBuilder.Append(_writerToReaderIndex[writerIndex]);
+    }
+
+    public void AppendNull() => _indexBuilder.AppendNull();
+
+    /// <summary>Appends a default using a reader symbol index.</summary>
+    public void AppendDefault(int readerIndex) => _indexBuilder.Append(readerIndex);
+
+    public IArrowArray Build(Field field)
+    {
+        var dictBuilder = new StringArray.Builder();
+        foreach (var sym in _readerSymbols)
+            dictBuilder.Append(sym);
+
+        return new DictionaryArray((DictionaryType)field.DataType,
+            _indexBuilder.Build(), dictBuilder.Build());
     }
 }
 
 internal sealed class FixedBuilder : IColumnBuilder
 {
     private readonly int _size;
-    private readonly List<byte[]> _values = new();
-    private readonly List<bool> _validity = new();
+    private byte[] _values;
+    private int _count;
+    private ValidityTracker _validity = new();
 
-    public FixedBuilder(int size) => _size = size;
+    public FixedBuilder(int size)
+    {
+        _size = size;
+        _values = new byte[size * 64];
+    }
 
     public void Append(ref AvroBinaryReader reader)
     {
-        _values.Add(reader.ReadFixed(_size).ToArray());
-        _validity.Add(true);
+        EnsureCapacity();
+        reader.ReadFixed(_size).CopyTo(_values.AsSpan(_count * _size));
+        _count++;
+        _validity.AppendValid();
     }
 
     public void AppendNull()
     {
-        _values.Add(new byte[_size]);
-        _validity.Add(false);
+        EnsureCapacity();
+        _values.AsSpan(_count * _size, _size).Clear();
+        _count++;
+        _validity.AppendNull();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureCapacity()
+    {
+        int required = (_count + 1) * _size;
+        if (required <= _values.Length) return;
+        var newValues = new byte[Math.Max(_values.Length * 2, required)];
+        _values.AsSpan(0, _count * _size).CopyTo(newValues);
+        _values = newValues;
     }
 
     public IArrowArray Build(Field field)
     {
-        int count = _values.Count;
-        var valueBuffer = new byte[count * _size];
-        for (int i = 0; i < count; i++)
-            _values[i].CopyTo(valueBuffer, i * _size);
-
-        int nullBitmapLength = (count + 7) / 8;
-        var nullBitmap = new byte[nullBitmapLength];
-        int nullCount = 0;
-        for (int i = 0; i < count; i++)
-        {
-            if (_validity[i])
-                nullBitmap[i / 8] |= (byte)(1 << (i % 8));
-            else
-                nullCount++;
-        }
-
         var dataType = field.DataType as FixedSizeBinaryType ?? new FixedSizeBinaryType(_size);
-        var data = new ArrayData(dataType, count, nullCount,
-            0, [new ArrowBuffer(nullBitmap), new ArrowBuffer(valueBuffer)]);
+        var data = new ArrayData(dataType, _count, _validity.NullCount,
+            0, [_validity.BuildBitmap(), new ArrowBuffer(_values.AsMemory(0, _count * _size))]);
         return ArrowArrayFactory.BuildArray(data);
     }
 }
@@ -583,7 +777,7 @@ internal sealed class ArrayBuilder : IColumnBuilder
 {
     private readonly IColumnBuilder _itemBuilder;
     private readonly List<int> _offsets = new() { 0 };
-    private readonly List<bool> _validity = new();
+    private ValidityTracker _validity = new();
 
     public ArrayBuilder(IColumnBuilder itemBuilder) => _itemBuilder = itemBuilder;
 
@@ -606,13 +800,13 @@ internal sealed class ArrayBuilder : IColumnBuilder
             }
         }
         _offsets.Add(_offsets[^1] + count);
-        _validity.Add(true);
+        _validity.AppendValid();
     }
 
     public void AppendNull()
     {
         _offsets.Add(_offsets[^1]);
-        _validity.Add(false);
+        _validity.AppendNull();
     }
 
     public IArrowArray Build(Field field)
@@ -623,17 +817,13 @@ internal sealed class ArrayBuilder : IColumnBuilder
     }
 
     internal static ListArray BuildListArray(
-        ListType listType, IArrowArray values, List<int> offsets, List<bool> validity)
+        ListType listType, IArrowArray values, List<int> offsets, ValidityTracker validity)
     {
         var offsetBuffer = new ArrowBuffer.Builder<int>();
         foreach (var o in offsets) offsetBuffer.Append(o);
 
-        var validityBuffer = new ArrowBuffer.BitmapBuilder();
-        foreach (var v in validity) validityBuffer.Append(v);
-
-        int nullCount = validity.Count(v => !v);
         return new ListArray(listType, validity.Count,
-            offsetBuffer.Build(), values, validityBuffer.Build(), nullCount);
+            offsetBuffer.Build(), values, validity.BuildBitmap(), validity.NullCount);
     }
 }
 
@@ -642,7 +832,7 @@ internal sealed class MapBuilder : IColumnBuilder
     private readonly IColumnBuilder _valueBuilder;
     private readonly StringArray.Builder _keyBuilder = new();
     private readonly List<int> _offsets = new() { 0 };
-    private readonly List<bool> _validity = new();
+    private ValidityTracker _validity = new();
 
     public MapBuilder(IColumnBuilder valueBuilder) => _valueBuilder = valueBuilder;
 
@@ -666,13 +856,13 @@ internal sealed class MapBuilder : IColumnBuilder
             }
         }
         _offsets.Add(_offsets[^1] + count);
-        _validity.Add(true);
+        _validity.AppendValid();
     }
 
     public void AppendNull()
     {
         _offsets.Add(_offsets[^1]);
-        _validity.Add(false);
+        _validity.AppendNull();
     }
 
     public IArrowArray Build(Field field)
@@ -681,7 +871,6 @@ internal sealed class MapBuilder : IColumnBuilder
         var keys = _keyBuilder.Build();
         var values = _valueBuilder.Build(mapType.ValueField);
 
-        // Build the struct array for entries (key, value)
         var structFields = new List<Field> { mapType.KeyField, mapType.ValueField };
         var structType = new StructType(structFields);
         var entries = new StructArray(structType, keys.Length,
@@ -690,19 +879,15 @@ internal sealed class MapBuilder : IColumnBuilder
         var offsetBuffer = new ArrowBuffer.Builder<int>();
         foreach (var o in _offsets) offsetBuffer.Append(o);
 
-        var validityBuffer = new ArrowBuffer.BitmapBuilder();
-        foreach (var v in _validity) validityBuffer.Append(v);
-
-        int nullCount = _validity.Count(v => !v);
         return new MapArray(mapType, _validity.Count,
-            offsetBuffer.Build(), entries, validityBuffer.Build(), nullCount);
+            offsetBuffer.Build(), entries, _validity.BuildBitmap(), _validity.NullCount);
     }
 }
 
 internal sealed class StructBuilder : IColumnBuilder
 {
     private readonly List<(string name, IColumnBuilder builder)> _children;
-    private readonly List<bool> _validity = new();
+    private ValidityTracker _validity = new();
 
     public StructBuilder(List<(string name, IColumnBuilder builder)> children)
         => _children = children;
@@ -711,14 +896,14 @@ internal sealed class StructBuilder : IColumnBuilder
     {
         foreach (var (_, builder) in _children)
             builder.Append(ref reader);
-        _validity.Add(true);
+        _validity.AppendValid();
     }
 
     public void AppendNull()
     {
         foreach (var (_, builder) in _children)
             builder.AppendNull();
-        _validity.Add(false);
+        _validity.AppendNull();
     }
 
     public IArrowArray Build(Field field)
@@ -728,12 +913,75 @@ internal sealed class StructBuilder : IColumnBuilder
         for (int i = 0; i < _children.Count; i++)
             childArrays[i] = _children[i].builder.Build(structType.Fields[i]);
 
-        var validityBuffer = new ArrowBuffer.BitmapBuilder();
-        foreach (var v in _validity) validityBuffer.Append(v);
-
-        int nullCount = _validity.Count(v => !v);
         return new StructArray(structType, _validity.Count,
-            childArrays, validityBuffer.Build(), nullCount);
+            childArrays, _validity.BuildBitmap(), _validity.NullCount);
+    }
+}
+
+/// <summary>
+/// A struct builder that handles nested record schema evolution.
+/// Reads wire data in writer field order but produces a StructArray in reader field order.
+/// Writer fields not in the reader are skipped; reader fields not in the writer get defaults.
+/// </summary>
+internal sealed class ResolvingStructBuilder : IColumnBuilder
+{
+    private readonly AvroRecordSchema _writerRecord;
+    private readonly SchemaResolution _resolution;
+    private readonly IColumnBuilder[] _readerBuilders;
+    private ValidityTracker _validity = new();
+
+    public ResolvingStructBuilder(
+        AvroRecordSchema writerRecord,
+        AvroRecordSchema readerRecord,
+        SchemaResolution resolution,
+        IColumnBuilder[] readerBuilders)
+    {
+        _writerRecord = writerRecord;
+        _resolution = resolution;
+        _readerBuilders = readerBuilders;
+    }
+
+    public void Append(ref AvroBinaryReader reader)
+    {
+        // Read writer fields in wire order, dispatching to the correct reader builder or skipping
+        for (int wi = 0; wi < _writerRecord.Fields.Count; wi++)
+        {
+            var action = _resolution.WriterActions[wi];
+            if (action.Skip)
+            {
+                reader.Skip(_writerRecord.Fields[wi].Schema);
+            }
+            else
+            {
+                _readerBuilders[action.ReaderFieldIndex].Append(ref reader);
+            }
+        }
+
+        // Fill defaults for reader fields not present in writer
+        foreach (var df in _resolution.DefaultFields)
+        {
+            DefaultValueApplicator.AppendDefault(_readerBuilders[df.ReaderIndex], df.DefaultValue, df.Schema);
+        }
+
+        _validity.AppendValid();
+    }
+
+    public void AppendNull()
+    {
+        foreach (var builder in _readerBuilders)
+            builder.AppendNull();
+        _validity.AppendNull();
+    }
+
+    public IArrowArray Build(Field field)
+    {
+        var structType = (StructType)field.DataType;
+        var childArrays = new IArrowArray[_readerBuilders.Length];
+        for (int i = 0; i < _readerBuilders.Length; i++)
+            childArrays[i] = _readerBuilders[i].Build(structType.Fields[i]);
+
+        return new StructArray(structType, _validity.Count,
+            childArrays, _validity.BuildBitmap(), _validity.NullCount);
     }
 }
 
@@ -745,32 +993,60 @@ internal sealed class DecimalFixedBuilder : IColumnBuilder
     private readonly int _size;
     private readonly int _precision;
     private readonly int _scale;
-    private readonly List<byte[]> _values = new();
-    private readonly List<bool> _validity = new();
+    private byte[] _values;
+    private int _count;
+    private ValidityTracker _validity = new();
 
     public DecimalFixedBuilder(int size, int precision, int scale)
     {
         _size = size;
         _precision = precision;
         _scale = scale;
+        _values = new byte[16 * 64];
     }
 
     public void Append(ref AvroBinaryReader reader)
     {
+        EnsureCapacity();
         var bytes = reader.ReadFixed(_size);
-        _values.Add(DecimalArrayHelper.BigEndianToDecimal128Bytes(bytes));
-        _validity.Add(true);
+        DecimalArrayHelper.BigEndianToDecimal128Bytes(bytes, _values.AsSpan(_count * 16));
+        _count++;
+        _validity.AppendValid();
     }
 
     public void AppendNull()
     {
-        _values.Add(new byte[16]);
-        _validity.Add(false);
+        EnsureCapacity();
+        _values.AsSpan(_count * 16, 16).Clear();
+        _count++;
+        _validity.AppendNull();
+    }
+
+    /// <summary>Appends a default value from big-endian Avro bytes.</summary>
+    public void AppendDefaultFromBigEndian(ReadOnlySpan<byte> bigEndianBytes)
+    {
+        EnsureCapacity();
+        DecimalArrayHelper.BigEndianToDecimal128Bytes(bigEndianBytes, _values.AsSpan(_count * 16));
+        _count++;
+        _validity.AppendValid();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureCapacity()
+    {
+        int required = (_count + 1) * 16;
+        if (required <= _values.Length) return;
+        var newValues = new byte[Math.Max(_values.Length * 2, required)];
+        _values.AsSpan(0, _count * 16).CopyTo(newValues);
+        _values = newValues;
     }
 
     public IArrowArray Build(Field field)
     {
-        return DecimalArrayHelper.BuildDecimal128Array(field, _values, _validity, _precision, _scale);
+        var dataType = new Decimal128Type(_precision, _scale);
+        var data = new ArrayData(dataType, _count, _validity.NullCount,
+            0, [_validity.BuildBitmap(), new ArrowBuffer(_values.AsMemory(0, _count * 16))]);
+        return ArrowArrayFactory.BuildArray(data);
     }
 }
 
@@ -779,69 +1055,88 @@ internal sealed class DecimalBytesBuilder : IColumnBuilder
 {
     private readonly int _precision;
     private readonly int _scale;
-    private readonly List<byte[]> _values = new();
-    private readonly List<bool> _validity = new();
+    private byte[] _values;
+    private int _count;
+    private ValidityTracker _validity = new();
 
     public DecimalBytesBuilder(int precision, int scale)
     {
         _precision = precision;
         _scale = scale;
+        _values = new byte[16 * 64];
     }
 
     public void Append(ref AvroBinaryReader reader)
     {
+        EnsureCapacity();
         var bytes = reader.ReadBytes();
-        _values.Add(DecimalArrayHelper.BigEndianToDecimal128Bytes(bytes));
-        _validity.Add(true);
+        DecimalArrayHelper.BigEndianToDecimal128Bytes(bytes, _values.AsSpan(_count * 16));
+        _count++;
+        _validity.AppendValid();
     }
 
     public void AppendNull()
     {
-        _values.Add(new byte[16]);
-        _validity.Add(false);
+        EnsureCapacity();
+        _values.AsSpan(_count * 16, 16).Clear();
+        _count++;
+        _validity.AppendNull();
+    }
+
+    /// <summary>Appends a default value from big-endian Avro bytes.</summary>
+    public void AppendDefaultFromBigEndian(ReadOnlySpan<byte> bigEndianBytes)
+    {
+        EnsureCapacity();
+        DecimalArrayHelper.BigEndianToDecimal128Bytes(bigEndianBytes, _values.AsSpan(_count * 16));
+        _count++;
+        _validity.AppendValid();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private void EnsureCapacity()
+    {
+        int required = (_count + 1) * 16;
+        if (required <= _values.Length) return;
+        var newValues = new byte[Math.Max(_values.Length * 2, required)];
+        _values.AsSpan(0, _count * 16).CopyTo(newValues);
+        _values = newValues;
     }
 
     public IArrowArray Build(Field field)
     {
-        return DecimalArrayHelper.BuildDecimal128Array(field, _values, _validity, _precision, _scale);
+        var dataType = new Decimal128Type(_precision, _scale);
+        var data = new ArrayData(dataType, _count, _validity.NullCount,
+            0, [_validity.BuildBitmap(), new ArrowBuffer(_values.AsMemory(0, _count * 16))]);
+        return ArrowArrayFactory.BuildArray(data);
     }
 }
 
 internal static class DecimalArrayHelper
 {
-    /// <summary>Converts Avro big-endian two's complement bytes to 16-byte little-endian for Arrow Decimal128.</summary>
+    /// <summary>Converts Avro big-endian two's complement bytes to 16-byte little-endian for Arrow Decimal128, writing directly into destination.</summary>
+    public static void BigEndianToDecimal128Bytes(ReadOnlySpan<byte> bigEndian, Span<byte> dest)
+    {
+        byte signExtend = (bigEndian.Length > 0 && (bigEndian[0] & 0x80) != 0) ? (byte)0xFF : (byte)0x00;
+        dest[..16].Fill(signExtend);
+        int len = Math.Min(bigEndian.Length, 16);
+        for (int i = 0; i < len; i++)
+            dest[i] = bigEndian[bigEndian.Length - 1 - i];
+    }
+
+    /// <summary>Allocating overload for default value paths.</summary>
     public static byte[] BigEndianToDecimal128Bytes(ReadOnlySpan<byte> bigEndian)
     {
         var result = new byte[16];
-        byte signExtend = (bigEndian.Length > 0 && (bigEndian[0] & 0x80) != 0) ? (byte)0xFF : (byte)0x00;
-        result.AsSpan().Fill(signExtend);
-        for (int i = 0; i < bigEndian.Length && i < 16; i++)
-            result[i] = bigEndian[bigEndian.Length - 1 - i];
+        BigEndianToDecimal128Bytes(bigEndian, result);
         return result;
     }
 
     public static IArrowArray BuildDecimal128Array(
-        Field field, List<byte[]> values, List<bool> validity, int precision, int scale)
+        Field field, byte[] values, int count, ValidityTracker validity, int precision, int scale)
     {
-        int count = values.Count;
-        var valueBuffer = new byte[count * 16];
-        for (int i = 0; i < count; i++)
-            values[i].CopyTo(valueBuffer, i * 16);
-
-        int nullBitmapLength = (count + 7) / 8;
-        var nullBitmap = new byte[nullBitmapLength];
-        int nullCount = 0;
-        for (int i = 0; i < count; i++)
-        {
-            if (validity[i])
-                nullBitmap[i / 8] |= (byte)(1 << (i % 8));
-            else
-                nullCount++;
-        }
-
         var dataType = new Decimal128Type(precision, scale);
-        var data = new ArrayData(dataType, count, nullCount,
-            0, [new ArrowBuffer(nullBitmap), new ArrowBuffer(valueBuffer)]);
+        var data = new ArrayData(dataType, count, validity.NullCount,
+            0, [validity.BuildBitmap(), new ArrowBuffer(values.AsMemory(0, count * 16))]);
         return ArrowArrayFactory.BuildArray(data);
     }
 }
