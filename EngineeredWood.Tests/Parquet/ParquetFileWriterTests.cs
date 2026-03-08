@@ -1311,6 +1311,221 @@ public class ParquetFileWriterTests : IDisposable
         Assert.Equal(3, r2.GetValue(0));
     }
 
+    // --- Map Write Tests ---
+
+    [Fact]
+    public async Task Map_NullableMapOfStringToInt32_RoundTrips()
+    {
+        var keyField = new Field("key", Apache.Arrow.Types.StringType.Default, nullable: false);
+        var valueField = new Field("value", Int32Type.Default, nullable: true);
+        var mapType = new MapType(keyField, valueField);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("data", mapType, nullable: true))
+            .Build();
+
+        // Row 0: {"a": 1, "b": 2}
+        // Row 1: null
+        // Row 2: {"c": null}
+        // Row 3: {"d": 4, "e": 5, "f": 6}
+
+        var keyBuilder = new StringArray.Builder();
+        keyBuilder.Append("a"); keyBuilder.Append("b");       // row 0
+        keyBuilder.Append("c");                                 // row 2
+        keyBuilder.Append("d"); keyBuilder.Append("e"); keyBuilder.Append("f"); // row 3
+
+        var valBuilder = new Int32Array.Builder();
+        valBuilder.Append(1); valBuilder.Append(2);             // row 0
+        valBuilder.AppendNull();                                 // row 2
+        valBuilder.Append(4); valBuilder.Append(5); valBuilder.Append(6); // row 3
+
+        var kvStruct = new StructArray(
+            new StructType(new[] { keyField, valueField }), 6,
+            new IArrowArray[] { keyBuilder.Build(), valBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(2);
+        offsetsBuilder.Append(3); offsetsBuilder.Append(6);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+        BitUtility.SetBit(nullBitmap, 3, true);
+
+        int count = 4;
+        var mapArray = new MapArray(mapType, count,
+            offsetsBuilder.Build(), kvStruct,
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { mapArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        Assert.IsType<MapType>(result.Schema.FieldsList[0].DataType);
+        var resultMap = (MapArray)result.Column(0);
+
+        // Row 0: {"a": 1, "b": 2}
+        Assert.False(resultMap.IsNull(0));
+        int off0 = resultMap.ValueOffsets[0];
+        int len0 = resultMap.ValueOffsets[1] - off0;
+        Assert.Equal(2, len0);
+        var allKeys = (StringArray)resultMap.Keys;
+        var allVals = (Int32Array)resultMap.Values;
+        Assert.Equal("a", allKeys.GetString(off0));
+        Assert.Equal("b", allKeys.GetString(off0 + 1));
+        Assert.Equal(1, allVals.GetValue(off0));
+        Assert.Equal(2, allVals.GetValue(off0 + 1));
+
+        // Row 1: null
+        Assert.True(resultMap.IsNull(1));
+
+        // Row 2: {"c": null}
+        Assert.False(resultMap.IsNull(2));
+        int off2 = resultMap.ValueOffsets[2];
+        int len2 = resultMap.ValueOffsets[3] - off2;
+        Assert.Equal(1, len2);
+        Assert.Equal("c", allKeys.GetString(off2));
+        Assert.True(allVals.IsNull(off2));
+
+        // Row 3: {"d": 4, "e": 5, "f": 6}
+        Assert.False(resultMap.IsNull(3));
+        int off3 = resultMap.ValueOffsets[3];
+        int len3 = resultMap.ValueOffsets[4] - off3;
+        Assert.Equal(3, len3);
+        Assert.Equal("d", allKeys.GetString(off3));
+        Assert.Equal(4, allVals.GetValue(off3));
+        Assert.Equal("e", allKeys.GetString(off3 + 1));
+        Assert.Equal(5, allVals.GetValue(off3 + 1));
+        Assert.Equal("f", allKeys.GetString(off3 + 2));
+        Assert.Equal(6, allVals.GetValue(off3 + 2));
+    }
+
+    [Fact]
+    public async Task Map_RequiredMapOfInt32ToInt64_RoundTrips()
+    {
+        var keyField = new Field("key", Int32Type.Default, nullable: false);
+        var valueField = new Field("value", Int64Type.Default, nullable: false);
+        var mapType = new MapType(keyField, valueField);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("mapping", mapType, nullable: false))
+            .Build();
+
+        // Row 0: {10: 100, 20: 200}
+        // Row 1: {30: 300}
+        var keyBuilder = new Int32Array.Builder();
+        keyBuilder.Append(10); keyBuilder.Append(20); keyBuilder.Append(30);
+
+        var valBuilder = new Int64Array.Builder();
+        valBuilder.Append(100); valBuilder.Append(200); valBuilder.Append(300);
+
+        var kvStruct = new StructArray(
+            new StructType(new[] { keyField, valueField }), 3,
+            new IArrowArray[] { keyBuilder.Build(), valBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(3);
+
+        int count = 2;
+        var mapArray = new MapArray(mapType, count,
+            offsetsBuilder.Build(), kvStruct, ArrowBuffer.Empty, nullCount: 0);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { mapArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultMap = (MapArray)result.Column(0);
+
+        var rKeys = (Int32Array)resultMap.Keys;
+        var rVals = (Int64Array)resultMap.Values;
+
+        int off0 = resultMap.ValueOffsets[0];
+        Assert.Equal(2, resultMap.ValueOffsets[1] - off0);
+        Assert.Equal(10, rKeys.GetValue(off0));
+        Assert.Equal(100, rVals.GetValue(off0));
+        Assert.Equal(20, rKeys.GetValue(off0 + 1));
+        Assert.Equal(200, rVals.GetValue(off0 + 1));
+
+        int off1 = resultMap.ValueOffsets[1];
+        Assert.Equal(1, resultMap.ValueOffsets[2] - off1);
+        Assert.Equal(30, rKeys.GetValue(off1));
+        Assert.Equal(300, rVals.GetValue(off1));
+    }
+
+    [Fact]
+    public async Task Map_MixedWithFlatAndListColumns_RoundTrips()
+    {
+        var keyField = new Field("key", Apache.Arrow.Types.StringType.Default, nullable: false);
+        var valueField = new Field("value", Int32Type.Default, nullable: true);
+        var mapType = new MapType(keyField, valueField);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("id", Int32Type.Default, nullable: false))
+            .Field(new Field("props", mapType, nullable: true))
+            .Build();
+
+        int count = 3;
+        var idBuilder = new Int32Array.Builder();
+        idBuilder.Append(1); idBuilder.Append(2); idBuilder.Append(3);
+
+        // Row 0: {"x": 10}
+        // Row 1: null
+        // Row 2: {"y": 20, "z": null}
+        var keyBuilder = new StringArray.Builder();
+        keyBuilder.Append("x");
+        keyBuilder.Append("y"); keyBuilder.Append("z");
+
+        var valBuilder = new Int32Array.Builder();
+        valBuilder.Append(10);
+        valBuilder.Append(20); valBuilder.AppendNull();
+
+        var kvStruct = new StructArray(
+            new StructType(new[] { keyField, valueField }), 3,
+            new IArrowArray[] { keyBuilder.Build(), valBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(1); offsetsBuilder.Append(1); offsetsBuilder.Append(3);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+
+        var mapArray = new MapArray(mapType, count,
+            offsetsBuilder.Build(), kvStruct,
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { idBuilder.Build(), mapArray }, count);
+        var result = await WriteAndRead(batch);
+
+        Assert.Equal(count, result.Length);
+        var resultId = (Int32Array)result.Column(0);
+        var resultMap = (MapArray)result.Column(1);
+
+        Assert.Equal(1, resultId.GetValue(0));
+        Assert.Equal(2, resultId.GetValue(1));
+        Assert.Equal(3, resultId.GetValue(2));
+
+        // Row 0
+        Assert.False(resultMap.IsNull(0));
+        var rKeys = (StringArray)resultMap.Keys;
+        var rVals = (Int32Array)resultMap.Values;
+        Assert.Equal("x", rKeys.GetString(resultMap.ValueOffsets[0]));
+        Assert.Equal(10, rVals.GetValue(resultMap.ValueOffsets[0]));
+
+        // Row 1: null
+        Assert.True(resultMap.IsNull(1));
+
+        // Row 2
+        Assert.False(resultMap.IsNull(2));
+        int off2 = resultMap.ValueOffsets[2];
+        Assert.Equal("y", rKeys.GetString(off2));
+        Assert.Equal(20, rVals.GetValue(off2));
+        Assert.Equal("z", rKeys.GetString(off2 + 1));
+        Assert.True(rVals.IsNull(off2 + 1));
+    }
+
     // --- Explicit V1 Tests (ensure V1 still works when selected) ---
 
     [Fact]

@@ -956,6 +956,10 @@ public class CrossReaderValidationTests : IDisposable
     //  ParquetSharp cross-reader: list tests
     // ----------------------------------------------------------------
 
+    // ----------------------------------------------------------------
+    //  ParquetSharp cross-reader: list tests
+    // ----------------------------------------------------------------
+
     [Fact]
     public async Task PS_List_NullableListOfNullableInt32_V2()
     {
@@ -1035,5 +1039,96 @@ public class CrossReaderValidationTests : IDisposable
             }
         }
         Assert.Equal(expectedValues.Length, vIdx);
+    }
+
+    // ----------------------------------------------------------------
+    //  ParquetSharp cross-reader: map tests
+    // ----------------------------------------------------------------
+
+    [Fact]
+    public async Task PS_Map_NullableMapOfStringToNullableInt32_V2()
+    {
+        var keyField = new Field("key", Apache.Arrow.Types.StringType.Default, nullable: false);
+        var valueField = new Field("value", Int32Type.Default, nullable: true);
+        var mapType = new MapType(keyField, valueField);
+        var schema = new Apache.Arrow.Schema.Builder()
+            .Field(new Field("data", mapType, nullable: true))
+            .Build();
+
+        // Row 0: {"a": 1, "b": 2}
+        // Row 1: null
+        // Row 2: {"c": null}
+
+        var keyBuilder = new StringArray.Builder();
+        keyBuilder.Append("a"); keyBuilder.Append("b"); keyBuilder.Append("c");
+
+        var valBuilder = new Int32Array.Builder();
+        valBuilder.Append(1); valBuilder.Append(2); valBuilder.AppendNull();
+
+        var kvStruct = new StructArray(
+            new StructType(new[] { keyField, valueField }), 3,
+            new IArrowArray[] { keyBuilder.Build(), valBuilder.Build() },
+            ArrowBuffer.Empty, 0);
+
+        var offsetsBuilder = new ArrowBuffer.Builder<int>();
+        offsetsBuilder.Append(0); offsetsBuilder.Append(2); offsetsBuilder.Append(2); offsetsBuilder.Append(3);
+
+        var nullBitmap = new byte[1];
+        BitUtility.SetBit(nullBitmap, 0, true);
+        BitUtility.SetBit(nullBitmap, 1, false);
+        BitUtility.SetBit(nullBitmap, 2, true);
+
+        int count = 3;
+        var mapArray = new MapArray(mapType, count,
+            offsetsBuilder.Build(), kvStruct,
+            new ArrowBuffer(nullBitmap), nullCount: 1);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { mapArray }, count);
+        var path = await WriteWithEW(batch, new ParquetWriteOptions
+        {
+            DataPageVersion = DataPageVersion.V2,
+        }, name: "ps_map.parquet");
+
+        // Read with ParquetSharp
+        // Schema: optional group data (MAP) → repeated group key_value → required ByteArray key, optional int32 value
+        // Key column: maxDef=2, maxRep=1 (key required: def=0 map null, def=1 empty map, def=2 key present)
+        // Value column: maxDef=3, maxRep=1 (value optional: +1 for null value)
+        using var psReader = new ParquetSharp.ParquetFileReader(path);
+        using var rg = psReader.RowGroup(0);
+
+        // Total entries: 2 (row 0) + 1 (row 1 null) + 1 (row 2) = 4
+        int totalEntries = 4;
+
+        // Key column
+        using var keyCol = rg.Column(0);
+        using var keyReader = (ParquetSharp.ColumnReader<ParquetSharp.ByteArray>)keyCol;
+        var keyDefLevels = new short[totalEntries];
+        var keyRepLevels = new short[totalEntries];
+        var keyValues = new ParquetSharp.ByteArray[totalEntries];
+        keyReader.ReadBatch(totalEntries, keyDefLevels, keyRepLevels, keyValues, out _);
+
+        short[] expectedKeyDef = [2, 2, 0, 2];
+        short[] expectedKeyRep = [0, 1, 0, 0];
+        for (int i = 0; i < totalEntries; i++)
+        {
+            Assert.Equal(expectedKeyDef[i], keyDefLevels[i]);
+            Assert.Equal(expectedKeyRep[i], keyRepLevels[i]);
+        }
+
+        // Value column
+        using var valCol = rg.Column(1);
+        using var valReader = (ParquetSharp.ColumnReader<int>)valCol;
+        var valDefLevels = new short[totalEntries];
+        var valRepLevels = new short[totalEntries];
+        var valValues = new int[totalEntries];
+        valReader.ReadBatch(totalEntries, valDefLevels, valRepLevels, valValues, out _);
+
+        short[] expectedValDef = [3, 3, 0, 2]; // 3=present, 0=map null, 2=value null
+        short[] expectedValRep = [0, 1, 0, 0];
+        for (int i = 0; i < totalEntries; i++)
+        {
+            Assert.Equal(expectedValDef[i], valDefLevels[i]);
+            Assert.Equal(expectedValRep[i], valRepLevels[i]);
+        }
     }
 }

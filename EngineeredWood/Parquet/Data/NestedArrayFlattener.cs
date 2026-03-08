@@ -90,7 +90,15 @@ internal static class NestedArrayFlattener
             return;
         }
 
+        // Map node: MAP group → repeated key_value → key + value (two leaf columns)
+        if (array is MapArray mapArray && ArrowSchemaConverter.IsMapNode(node))
+        {
+            FlattenMap(mapArray, node, leafDescriptors, result, ancestorDefLevels, ancestorMaxDef);
+            return;
+        }
+
         // List node: schema has LIST group → repeated group → element child(ren)
+        // Check after MapArray since MapArray extends ListArray
         if (array is ListArray listArray && ArrowSchemaConverter.IsListNode(node))
         {
             FlattenList(listArray, node, leafDescriptors, result, ancestorDefLevels, ancestorMaxDef);
@@ -98,8 +106,7 @@ internal static class NestedArrayFlattener
         }
 
         throw new NotSupportedException(
-            $"Nested array type '{array.GetType().Name}' is not yet supported for writing. " +
-            "Struct, List, and Map support is being added incrementally.");
+            $"Nested array type '{array.GetType().Name}' is not yet supported for writing.");
     }
 
     /// <summary>
@@ -477,6 +484,178 @@ internal static class NestedArrayFlattener
         // Extract dense values from the values array
         var decomposed = ExtractDenseValuesFromFlat(
             valuesArray, defLevels, repLevels, maxDef, nonNullCount,
+            descriptor.PhysicalType, descriptor.TypeLength ?? 0);
+        result.Add(new FlattenedColumn(decomposed, totalEntries));
+    }
+
+    /// <summary>
+    /// Flattens a MapArray into two leaf columns (key and value) with correct def/rep levels.
+    /// Maps are structurally similar to lists: MAP group → repeated key_value → key + value.
+    /// Both leaf columns share the same rep levels (from the map's repeated structure).
+    /// </summary>
+    private static void FlattenMap(
+        MapArray mapArray,
+        SchemaNode mapNode,
+        IReadOnlyList<ColumnDescriptor> leafDescriptors,
+        List<FlattenedColumn> result,
+        byte[]? ancestorDefLevels,
+        int ancestorMaxDef)
+    {
+        int rowCount = mapArray.Length;
+        bool mapIsNullable = mapNode.Element.RepetitionType == FieldRepetitionType.Optional;
+
+        int mapExistsDef = ancestorMaxDef + (mapIsNullable ? 1 : 0);
+        int repeatedEntryDef = mapExistsDef + 1;
+
+        var keyValueGroup = mapNode.Children[0]; // repeated key_value
+        var keyNode = keyValueGroup.Children[0];
+        var valueNode = keyValueGroup.Children.Count > 1 ? keyValueGroup.Children[1] : null;
+
+        var offsets = mapArray.ValueOffsets;
+        var keysArray = mapArray.Keys;
+        var valuesArray = valueNode != null ? mapArray.Values : null;
+
+        // Get descriptors for key and value columns
+        int keyLeafIndex = result.Count;
+        var keyDescriptor = leafDescriptors[keyLeafIndex];
+        int keyMaxDef = keyDescriptor.MaxDefinitionLevel;
+        int maxRep = keyDescriptor.MaxRepetitionLevel;
+
+        // Count total entries
+        int totalEntries = 0;
+        for (int i = 0; i < rowCount; i++)
+        {
+            if (ancestorDefLevels != null && ancestorDefLevels[i] < ancestorMaxDef)
+                totalEntries++;
+            else if (mapIsNullable && !mapArray.IsValid(i))
+                totalEntries++;
+            else
+            {
+                int len = offsets[i + 1] - offsets[i];
+                totalEntries += len > 0 ? len : 1;
+            }
+        }
+
+        // Build shared rep levels and base def levels for the key_value repeated group
+        var repLevels = new byte[totalEntries];
+        var baseDefLevels = new byte[totalEntries];
+        int writeIdx = 0;
+
+        for (int i = 0; i < rowCount; i++)
+        {
+            if (ancestorDefLevels != null && ancestorDefLevels[i] < ancestorMaxDef)
+            {
+                baseDefLevels[writeIdx] = ancestorDefLevels[i];
+                repLevels[writeIdx] = 0;
+                writeIdx++;
+            }
+            else if (mapIsNullable && !mapArray.IsValid(i))
+            {
+                baseDefLevels[writeIdx] = (byte)ancestorMaxDef;
+                repLevels[writeIdx] = 0;
+                writeIdx++;
+            }
+            else
+            {
+                int start = offsets[i];
+                int end = offsets[i + 1];
+
+                if (start == end)
+                {
+                    baseDefLevels[writeIdx] = (byte)mapExistsDef;
+                    repLevels[writeIdx] = 0;
+                    writeIdx++;
+                }
+                else
+                {
+                    for (int j = start; j < end; j++)
+                    {
+                        baseDefLevels[writeIdx] = (byte)repeatedEntryDef;
+                        repLevels[writeIdx] = j == start ? (byte)0 : (byte)maxRep;
+                        writeIdx++;
+                    }
+                }
+            }
+        }
+
+        // Flatten key column
+        FlattenMapLeafColumn(keysArray, keyNode, baseDefLevels, repLevels,
+            repeatedEntryDef, keyDescriptor, totalEntries, result);
+
+        // Flatten value column
+        if (valueNode != null && valuesArray != null)
+        {
+            var valueDescriptor = leafDescriptors[keyLeafIndex + 1];
+            FlattenMapLeafColumn(valuesArray, valueNode, baseDefLevels, repLevels,
+                repeatedEntryDef, valueDescriptor, totalEntries, result);
+        }
+    }
+
+    /// <summary>
+    /// Flattens a single leaf column of a map (key or value) using the shared base def/rep levels.
+    /// </summary>
+    private static void FlattenMapLeafColumn(
+        IArrowArray leafArray,
+        SchemaNode leafNode,
+        byte[] baseDefLevels,
+        byte[] repLevels,
+        int repeatedEntryDef,
+        ColumnDescriptor descriptor,
+        int totalEntries,
+        List<FlattenedColumn> result)
+    {
+        int maxDef = descriptor.MaxDefinitionLevel;
+        bool isNullable = leafNode.Element.RepetitionType == FieldRepetitionType.Optional;
+
+        var defLevels = new byte[totalEntries];
+        int nonNullCount = 0;
+
+        for (int i = 0; i < totalEntries; i++)
+        {
+            if (baseDefLevels[i] < repeatedEntryDef)
+            {
+                // Map null, empty, or ancestor null — pass through base def level
+                defLevels[i] = baseDefLevels[i];
+            }
+            else
+            {
+                // We're inside a map entry — check leaf nullability
+                // We need the value-array index: count entries with baseDefLevels >= repeatedEntryDef
+                // up to position i
+                // (This is just a running count that we'll use to index into the values array)
+                defLevels[i] = (byte)maxDef;
+                nonNullCount++;
+            }
+        }
+
+        // For nullable columns, we need to check actual values for nulls
+        if (isNullable)
+        {
+            nonNullCount = 0;
+            int valIdx = 0;
+            for (int i = 0; i < totalEntries; i++)
+            {
+                if (baseDefLevels[i] >= repeatedEntryDef)
+                {
+                    if (!leafArray.IsValid(valIdx))
+                    {
+                        defLevels[i] = (byte)(maxDef - 1); // entry exists but value null
+                    }
+                    else
+                    {
+                        defLevels[i] = (byte)maxDef;
+                        nonNullCount++;
+                    }
+                    valIdx++;
+                }
+            }
+        }
+
+        var repLevelsCopy = new byte[totalEntries];
+        System.Array.Copy(repLevels, repLevelsCopy, totalEntries);
+
+        var decomposed = ExtractDenseValuesFromFlat(
+            leafArray, defLevels, repLevelsCopy, maxDef, nonNullCount,
             descriptor.PhysicalType, descriptor.TypeLength ?? 0);
         result.Add(new FlattenedColumn(decomposed, totalEntries));
     }
