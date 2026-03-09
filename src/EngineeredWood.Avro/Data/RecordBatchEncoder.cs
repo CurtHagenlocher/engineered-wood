@@ -15,7 +15,6 @@ namespace EngineeredWood.Avro.Data;
 internal sealed class RecordBatchEncoder
 {
     private readonly AvroRecordSchema _schema;
-    private readonly GrowableBuffer _rowBuffer = new(1024);
 
     public RecordBatchEncoder(AvroRecordSchema schema)
     {
@@ -28,14 +27,10 @@ internal sealed class RecordBatchEncoder
     /// </summary>
     public int Encode(RecordBatch batch, GrowableBuffer output)
     {
-        var writer = new AvroBinaryWriter(_rowBuffer);
+        var writer = new AvroBinaryWriter(output);
 
         for (int row = 0; row < batch.Length; row++)
-        {
-            _rowBuffer.Reset();
             EncodeRecord(writer, batch, row, _schema);
-            output.Write(_rowBuffer.WrittenSpan);
-        }
 
         return batch.Length;
     }

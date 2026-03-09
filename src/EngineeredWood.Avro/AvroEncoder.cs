@@ -15,7 +15,6 @@ public sealed class AvroEncoder : IDisposable
 {
     private readonly AvroRecordSchema _avroRecord;
     private readonly GrowableBuffer _outputBuffer;
-    private readonly GrowableBuffer _rowBuffer;
     private readonly List<int> _rowOffsets;
     private readonly byte[] _headerPrefix;
     private bool _disposed;
@@ -32,7 +31,6 @@ public sealed class AvroEncoder : IDisposable
         AvroSchema = avroSchema;
         _avroRecord = avroRecord;
         _outputBuffer = new GrowableBuffer(4096);
-        _rowBuffer = new GrowableBuffer(1024);
         _rowOffsets = new List<int>();
         _headerPrefix = BuildHeaderPrefix(avroSchema, strategy);
     }
@@ -45,20 +43,13 @@ public sealed class AvroEncoder : IDisposable
         ObjectDisposedException.ThrowIf(_disposed, this);
         ArgumentNullException.ThrowIfNull(batch);
 
-        var writer = new AvroBinaryWriter(_rowBuffer);
+        var writer = new AvroBinaryWriter(_outputBuffer);
 
         for (int row = 0; row < batch.Length; row++)
         {
-            // Record the start offset of this row
             _rowOffsets.Add(_outputBuffer.Length);
-
-            // Write the fingerprint header
             _outputBuffer.Write(_headerPrefix);
-
-            // Encode the row into the scratch buffer, then copy to output
-            _rowBuffer.Reset();
             EncodeRecord(writer, batch, row);
-            _outputBuffer.Write(_rowBuffer.WrittenSpan);
         }
     }
 
