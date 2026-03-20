@@ -21,6 +21,8 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
     private BlobContainerClient? _container;
     private bool _azuriteAvailable;
 
+    private BlobContainerClient Container => _container ?? throw new InvalidOperationException("Container not initialized");
+
     public async Task InitializeAsync()
     {
         try
@@ -67,7 +69,7 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
 
         // Read back
         await using var readFile = new AzureBlobRandomAccessFile(
-            _container.GetBlobClient(blobName));
+            Container.GetBlobClient(blobName));
         await using var reader = new ParquetFileReader(readFile, ownsFile: false);
 
         var metadata = await reader.ReadMetadataAsync();
@@ -103,7 +105,7 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
 
         // Read back
         await using var readFile = new AzureBlobRandomAccessFile(
-            _container.GetBlobClient("test-small-blocks.parquet"));
+            Container.GetBlobClient("test-small-blocks.parquet"));
         await using var reader = new ParquetFileReader(readFile, ownsFile: false);
 
         var metadata = await reader.ReadMetadataAsync();
@@ -145,7 +147,7 @@ public class AzureBlobSequentialFileTests : IAsyncLifetime
 
         // Read back
         await using var readFile = new AzureBlobRandomAccessFile(
-            _container.GetBlobClient("test-compressed.parquet"));
+            Container.GetBlobClient("test-compressed.parquet"));
         await using var reader = new ParquetFileReader(readFile, ownsFile: false);
 
         var readBatch = await reader.ReadRowGroupAsync(0);

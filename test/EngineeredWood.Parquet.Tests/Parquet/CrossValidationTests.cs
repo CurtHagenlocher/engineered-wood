@@ -246,7 +246,7 @@ public class CrossValidationTests : IDisposable
             else
             {
                 expectedDoubles[i] = random.NextDouble() * 1000;
-                dblBuilder.Append(expectedDoubles[i].Value);
+                dblBuilder.Append(expectedDoubles[i]!.Value);
             }
 
             if (random.NextDouble() < 0.1)

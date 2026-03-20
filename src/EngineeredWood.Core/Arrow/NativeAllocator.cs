@@ -4,7 +4,6 @@ using System.Reflection;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
-using Apache.Arrow.Memory;
 
 namespace EngineeredWood.Arrow;
 
@@ -71,74 +70,17 @@ internal sealed class NativeMemoryManager : MemoryManager<byte>
 }
 
 /// <summary>
-/// Arrow <see cref="MemoryAllocator"/> that allocates 64-byte-aligned native memory.
-/// </summary>
-internal sealed class NativeAllocator : MemoryAllocator
-{
-    public static readonly NativeAllocator Instance = new();
-
-    private new const int Alignment = 64;
-
-    private static readonly Func<IMemoryOwner<byte>, ArrowBuffer> s_createBuffer = BuildCreateBuffer();
-
-    protected override IMemoryOwner<byte> AllocateInternal(int length, out int bytesAllocated)
-    {
-        return AllocateInternal(length, zeroFill: true, out bytesAllocated);
-    }
-
-    /// <summary>
-    /// Allocates aligned native memory, optionally skipping zero-fill for buffers
-    /// that will be fully overwritten by the caller.
-    /// </summary>
-    public IMemoryOwner<byte> Allocate(int length, bool zeroFill)
-    {
-        int aligned = (length + Alignment - 1) & ~(Alignment - 1);
-        return new NativeMemoryManager(aligned, Alignment, zeroFill);
-    }
-
-    private static IMemoryOwner<byte> AllocateInternal(int length, bool zeroFill, out int bytesAllocated)
-    {
-        int aligned = (length + Alignment - 1) & ~(Alignment - 1);
-        bytesAllocated = aligned;
-        return new NativeMemoryManager(aligned, Alignment, zeroFill);
-    }
-
-    /// <summary>
-    /// Creates an <see cref="ArrowBuffer"/> that owns the given <see cref="IMemoryOwner{T}"/>,
-    /// transferring lifetime management to the Arrow buffer. When the Arrow array holding
-    /// this buffer is disposed, the native memory is freed.
-    /// </summary>
-    public static ArrowBuffer CreateBuffer(IMemoryOwner<byte> owner)
-    {
-        return s_createBuffer(owner);
-    }
-
-    private static Func<IMemoryOwner<byte>, ArrowBuffer> BuildCreateBuffer()
-    {
-        // ArrowBuffer has an internal constructor: ArrowBuffer(IMemoryOwner<byte>)
-        // We use a compiled expression to call it efficiently.
-        var ctor = typeof(ArrowBuffer).GetConstructor(
-            BindingFlags.Instance | BindingFlags.NonPublic,
-            binder: null,
-            types: [typeof(IMemoryOwner<byte>)],
-            modifiers: null)
-            ?? throw new InvalidOperationException(
-                "Could not find ArrowBuffer(IMemoryOwner<byte>) constructor.");
-
-        var param = Expression.Parameter(typeof(IMemoryOwner<byte>), "owner");
-        var newExpr = Expression.New(ctor, param);
-        return Expression.Lambda<Func<IMemoryOwner<byte>, ArrowBuffer>>(newExpr, param).Compile();
-    }
-}
-
-/// <summary>
 /// A pre-sized native-memory buffer for accumulating column values.
 /// Values are written into the buffer via <see cref="Span"/>; calling <see cref="Build"/>
 /// transfers ownership to an <see cref="ArrowBuffer"/> (zero-copy).
+/// TODO: Why doesn't this slice by the length?
 /// </summary>
 internal sealed class NativeBuffer<T> : IDisposable where T : struct
 {
-    private IMemoryOwner<byte>? _owner;
+    private static readonly Func<IMemoryOwner<byte>, ArrowBuffer> s_createBuffer = BuildCreateBuffer();
+    private const int Alignment = 64;
+
+    private NativeMemoryManager? _owner;
     private int _byteLength;
 
     /// <summary>Number of <typeparamref name="T"/> elements that fit in the buffer.</summary>
@@ -151,11 +93,9 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
     public NativeBuffer(int elementCount, bool zeroFill = true)
     {
         int elementSize = Unsafe.SizeOf<T>();
-        int rawBytes = elementCount * elementSize;
-        // Round up to 64-byte boundary
-        _byteLength = (rawBytes + 63) & ~63;
-        Length = _byteLength / elementSize;
-        _owner = NativeAllocator.Instance.Allocate(_byteLength, zeroFill);
+        _byteLength = checked(elementCount * elementSize);
+        Length = elementCount;
+        _owner = new NativeMemoryManager(_byteLength, Alignment, zeroFill);
     }
 
     /// <summary>Gets a <see cref="Span{T}"/> over the native buffer.</summary>
@@ -178,7 +118,7 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
     {
         var owner = _owner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
         _owner = null;
-        return NativeAllocator.CreateBuffer(owner);
+        return s_createBuffer(owner);
     }
 
     /// <summary>
@@ -187,35 +127,45 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
     /// </summary>
     public void Grow(int newElementCount)
     {
-        int elementSize = Unsafe.SizeOf<T>();
-        int needed = (newElementCount * elementSize + 63) & ~63;
-        if (needed <= _byteLength)
+        if (newElementCount <= Length)
             return;
 
         // Exponential growth (2x) to amortise repeated grows
-        int newBytes = Math.Max(needed, _byteLength * 2);
+        // TODO: There might be a size that's big enough to work for this case but not too big to overflow.
+        // We could use that instead of blindly doubling.
+        int newCount = Math.Max(newElementCount, checked(Length * 2));
+        int elementSize = Unsafe.SizeOf<T>();
+        int needed = checked(newCount * elementSize);
 
-        if (_owner is NativeMemoryManager mgr)
-        {
-            // In-place realloc: OS can extend the block without a copy if space is available
-            mgr.Reallocate(newBytes);
-        }
-        else
-        {
-            var newOwner = NativeAllocator.Instance.Allocate(newBytes, zeroFill: false);
-            _owner!.Memory.Span.CopyTo(newOwner.Memory.Span);
-            _owner.Dispose();
-            _owner = newOwner;
-        }
+        var owner = _owner ?? throw new ObjectDisposedException(nameof(NativeBuffer<T>));
+        owner.Reallocate(needed);
 
-        _byteLength = newBytes;
-        Length = _byteLength / elementSize;
+        _byteLength = needed;
+        Length = newCount;
     }
 
     public void Dispose()
     {
-        _owner?.Dispose();
+        IDisposable? disposable = _owner;
+        disposable?.Dispose();
         _owner = null;
+    }
+
+    private static Func<IMemoryOwner<byte>, ArrowBuffer> BuildCreateBuffer()
+    {
+        // ArrowBuffer has an internal constructor: ArrowBuffer(IMemoryOwner<byte>)
+        // We use a compiled expression to call it efficiently.
+        var ctor = typeof(ArrowBuffer).GetConstructor(
+            BindingFlags.Instance | BindingFlags.NonPublic,
+            binder: null,
+            types: [typeof(IMemoryOwner<byte>)],
+            modifiers: null)
+            ?? throw new InvalidOperationException(
+                "Could not find ArrowBuffer(IMemoryOwner<byte>) constructor.");
+
+        var param = Expression.Parameter(typeof(IMemoryOwner<byte>), "owner");
+        var newExpr = Expression.New(ctor, param);
+        return Expression.Lambda<Func<IMemoryOwner<byte>, ArrowBuffer>>(newExpr, param).Compile();
     }
 }
 
@@ -280,4 +230,3 @@ public static class NativeMemoryTracker
         }
     }
 }
-

@@ -12,7 +12,7 @@ src/
     IO/                           Random-access and sequential I/O abstractions
       Local/                      Local file backends
     Compression/                  Codec dispatch (compress + decompress)
-    Arrow/                        NativeAllocator, NativeBuffer<T>
+    Arrow/                        NativeBuffer<T>
   EngineeredWood.Parquet/         Parquet format implementation (~63 source files)
     Parquet/
       Thrift/                     Thrift Compact Protocol codec
@@ -91,7 +91,7 @@ The shared `CompressionCodec` enum uses semantic names. Format-specific mapping 
 
 ### Arrow helpers (`EngineeredWood.Arrow`)
 
-`NativeAllocator` provides 64-byte-aligned native memory via `NativeMemoryManager`. `NativeBuffer<T>` is a growable buffer backed by native memory that can be transferred to Arrow without copying.
+`NativeBuffer<T>` is a growable buffer backed by native memory that can be transferred to Arrow without copying.
 
 ---
 
