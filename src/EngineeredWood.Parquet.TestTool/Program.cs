@@ -69,8 +69,9 @@ static async Task<int> CreateTestFile(string[] args)
         .Field(new Field("flag", Int32Type.Default, nullable: false))
         .Build();
 
-    // Write in chunks to avoid building a huge in-memory RecordBatch.
-    // RowGroupMaxRows is set very high so the writer doesn't auto-split.
+    // Build the entire batch in memory so it gets written as a single row group.
+    // This uses RAM proportional to the target size, but the purpose of this tool
+    // is to produce files with one large row group for memory-consumption testing.
     var writeOptions = new ParquetWriteOptions
     {
         Compression = CompressionCodec.Snappy,
@@ -80,26 +81,19 @@ static async Task<int> CreateTestFile(string[] args)
     };
 
     var sw = Stopwatch.StartNew();
-    long rowsWritten = 0;
-    const int chunkRows = 100_000;
 
+    Console.Write("  Building batch in memory...");
+    var batch = GenerateRandomBatch(schema, totalRows, startId: 0);
+    Console.WriteLine($" done ({sw.Elapsed.TotalSeconds:F1}s, {FormatBytes(GC.GetTotalMemory(false))} heap)");
+
+    Console.Write("  Writing...");
     await using (var file = new LocalSequentialFile(path))
     await using (var writer = new ParquetFileWriter(file, ownsFile: false, writeOptions))
     {
-        while (rowsWritten < totalRows)
-        {
-            int batchRows = (int)Math.Min(chunkRows, totalRows - rowsWritten);
-            var batch = GenerateRandomBatch(schema, batchRows, rowsWritten);
-            await writer.WriteRowGroupAsync(batch);
-            rowsWritten += batchRows;
-
-            if (rowsWritten % 1_000_000 == 0 || rowsWritten == totalRows)
-                Console.Write($"\r  Written {rowsWritten:N0} / {totalRows:N0} rows...");
-        }
+        await writer.WriteRowGroupAsync(batch);
         await writer.CloseAsync();
     }
-
-    Console.WriteLine();
+    Console.WriteLine(" done");
 
     var fileInfo = new FileInfo(path);
     Console.WriteLine($"File size:    {FormatBytes(fileInfo.Length)}");
