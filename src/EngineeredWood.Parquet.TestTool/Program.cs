@@ -49,25 +49,26 @@ static async Task<int> CreateTestFile(string[] args)
     string path = args[0];
     long targetBytes = ParseSize(args[2]);
 
-    // Schema: 4 columns of different types to make a realistic workload.
+    // Schema: fixed-width columns that are easy to bulk-fill and don't
+    // run into .NET's 2 GB single-array limit.
     //   id        Int64   (8 bytes)
-    //   payload   Binary  (variable, ~64 bytes avg)
-    //   value     Double  (8 bytes)
+    //   v0..v5    Int64   (8 bytes each, 6 columns)
     //   flag      Int32   (4 bytes)
-    // Approximate row size: 8 + 64 + 4 (offset) + 8 + 4 ≈ 88 bytes
-    const int approxRowBytes = 88;
+    // Approximate row size: 7×8 + 4 = 60 bytes
+    const int numInt64Cols = 7; // id + v0..v5
+    const int approxRowBytes = numInt64Cols * 8 + 4;
     int totalRows = (int)Math.Min(targetBytes / approxRowBytes, int.MaxValue);
 
     Console.WriteLine($"Target size:  {FormatBytes(targetBytes)}");
     Console.WriteLine($"Rows:         {totalRows:N0}");
     Console.WriteLine($"Output:       {path}");
 
-    var schema = new Apache.Arrow.Schema.Builder()
-        .Field(new Field("id", Int64Type.Default, nullable: false))
-        .Field(new Field("payload", BinaryType.Default, nullable: false))
-        .Field(new Field("value", DoubleType.Default, nullable: false))
-        .Field(new Field("flag", Int32Type.Default, nullable: false))
-        .Build();
+    var schemaBuilder = new Apache.Arrow.Schema.Builder()
+        .Field(new Field("id", Int64Type.Default, nullable: false));
+    for (int c = 0; c < numInt64Cols - 1; c++)
+        schemaBuilder.Field(new Field($"v{c}", Int64Type.Default, nullable: false));
+    schemaBuilder.Field(new Field("flag", Int32Type.Default, nullable: false));
+    var schema = schemaBuilder.Build();
 
     // Build the entire batch in memory so it gets written as a single row group.
     // This uses RAM proportional to the target size, but the purpose of this tool
@@ -103,32 +104,32 @@ static async Task<int> CreateTestFile(string[] args)
 
 static RecordBatch GenerateRandomBatch(Apache.Arrow.Schema schema, int rowCount, long startId)
 {
-    var idBuilder = new Int64Array.Builder();
-    var payloadBuilder = new BinaryArray.Builder();
-    var valueBuilder = new DoubleArray.Builder();
-    var flagBuilder = new Int32Array.Builder();
+    // Build arrays from bulk-filled random buffers for speed.
+    var arrays = new List<IArrowArray>();
 
-    // Pre-allocate a buffer for random bytes
-    byte[] randomBuf = new byte[64];
-
+    // --- id (sequential Int64) ---
+    var ids = new long[rowCount];
     for (int i = 0; i < rowCount; i++)
+        ids[i] = startId + i;
+    arrays.Add(new Int64Array.Builder().AppendRange(ids).Build());
+
+    // --- v0..v5 (random Int64 columns) ---
+    int int64ColCount = schema.FieldsList.Count(f => f.DataType is Int64Type) - 1; // minus id
+    for (int c = 0; c < int64ColCount; c++)
     {
-        idBuilder.Append(startId + i);
-
-        // Random binary payload (resists compression)
-        RandomNumberGenerator.Fill(randomBuf);
-        payloadBuilder.Append(randomBuf);
-
-        valueBuilder.Append(BitConverter.Int64BitsToDouble(
-            (uint)RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue)
-            | ((long)RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue) << 32)));
-
-        flagBuilder.Append(RandomNumberGenerator.GetInt32(int.MinValue, int.MaxValue));
+        var values = new long[rowCount];
+        RandomNumberGenerator.Fill(
+            System.Runtime.InteropServices.MemoryMarshal.AsBytes(values.AsSpan()));
+        arrays.Add(new Int64Array.Builder().AppendRange(values).Build());
     }
 
-    return new RecordBatch(schema,
-        [idBuilder.Build(), payloadBuilder.Build(), valueBuilder.Build(), flagBuilder.Build()],
-        rowCount);
+    // --- flag (random Int32) ---
+    var ints = new int[rowCount];
+    RandomNumberGenerator.Fill(
+        System.Runtime.InteropServices.MemoryMarshal.AsBytes(ints.AsSpan()));
+    arrays.Add(new Int32Array.Builder().AppendRange(ints).Build());
+
+    return new RecordBatch(schema, arrays, rowCount);
 }
 
 // ---------------------------------------------------------------------------
