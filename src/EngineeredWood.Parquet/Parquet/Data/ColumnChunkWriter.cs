@@ -233,6 +233,23 @@ internal static class ColumnChunkWriter
         return new ColumnChunkResult { Data = buffer, MetaData = metadata };
     }
 
+    /// <summary>
+    /// Writes a dictionary-encoded column from a pre-built <see cref="DictionaryEncoder.DictionaryResult"/>.
+    /// Used by <see cref="BufferedParquetWriter"/> which builds dictionaries incrementally.
+    /// </summary>
+    internal static ColumnChunkResult WriteDictionaryColumnFromResult(
+        DictionaryEncoder.DictionaryResult dictResult,
+        int rowCount,
+        IReadOnlyList<string> pathInSchema,
+        PhysicalType physicalType,
+        int maxDefLevel,
+        int maxRepLevel,
+        int[]? defLevels,
+        int[]? repLevels,
+        ParquetWriteOptions options) =>
+        WriteDictionaryColumn(dictResult, rowCount, pathInSchema, physicalType,
+            maxDefLevel, maxRepLevel, defLevels, repLevels, options);
+
     private static ColumnChunkResult WriteDictionaryColumn(
         DictionaryEncoder.DictionaryResult dictResult,
         int rowCount,

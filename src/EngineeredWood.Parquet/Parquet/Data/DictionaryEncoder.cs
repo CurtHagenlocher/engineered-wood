@@ -10,7 +10,7 @@ namespace EngineeredWood.Parquet.Data;
 /// </summary>
 internal static class DictionaryEncoder
 {
-    private const float CardinalityThreshold = 0.20f;
+    internal const float CardinalityThreshold = 0.20f;
 
     internal readonly struct DictionaryResult
     {

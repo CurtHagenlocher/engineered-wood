@@ -23,6 +23,7 @@ internal sealed class NativeMemoryManager : MemoryManager<byte>
         _pointer = NativeMemory.AlignedAlloc((nuint)length, (nuint)alignment);
         if (zeroFill)
             NativeMemory.Clear(_pointer, (nuint)length);
+        NativeMemoryTracker.OnAlloc(length);
     }
 
     public override Span<byte> GetSpan()
@@ -49,6 +50,7 @@ internal sealed class NativeMemoryManager : MemoryManager<byte>
         {
             if (_pointer != null)
             {
+                NativeMemoryTracker.OnFree(_length);
                 NativeMemory.AlignedFree(_pointer);
                 _pointer = null;
             }
@@ -61,8 +63,10 @@ internal sealed class NativeMemoryManager : MemoryManager<byte>
     /// </summary>
     public unsafe void Reallocate(int newLength)
     {
+        int oldLength = _length;
         _pointer = NativeMemory.AlignedRealloc(_pointer, (nuint)newLength, 64);
         _length = newLength;
+        NativeMemoryTracker.OnRealloc(oldLength, newLength);
     }
 }
 
@@ -212,6 +216,68 @@ internal sealed class NativeBuffer<T> : IDisposable where T : struct
     {
         _owner?.Dispose();
         _owner = null;
+    }
+}
+
+/// <summary>
+/// Thread-safe tracker for native (unmanaged) memory allocated by <see cref="NativeMemoryManager"/>.
+/// Provides live and peak counters for use in benchmarks and diagnostics.
+/// </summary>
+public static class NativeMemoryTracker
+{
+    private static long s_liveBytes;
+    private static long s_peakBytes;
+    private static long s_totalAllocated;
+
+    /// <summary>Current live (allocated but not yet freed) native bytes.</summary>
+    public static long LiveBytes => Volatile.Read(ref s_liveBytes);
+
+    /// <summary>Peak live native bytes since the last reset.</summary>
+    public static long PeakBytes => Volatile.Read(ref s_peakBytes);
+
+    /// <summary>Total native bytes allocated since the last reset (cumulative, does not decrease on free).</summary>
+    public static long TotalAllocated => Volatile.Read(ref s_totalAllocated);
+
+    /// <summary>Resets all counters to zero. Call before a measurement interval.</summary>
+    public static void Reset()
+    {
+        Volatile.Write(ref s_liveBytes, 0);
+        Volatile.Write(ref s_peakBytes, 0);
+        Volatile.Write(ref s_totalAllocated, 0);
+    }
+
+    internal static void OnAlloc(int bytes)
+    {
+        Interlocked.Add(ref s_totalAllocated, bytes);
+        long live = Interlocked.Add(ref s_liveBytes, bytes);
+        UpdatePeak(live);
+    }
+
+    internal static void OnFree(int bytes)
+    {
+        Interlocked.Add(ref s_liveBytes, -bytes);
+    }
+
+    internal static void OnRealloc(int oldBytes, int newBytes)
+    {
+        int delta = newBytes - oldBytes;
+        if (delta > 0)
+            Interlocked.Add(ref s_totalAllocated, delta);
+        long live = Interlocked.Add(ref s_liveBytes, delta);
+        if (delta > 0)
+            UpdatePeak(live);
+    }
+
+    private static void UpdatePeak(long candidate)
+    {
+        long current = Volatile.Read(ref s_peakBytes);
+        while (candidate > current)
+        {
+            long prev = Interlocked.CompareExchange(ref s_peakBytes, candidate, current);
+            if (prev == current)
+                break;
+            current = prev;
+        }
     }
 }
 
