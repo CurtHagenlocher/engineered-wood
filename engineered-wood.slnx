@@ -3,6 +3,7 @@
     <Project Path="src/EngineeredWood.Core/EngineeredWood.Core.csproj" />
     <Project Path="src/EngineeredWood.Azure/EngineeredWood.Azure.csproj" />
     <Project Path="src/EngineeredWood.Parquet/EngineeredWood.Parquet.csproj" />
+    <Project Path="src/EngineeredWood.Parquet.TestTool/EngineeredWood.Parquet.TestTool.csproj" />
     <Project Path="src/EngineeredWood.Orc/EngineeredWood.Orc.csproj" />
     <Project Path="src/EngineeredWood.Avro/EngineeredWood.Avro.csproj" />
   </Folder>
