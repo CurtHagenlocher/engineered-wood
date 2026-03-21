@@ -28,12 +28,28 @@ in the test output.
 To enable them, install Python 3.8+ and the following packages:
 
 ```
-pip install pyarrow fastavro
+pip install pyarrow fastavro tzdata
 ```
 
-The detection logic runs `python -c "import pyarrow.orc"` (ORC) and
-`python -c "import fastavro"` (Avro). The `python` command must be on
-your PATH.
+The `tzdata` package is required on Windows — PyArrow's Arrow C++ ORC
+reader needs IANA timezone data that isn't available natively on Windows.
+The test harness automatically detects the `tzdata` package and sets
+the `TZDIR` environment variable for the Python subprocess. If you still
+see timezone-related errors, you can set `TZDIR` manually:
+
+```
+# PowerShell (session)
+$env:TZDIR = "$(python -c "import os, tzdata; print(os.path.join(os.path.dirname(tzdata.__file__), 'zoneinfo'))")"
+
+# Or set permanently via System Properties → Environment Variables
+# Value: C:\Users\<you>\AppData\Local\Programs\Python\Python3XX\Lib\site-packages\tzdata\zoneinfo
+```
+
+**Python discovery:** The tests try `python3` and `python` on PATH,
+then fall back to scanning `%LOCALAPPDATA%\Programs\Python\Python*\`.
+On Windows, you may need to disable the Microsoft Store "python.exe"
+app execution alias (Settings → Apps → Advanced app settings → App
+execution aliases → turn off "python.exe" and "python3.exe").
 
 | Test suite | Python package | Tests enabled | What they validate |
 |---|---|---|---|

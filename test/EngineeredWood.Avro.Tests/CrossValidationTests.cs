@@ -55,6 +55,31 @@ public class CrossValidationTests
 
     private static readonly string? PythonExe = FindPythonExe();
 
+    private static readonly string? TzDataDir = FindTzDataDir();
+
+    private static string? FindTzDataDir()
+    {
+        if (PythonExe == null) return null;
+        try
+        {
+            var psi = new ProcessStartInfo(PythonExe,
+                "-c \"import os, tzdata; print(os.path.join(os.path.dirname(tzdata.__file__), 'zoneinfo'))\"")
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+                CreateNoWindow = true,
+            };
+            var p = Process.Start(psi)!;
+            var stdout = p.StandardOutput.ReadToEnd().Trim();
+            p.WaitForExit(5000);
+            if (p.ExitCode == 0 && Directory.Exists(stdout))
+                return stdout;
+        }
+        catch { }
+        return null;
+    }
+
     private static ProcessStartInfo PythonPsi(string arguments)
     {
         var psi = new ProcessStartInfo(PythonExe!, arguments)
@@ -64,14 +89,12 @@ public class CrossValidationTests
             UseShellExecute = false,
             CreateNoWindow = true,
         };
-        if (PythonExe != null && !psi.Environment.ContainsKey("TZDIR"))
+
+        if (TzDataDir != null && !psi.Environment.ContainsKey("TZDIR"))
         {
-            var sitePackages = Path.Combine(
-                Path.GetDirectoryName(PythonExe)!, "Lib", "site-packages");
-            var tzdir = Path.Combine(sitePackages, "tzdata", "zoneinfo");
-            if (Directory.Exists(tzdir))
-                psi.Environment["TZDIR"] = tzdir;
+            psi.Environment["TZDIR"] = TzDataDir;
         }
+
         return psi;
     }
 
