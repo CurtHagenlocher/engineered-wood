@@ -220,7 +220,7 @@ public static class TestFileGenerator
         using var col = rowGroup.NextColumn().LogicalWriter<long>();
         var values = new long[rowCount];
         for (int j = 0; j < rowCount; j++)
-            values[j] = random.NextInt64();
+            values[j] = NextInt64(random);
         col.WriteBatch(values);
     }
 
@@ -259,7 +259,7 @@ public static class TestFileGenerator
         using var col = rowGroup.NextColumn().LogicalWriter<long?>();
         var values = new long?[rowCount];
         for (int j = 0; j < rowCount; j++)
-            values[j] = random.NextDouble() < NullRate ? null : random.NextInt64();
+            values[j] = random.NextDouble() < NullRate ? null : NextInt64(random);
         col.WriteBatch(values);
     }
 
@@ -426,6 +426,15 @@ public static class TestFileGenerator
     }
 
     // --- Helpers ---
+
+    private static long NextInt64(Random random)
+    {
+#if NET8_0_OR_GREATER
+        return random.NextInt64();
+#else
+        return ((long)random.Next() << 32) | (uint)random.Next();
+#endif
+    }
 
     private static byte[][] GenerateStringPool(Random random, int count, int minLen, int maxLen)
     {

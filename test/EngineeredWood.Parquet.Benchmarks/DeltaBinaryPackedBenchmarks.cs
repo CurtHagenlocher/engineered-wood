@@ -99,7 +99,7 @@ public class DeltaBinaryPackedBenchmarks
     private static long[] GenerateInt64WithDeltas(Random random, int count, int minDelta, int maxDelta)
     {
         var values = new long[count];
-        values[0] = random.NextInt64();
+        values[0] = NextInt64(random);
         for (int i = 1; i < count; i++)
             values[i] = values[i - 1] + random.Next(minDelta, maxDelta + 1);
         return values;
@@ -156,10 +156,10 @@ public class DeltaBinaryPackedBenchmarks
                 for (int i = mbStart; i < mbEnd; i++)
                     maxVal = Math.Max(maxVal, deltas[i] - minDelta);
 
-                bitWidths[mb] = maxVal == 0 ? (byte)0 : (byte)(64 - long.LeadingZeroCount(maxVal));
+                bitWidths[mb] = maxVal == 0 ? (byte)0 : (byte)(64 - LeadingZeroCount(maxVal));
             }
 
-            ms.Write(bitWidths);
+            ms.Write(bitWidths, 0, bitWidths.Length);
 
             // Write bit-packed deltas per miniblock
             for (int mb = 0; mb < MiniblockCount; mb++)
@@ -183,13 +183,40 @@ public class DeltaBinaryPackedBenchmarks
                     bitOffset += bitWidth;
                 }
 
-                ms.Write(packed);
+                ms.Write(packed, 0, packed.Length);
             }
 
             deltaIdx += blockCount;
         }
 
         return ms.ToArray();
+    }
+
+    private static int LeadingZeroCount(long value)
+    {
+#if NET8_0_OR_GREATER
+        return (int)long.LeadingZeroCount(value);
+#else
+        ulong v = (ulong)value;
+        if (v == 0) { return 64; }
+        int n = 0;
+        if ((v & 0xFFFFFFFF00000000UL) == 0) { n += 32; v <<= 32; }
+        if ((v & 0xFFFF000000000000UL) == 0) { n += 16; v <<= 16; }
+        if ((v & 0xFF00000000000000UL) == 0) { n += 8; v <<= 8; }
+        if ((v & 0xF000000000000000UL) == 0) { n += 4; v <<= 4; }
+        if ((v & 0xC000000000000000UL) == 0) { n += 2; v <<= 2; }
+        if ((v & 0x8000000000000000UL) == 0) { n += 1; }
+        return n;
+#endif
+    }
+
+    private static long NextInt64(Random random)
+    {
+#if NET8_0_OR_GREATER
+        return random.NextInt64();
+#else
+        return ((long)random.Next() << 32) | (uint)random.Next();
+#endif
     }
 
     private static void WriteBitPacked(byte[] buffer, int bitOffset, long value, int bitWidth)

@@ -105,7 +105,16 @@ public class ByteStreamSplitBenchmarks
     {
         var values = new long[count];
         for (int i = 0; i < count; i++)
-            values[i] = random.NextInt64();
+            values[i] = NextInt64(random);
         return values;
+    }
+
+    private static long NextInt64(Random random)
+    {
+#if NET8_0_OR_GREATER
+        return random.NextInt64();
+#else
+        return ((long)random.Next() << 32) | (uint)random.Next();
+#endif
     }
 }

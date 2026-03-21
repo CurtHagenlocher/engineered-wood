@@ -223,7 +223,11 @@ public class DefaultWriteBenchmarks
             new DataField<string>("name"),
             new DataField<bool?>("flag"));
 
+#if NET8_0_OR_GREATER
         await using var stream = File.Create(path);
+#else
+        using var stream = File.Create(path);
+#endif
         using var writer = await ParquetWriter.CreateAsync(schema, stream);
         using var group = writer.CreateRowGroup();
 

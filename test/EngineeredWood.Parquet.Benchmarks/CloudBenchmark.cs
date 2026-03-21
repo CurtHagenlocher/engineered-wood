@@ -94,7 +94,14 @@ public static class CloudBenchmark
         await RunParquetSharp(blobClient, rowGroupIndex, iterations);
 
         // --- Parquet.Net (via Azure BlobClient.OpenRead stream) ---
-        await RunParquetNet(blobClient, rowGroupIndex, iterations);
+        try
+        {
+            await RunParquetNet(blobClient, rowGroupIndex, iterations);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"{"Parquet.Net",-52} FAILED: {ex.GetType().Name}: {ex.Message}");
+        }
 
         Console.WriteLine();
 
@@ -139,8 +146,13 @@ public static class CloudBenchmark
         for (int i = 0; i < iterations; i++)
         {
             sw.Restart();
+#if NET8_0_OR_GREATER
             await using var stream = await blobClient.OpenReadAsync(
                 new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#else
+            using var stream = await blobClient.OpenReadAsync(
+                new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#endif
 
             using var reader = new ParquetSharp.ParquetFileReader(stream, leaveOpen: false);
             using var rowGroup = reader.RowGroup(rowGroupIndex);
@@ -199,8 +211,13 @@ public static class CloudBenchmark
         for (int i = 0; i < iterations; i++)
         {
             sw.Restart();
+#if NET8_0_OR_GREATER
             await using var stream = await blobClient.OpenReadAsync(
                 new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#else
+            using var stream = await blobClient.OpenReadAsync(
+                new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#endif
 
             using var reader = await global::Parquet.ParquetReader.CreateAsync(stream);
             using var rg = reader.OpenRowGroupReader(rowGroupIndex);
@@ -244,8 +261,13 @@ public static class CloudBenchmark
         Console.WriteLine("Reading via Parquet.Net...");
         global::Parquet.Data.DataColumn[] pnetColumns;
         {
+#if NET8_0_OR_GREATER
             await using var stream = await blobClient.OpenReadAsync(
                 new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#else
+            using var stream = await blobClient.OpenReadAsync(
+                new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#endif
             using var reader = await global::Parquet.ParquetReader.CreateAsync(stream);
             using var rg = reader.OpenRowGroupReader(rowGroupIndex);
             var fields = reader.Schema.GetDataFields();
@@ -258,8 +280,13 @@ public static class CloudBenchmark
         System.Array[] psColumns;
         string[] psTypeNames;
         {
+#if NET8_0_OR_GREATER
             await using var stream = await blobClient.OpenReadAsync(
                 new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#else
+            using var stream = await blobClient.OpenReadAsync(
+                new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
+#endif
             using var reader = new ParquetSharp.ParquetFileReader(stream, leaveOpen: false);
             using var rowGroup = reader.RowGroup(rowGroupIndex);
             int numCols = rowGroup.MetaData.NumColumns;

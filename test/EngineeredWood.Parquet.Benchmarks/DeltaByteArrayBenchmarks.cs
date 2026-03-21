@@ -150,7 +150,8 @@ public class DeltaByteArrayBenchmarks
             while (commonLen < maxCommon && prev[commonLen] == curr[commonLen])
                 commonLen++;
             prefixLengths[i] = commonLen;
-            suffixes[i] = curr[commonLen..];
+            suffixes[i] = new byte[curr.Length - commonLen];
+            Array.Copy(curr, commonLen, suffixes[i], 0, suffixes[i].Length);
         }
 
         // Encode: prefix lengths as DELTA_BINARY_PACKED + suffixes as DELTA_LENGTH_BYTE_ARRAY
@@ -203,10 +204,10 @@ public class DeltaByteArrayBenchmarks
                 long maxVal = 0;
                 for (int i = mbStart; i < mbEnd; i++)
                     maxVal = Math.Max(maxVal, deltas[i] - minDelta);
-                bitWidths[mb] = maxVal == 0 ? (byte)0 : (byte)(64 - long.LeadingZeroCount(maxVal));
+                bitWidths[mb] = maxVal == 0 ? (byte)0 : (byte)(64 - LeadingZeroCount(maxVal));
             }
 
-            ms.Write(bitWidths);
+            ms.Write(bitWidths, 0, bitWidths.Length);
 
             for (int mb = 0; mb < MiniblockCount; mb++)
             {
@@ -226,13 +227,31 @@ public class DeltaByteArrayBenchmarks
                     WriteBitPacked(packed, bitOffset, val, bitWidth);
                     bitOffset += bitWidth;
                 }
-                ms.Write(packed);
+                ms.Write(packed, 0, packed.Length);
             }
 
             deltaIdx += blockCount;
         }
 
         return ms.ToArray();
+    }
+
+    private static int LeadingZeroCount(long value)
+    {
+#if NET8_0_OR_GREATER
+        return (int)long.LeadingZeroCount(value);
+#else
+        ulong v = (ulong)value;
+        if (v == 0) { return 64; }
+        int n = 0;
+        if ((v & 0xFFFFFFFF00000000UL) == 0) { n += 32; v <<= 32; }
+        if ((v & 0xFFFF000000000000UL) == 0) { n += 16; v <<= 16; }
+        if ((v & 0xFF00000000000000UL) == 0) { n += 8; v <<= 8; }
+        if ((v & 0xF000000000000000UL) == 0) { n += 4; v <<= 4; }
+        if ((v & 0xC000000000000000UL) == 0) { n += 2; v <<= 2; }
+        if ((v & 0x8000000000000000UL) == 0) { n += 1; }
+        return n;
+#endif
     }
 
     private static void WriteBitPacked(byte[] buffer, int bitOffset, long value, int bitWidth)
