@@ -14,17 +14,77 @@ public class CrossValidationTests
 {
     private static string GetTempPath() => Path.Combine(Path.GetTempPath(), $"storc_xval_{Guid.NewGuid():N}.orc");
 
+    private static string? FindPythonExe()
+    {
+        foreach (var candidate in new[] { "python3", "python" })
+        {
+            try
+            {
+                var psi = new ProcessStartInfo(candidate, "--version")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                var p = Process.Start(psi)!;
+                p.WaitForExit(3000);
+                if (p.ExitCode == 0)
+                    return candidate;
+            }
+            catch { }
+        }
+
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var pythonDir = Path.Combine(home, "Programs", "Python");
+        if (Directory.Exists(pythonDir))
+        {
+            foreach (var dir in Directory.EnumerateDirectories(pythonDir, "Python*"))
+            {
+                var exe = Path.Combine(dir, "python.exe");
+                if (File.Exists(exe))
+                    return exe;
+            }
+        }
+
+        return null;
+    }
+
+    private static readonly string? PythonExe = FindPythonExe();
+
+    /// <summary>
+    /// Creates a ProcessStartInfo for running a Python script, setting TZDIR
+    /// so PyArrow's ORC reader can find timezone data on Windows.
+    /// </summary>
+    private static ProcessStartInfo PythonPsi(string arguments)
+    {
+        var psi = new ProcessStartInfo(PythonExe!, arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+
+        // PyArrow's Arrow C++ library needs TZDIR on Windows to find timezone data.
+        if (PythonExe != null && !psi.Environment.ContainsKey("TZDIR"))
+        {
+            var sitePackages = Path.Combine(
+                Path.GetDirectoryName(PythonExe)!, "Lib", "site-packages");
+            var tzdir = Path.Combine(sitePackages, "tzdata", "zoneinfo");
+            if (Directory.Exists(tzdir))
+                psi.Environment["TZDIR"] = tzdir;
+        }
+
+        return psi;
+    }
+
     private static bool IsPyArrowAvailable()
     {
+        if (PythonExe == null) return false;
         try
         {
-            var psi = new ProcessStartInfo("python", "-c \"import pyarrow.orc\"")
-            {
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            var p = Process.Start(psi)!;
+            var p = Process.Start(PythonPsi("-c \"import pyarrow.orc\""))!;
             p.WaitForExit(5000);
             return p.ExitCode == 0;
         }
@@ -62,13 +122,7 @@ public class CrossValidationTests
                 "result['columns'] = columns\n" +
                 "print(json.dumps(result))\n");
 
-            var psi = new ProcessStartInfo("python", scriptPath)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
+            var psi = PythonPsi(scriptPath);
 
             var p = Process.Start(psi)!;
             var stdout = p.StandardOutput.ReadToEnd();
@@ -76,7 +130,7 @@ public class CrossValidationTests
             p.WaitForExit(10000);
 
             if (p.ExitCode != 0)
-                return null;
+                throw new Exception($"PyArrow script failed (exit {p.ExitCode}):\n{stderr}");
 
             return stdout.Trim();
         }
@@ -119,13 +173,7 @@ public class CrossValidationTests
                 "result['columns'] = columns\n" +
                 "print(json.dumps(result))\n");
 
-            var psi = new ProcessStartInfo("python", scriptPath)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
+            var psi = PythonPsi(scriptPath);
 
             var p = Process.Start(psi)!;
             var stdout = p.StandardOutput.ReadToEnd();
@@ -133,7 +181,7 @@ public class CrossValidationTests
             p.WaitForExit(10000);
 
             if (p.ExitCode != 0)
-                return null;
+                throw new Exception($"PyArrow script failed (exit {p.ExitCode}):\n{stderr}");
 
             return stdout.Trim();
         }
@@ -171,13 +219,7 @@ public class CrossValidationTests
                 "result['columns'] = columns\n" +
                 "print(json.dumps(result))\n");
 
-            var psi = new ProcessStartInfo("python", scriptPath)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
+            var psi = PythonPsi(scriptPath);
 
             var p = Process.Start(psi)!;
             var stdout = p.StandardOutput.ReadToEnd();
@@ -185,7 +227,7 @@ public class CrossValidationTests
             p.WaitForExit(10000);
 
             if (p.ExitCode != 0)
-                return null;
+                throw new Exception($"PyArrow script failed (exit {p.ExitCode}):\n{stderr}");
 
             return stdout.Trim();
         }

@@ -541,18 +541,70 @@ public class AvroPhase6Tests
 
     // ─── Helpers ───
 
+    private static string? FindPythonExe()
+    {
+        foreach (var candidate in new[] { "python3", "python" })
+        {
+            try
+            {
+                var psi = new ProcessStartInfo(candidate, "--version")
+                {
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                };
+                var p = Process.Start(psi)!;
+                p.WaitForExit(3000);
+                if (p.ExitCode == 0)
+                    return candidate;
+            }
+            catch { }
+        }
+
+        var home = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
+        var pythonDir = Path.Combine(home, "Programs", "Python");
+        if (Directory.Exists(pythonDir))
+        {
+            foreach (var dir in Directory.EnumerateDirectories(pythonDir, "Python*"))
+            {
+                var exe = Path.Combine(dir, "python.exe");
+                if (File.Exists(exe))
+                    return exe;
+            }
+        }
+
+        return null;
+    }
+
+    private static readonly string? PythonExe = FindPythonExe();
+
+    private static ProcessStartInfo PythonPsi(string arguments)
+    {
+        var psi = new ProcessStartInfo(PythonExe!, arguments)
+        {
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true,
+        };
+        if (PythonExe != null && !psi.Environment.ContainsKey("TZDIR"))
+        {
+            var sitePackages = Path.Combine(
+                Path.GetDirectoryName(PythonExe)!, "Lib", "site-packages");
+            var tzdir = Path.Combine(sitePackages, "tzdata", "zoneinfo");
+            if (Directory.Exists(tzdir))
+                psi.Environment["TZDIR"] = tzdir;
+        }
+        return psi;
+    }
+
     private static bool IsFastavroAvailable()
     {
+        if (PythonExe == null) return false;
         try
         {
-            var psi = new ProcessStartInfo("python", "-c \"import fastavro\"")
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            var p = Process.Start(psi)!;
+            var p = Process.Start(PythonPsi("-c \"import fastavro\""))!;
             p.WaitForExit(5000);
             return p.ExitCode == 0;
         }
@@ -634,14 +686,7 @@ print(json.dumps(result))
 
         try
         {
-            var psi = new ProcessStartInfo("python", scriptPath)
-            {
-                RedirectStandardOutput = true,
-                RedirectStandardError = true,
-                UseShellExecute = false,
-                CreateNoWindow = true,
-            };
-            var p = Process.Start(psi)!;
+            var p = Process.Start(PythonPsi(scriptPath))!;
             var stdout = p.StandardOutput.ReadToEnd();
             var stderr = p.StandardError.ReadToEnd();
             p.WaitForExit(10000);
