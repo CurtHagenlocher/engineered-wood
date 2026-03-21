@@ -49,32 +49,55 @@ internal static class Decompressor
         return Snappy.Decompress(source, destination);
     }
 
-    private static unsafe int DecompressGzip(ReadOnlySpan<byte> source, Span<byte> destination)
+    private static int DecompressGzip(ReadOnlySpan<byte> source, Span<byte> destination)
     {
-        fixed (byte* ptr = source)
-        {
-            using var sourceStream = new UnmanagedMemoryStream(ptr, source.Length);
-            using var gzip = new GZipStream(sourceStream, CompressionMode.Decompress);
-            int totalRead = 0;
 #if NET6_0_OR_GREATER
-            while (totalRead < destination.Length)
+        unsafe
+        {
+            fixed (byte* ptr = source)
             {
-                int read = gzip.Read(destination.Slice(totalRead));
-                if (read == 0) break;
-                totalRead += read;
+                using var sourceStream = new UnmanagedMemoryStream(ptr, source.Length);
+                using var gzip = new GZipStream(sourceStream, CompressionMode.Decompress);
+                int totalRead = 0;
+                while (totalRead < destination.Length)
+                {
+                    int read = gzip.Read(destination.Slice(totalRead));
+                    if (read == 0) break;
+                    totalRead += read;
+                }
+                return totalRead;
             }
-#else
-            byte[] tempBuffer = new byte[destination.Length];
-            while (totalRead < tempBuffer.Length)
-            {
-                int read = gzip.Read(tempBuffer, totalRead, tempBuffer.Length - totalRead);
-                if (read == 0) break;
-                totalRead += read;
-            }
-            tempBuffer.AsSpan(0, totalRead).CopyTo(destination);
-#endif
-            return totalRead;
         }
+#else
+        // .NET Framework's GZipStream stops after the first Gzip member and may
+        // over-read the underlying stream. Use a MemoryStream and re-create the
+        // GZipStream for each concatenated member (per RFC 1952).
+        byte[] sourceArray = source.ToArray();
+        var sourceStream = new MemoryStream(sourceArray);
+        byte[] tempBuffer = new byte[destination.Length];
+        int totalRead = 0;
+
+        while (sourceStream.Position < sourceStream.Length && totalRead < tempBuffer.Length)
+        {
+            // Mark start so we can detect if GZipStream consumed anything
+            long before = sourceStream.Position;
+            using (var gzip = new GZipStream(sourceStream, CompressionMode.Decompress, leaveOpen: true))
+            {
+                while (totalRead < tempBuffer.Length)
+                {
+                    int read = gzip.Read(tempBuffer, totalRead, tempBuffer.Length - totalRead);
+                    if (read == 0) break;
+                    totalRead += read;
+                }
+            }
+            // If GZipStream didn't advance the stream, we're stuck — break to avoid infinite loop
+            if (sourceStream.Position == before)
+                break;
+        }
+
+        tempBuffer.AsSpan(0, totalRead).CopyTo(destination);
+        return totalRead;
+#endif
     }
 
     private static int DecompressBrotli(ReadOnlySpan<byte> source, Span<byte> destination)
