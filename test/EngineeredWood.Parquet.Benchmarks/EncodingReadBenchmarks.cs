@@ -40,11 +40,11 @@ public class EncodingReadBenchmarks
     }
 
     [Benchmark(Baseline = true, Description = "EngineeredWood")]
-    public async Task<Apache.Arrow.RecordBatch> EngineeredWood_Read()
+    public async Task EngineeredWood_Read()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file);
-        return await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "ParquetSharp")]
