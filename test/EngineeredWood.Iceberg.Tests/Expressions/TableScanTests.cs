@@ -1,3 +1,4 @@
+using EngineeredWood.Expressions;
 using EngineeredWood.Iceberg.Expressions;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Iceberg.Manifest;

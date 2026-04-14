@@ -20,8 +20,6 @@
   </ItemGroup>
 
   <ItemGroup>
-    <ProjectReference Include="..\..\src\EngineeredWood.Core\EngineeredWood.Core.csproj" />
-    <ProjectReference Include="..\..\src\EngineeredWood.Iceberg\EngineeredWood.Iceberg.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
   </ItemGroup>
 

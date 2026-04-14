@@ -9,6 +9,8 @@
     <Project Path="src/EngineeredWood.DeltaLake/EngineeredWood.DeltaLake.csproj" />
     <Project Path="src/EngineeredWood.DeltaLake.Table/EngineeredWood.DeltaLake.Table.csproj" />
     <Project Path="src/EngineeredWood.Iceberg/EngineeredWood.Iceberg.csproj" />
+    <Project Path="src/EngineeredWood.Expressions/EngineeredWood.Expressions.csproj" />
+    <Project Path="src/EngineeredWood.Expressions.Arrow/EngineeredWood.Expressions.Arrow.csproj" />
   </Folder>
   <Folder Name="/test/">
     <Project Path="test/EngineeredWood.Parquet.Tests/EngineeredWood.Parquet.Tests.csproj" />
@@ -22,5 +24,7 @@
     <Project Path="test/EngineeredWood.DeltaLake.Table.Tests/EngineeredWood.DeltaLake.Table.Tests.csproj" />
     <Project Path="test/EngineeredWood.DeltaLake.Benchmarks/EngineeredWood.DeltaLake.Benchmarks.csproj" />
     <Project Path="test/EngineeredWood.Iceberg.Tests/EngineeredWood.Iceberg.Tests.csproj" />
+    <Project Path="test/EngineeredWood.Expressions.Tests/EngineeredWood.Expressions.Tests.csproj" />
+    <Project Path="test/EngineeredWood.Expressions.Arrow.Tests/EngineeredWood.Expressions.Arrow.Tests.csproj" />
   </Folder>
 </Solution>

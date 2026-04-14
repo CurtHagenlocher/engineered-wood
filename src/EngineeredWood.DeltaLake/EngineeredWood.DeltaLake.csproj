@@ -11,6 +11,7 @@
   <ItemGroup>
     <ProjectReference Include="..\EngineeredWood.Core\EngineeredWood.Core.csproj" />
     <ProjectReference Include="..\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
+    <ProjectReference Include="..\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">

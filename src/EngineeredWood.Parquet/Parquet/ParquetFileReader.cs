@@ -173,8 +173,34 @@ public sealed partial class ParquetFileReader : IAsyncDisposable, IDisposable
     {
         var metadata = await ReadMetadataAsync(cancellationToken).ConfigureAwait(false);
 
+        ParquetStatisticsAccessor? accessor = null;
+        SchemaDescriptor? schema = null;
+        if (_options.Filter is not null)
+        {
+            schema = await GetSchemaAsync(cancellationToken).ConfigureAwait(false);
+            accessor = new ParquetStatisticsAccessor(schema);
+        }
+
         for (int i = 0; i < metadata.RowGroups.Count; i++)
         {
+            if (accessor is not null && _options.Filter is not null)
+            {
+                var result = EngineeredWood.Expressions.StatisticsEvaluator.Evaluate(
+                    _options.Filter, metadata.RowGroups[i], accessor);
+                if (result == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
+                    continue;
+
+                if (_options.FilterUseBloomFilters
+                    && result == EngineeredWood.Expressions.FilterResult.Unknown)
+                {
+                    var bloomResult = await BloomFilterPredicateEvaluator.EvaluateAsync(
+                        _options.Filter, i, metadata, schema!,
+                        _file, _fileLength, cancellationToken).ConfigureAwait(false);
+                    if (bloomResult == EngineeredWood.Expressions.FilterResult.AlwaysFalse)
+                        continue;
+                }
+            }
+
             if (_options.BatchSize is > 0 || _options.MaxBatchByteSize is > 0)
             {
                 await foreach (var batch in ReadRowGroupBatchesAsync(i, columnNames, cancellationToken)

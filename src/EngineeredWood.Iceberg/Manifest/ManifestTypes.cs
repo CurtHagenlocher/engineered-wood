@@ -1,6 +1,6 @@
 using System.Text.Json;
 using System.Text.Json.Serialization;
-using EngineeredWood.Iceberg.Expressions;
+using EngineeredWood.Expressions;
 
 namespace EngineeredWood.Iceberg.Manifest;
 

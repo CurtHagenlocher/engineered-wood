@@ -726,15 +726,33 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// Reads all data from the current snapshot as a stream of RecordBatches.
     /// </summary>
-    public async IAsyncEnumerable<RecordBatch> ReadAllAsync(
+    public IAsyncEnumerable<RecordBatch> ReadAllAsync(
         IReadOnlyList<string>? columns = null,
+        CancellationToken cancellationToken = default) =>
+        ReadAllAsync(columns, filter: null, cancellationToken);
+
+    /// <summary>
+    /// Reads all data with an optional <see cref="EngineeredWood.Expressions.Predicate"/>
+    /// filter. When set, files whose partition values or column statistics
+    /// prove no rows can match are skipped before any data pages are read.
+    /// The reader does NOT re-apply the predicate per row; callers wanting
+    /// exact row-level filtering must do that on the returned batches.
+    /// </summary>
+    public async IAsyncEnumerable<RecordBatch> ReadAllAsync(
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         var snapshot = CurrentSnapshot;
+        var pruner = filter is null ? null : new DeltaFilePruner(
+            snapshot.Schema, snapshot.Metadata.PartitionColumns);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
+            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
+                continue;
+
             await foreach (var batch in ReadFileAsync(
                 addFile, columns, snapshot, cancellationToken).ConfigureAwait(false))
             {
@@ -746,17 +764,34 @@ public sealed class DeltaTable : IAsyncDisposable, IDisposable
     /// <summary>
     /// Reads data from a specific version (time travel).
     /// </summary>
-    public async IAsyncEnumerable<RecordBatch> ReadAtVersionAsync(
+    public IAsyncEnumerable<RecordBatch> ReadAtVersionAsync(
         long version,
         IReadOnlyList<string>? columns = null,
+        CancellationToken cancellationToken = default) =>
+        ReadAtVersionAsync(version, columns, filter: null, cancellationToken);
+
+    /// <summary>
+    /// Reads data from a specific version with an optional filter predicate.
+    /// See <see cref="ReadAllAsync(IReadOnlyList{string}, EngineeredWood.Expressions.Predicate, CancellationToken)"/>
+    /// for filter semantics.
+    /// </summary>
+    public async IAsyncEnumerable<RecordBatch> ReadAtVersionAsync(
+        long version,
+        IReadOnlyList<string>? columns,
+        EngineeredWood.Expressions.Predicate? filter,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         ThrowIfDisposed();
         var snapshot = await GetSnapshotAtVersionAsync(version, cancellationToken)
             .ConfigureAwait(false);
+        var pruner = filter is null ? null : new DeltaFilePruner(
+            snapshot.Schema, snapshot.Metadata.PartitionColumns);
 
         foreach (var addFile in snapshot.ActiveFiles.Values)
         {
+            if (pruner is not null && !pruner.ShouldInclude(addFile, filter!))
+                continue;
+
             await foreach (var batch in ReadFileAsync(
                 addFile, columns, snapshot, cancellationToken).ConfigureAwait(false))
             {

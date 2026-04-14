@@ -1,17 +1,18 @@
+using EngineeredWood.Expressions;
 using EngineeredWood.Iceberg.Manifest;
 using EngineeredWood.IO;
 
 namespace EngineeredWood.Iceberg.Expressions;
 
 /// <summary>
-/// Plans a table scan by evaluating filter expressions against file-level statistics
-/// to prune files that cannot contain matching rows.
+/// Plans a table scan by evaluating filter predicates against file-level
+/// statistics to prune files that cannot contain matching rows.
 /// </summary>
 public sealed class TableScan
 {
     private readonly TableMetadata _metadata;
     private readonly ITableFileSystem _fs;
-    private Expression _filter = Expression.True;
+    private Predicate _filter = EngineeredWood.Expressions.Expressions.True;
     private long? _snapshotId;
 
     /// <summary>
@@ -24,11 +25,13 @@ public sealed class TableScan
     }
 
     /// <summary>
-    /// Add a filter expression. Multiple filters are ANDed together.
+    /// Add a filter predicate. Multiple filters are ANDed together.
     /// </summary>
-    public TableScan Filter(Expression filter)
+    public TableScan Filter(Predicate filter)
     {
-        _filter = _filter is TrueExpression ? filter : Expressions.And(_filter, filter);
+        _filter = _filter is TruePredicate
+            ? filter
+            : EngineeredWood.Expressions.Expressions.And(_filter, filter);
         return this;
     }
 
@@ -60,10 +63,9 @@ public sealed class TableScan
         if (!await _fs.ExistsAsync(snapshot.ManifestList, ct).ConfigureAwait(false))
             return new ScanResult([], [], 0, 0);
 
-        // Bind the filter to the current schema
         var schema = effectiveMetadata.Schemas.First(
             s => s.SchemaId == effectiveMetadata.CurrentSchemaId);
-        var boundFilter = ExpressionBinder.Bind(_filter, schema);
+        var (boundFilter, accessor) = BindFilter(_filter, schema);
 
         var manifestList = await ManifestIO.ReadManifestListAsync(_fs, snapshot.ManifestList, ct)
             .ConfigureAwait(false);
@@ -95,15 +97,10 @@ public sealed class TableScan
                     continue;
                 }
 
-                // Evaluate filter against data file stats
-                if (boundFilter is not TrueExpression)
+                if (!ShouldInclude(boundFilter, accessor, entry.DataFile))
                 {
-                    var stats = BuildStats(entry.DataFile);
-                    if (!ManifestEvaluator.MightMatch(boundFilter, stats))
-                    {
-                        filesSkipped++;
-                        continue;
-                    }
+                    filesSkipped++;
+                    continue;
                 }
 
                 dataFiles.Add(entry.DataFile);
@@ -115,13 +112,12 @@ public sealed class TableScan
 
     /// <summary>
     /// Plan the scan against a pre-loaded list of data files (bypasses manifest I/O).
-    /// Useful when files are already in memory with column statistics attached.
     /// </summary>
     public ScanResult PlanFiles(IReadOnlyList<DataFile> candidateFiles)
     {
         var schema = _metadata.Schemas.First(
             s => s.SchemaId == _metadata.CurrentSchemaId);
-        var boundFilter = ExpressionBinder.Bind(_filter, schema);
+        var (boundFilter, accessor) = BindFilter(_filter, schema);
 
         var dataFiles = new List<DataFile>();
         var deleteFiles = new List<DataFile>();
@@ -138,14 +134,10 @@ public sealed class TableScan
 
             totalScanned++;
 
-            if (boundFilter is not TrueExpression)
+            if (!ShouldInclude(boundFilter, accessor, df))
             {
-                var stats = BuildStats(df);
-                if (!ManifestEvaluator.MightMatch(boundFilter, stats))
-                {
-                    skipped++;
-                    continue;
-                }
+                skipped++;
+                continue;
             }
 
             dataFiles.Add(df);
@@ -154,30 +146,34 @@ public sealed class TableScan
         return new ScanResult(dataFiles, deleteFiles, totalScanned, skipped);
     }
 
-    private static DataFileStats BuildStats(DataFile df)
+    /// <summary>
+    /// Binds the filter against the schema. Iceberg requires bound references
+    /// before evaluation; lookup is by field ID, so unresolved references are
+    /// left unbound (treated as Unknown by the evaluator so they don't filter
+    /// out files).
+    /// </summary>
+    private static (Predicate Filter, IcebergStatisticsAccessor Accessor) BindFilter(
+        Predicate filter, Schema schema)
     {
-        var lowerBounds = new Dictionary<int, LiteralValue>();
-        var upperBounds = new Dictionary<int, LiteralValue>();
+        var nameToId = schema.Fields.ToDictionary(f => f.Name, f => f.Id);
+        var binder = new ExpressionBinder(nameToId, allowUnresolved: true);
+        var bound = filter is TruePredicate ? filter : binder.Bind(filter);
+        return (bound, new IcebergStatisticsAccessor(nameToId));
+    }
 
-        if (df.ColumnLowerBounds is not null)
-        {
-            foreach (var (fieldId, value) in df.ColumnLowerBounds)
-                lowerBounds[fieldId] = value;
-        }
+    /// <summary>
+    /// Returns true if the file might contain matching rows. Skips files that
+    /// the evaluator proves cannot match.
+    /// </summary>
+    private static bool ShouldInclude(
+        Predicate filter, IcebergStatisticsAccessor accessor, DataFile df)
+    {
+        if (filter is TruePredicate)
+            return true;
 
-        if (df.ColumnUpperBounds is not null)
-        {
-            foreach (var (fieldId, value) in df.ColumnUpperBounds)
-                upperBounds[fieldId] = value;
-        }
-
-        return new DataFileStats
-        {
-            RecordCount = df.RecordCount,
-            LowerBounds = lowerBounds,
-            UpperBounds = upperBounds,
-            NullCounts = df.NullValueCounts ?? new Dictionary<int, long>(),
-        };
+        var stats = new DataFileStats(df);
+        var result = StatisticsEvaluator.Evaluate(filter, stats, accessor);
+        return result != FilterResult.AlwaysFalse;
     }
 }
 
@@ -185,10 +181,6 @@ public sealed class TableScan
 /// Result of a table scan plan, containing the data files that may match the filter
 /// and statistics about how many files were pruned.
 /// </summary>
-/// <param name="DataFiles">Data files that may contain matching rows.</param>
-/// <param name="DeleteFiles">Delete files that apply to the matched data files.</param>
-/// <param name="TotalFilesScanned">Total number of data files evaluated.</param>
-/// <param name="FilesSkipped">Number of data files pruned by the filter.</param>
 public sealed record ScanResult(
     IReadOnlyList<DataFile> DataFiles,
     IReadOnlyList<DataFile> DeleteFiles,
@@ -197,4 +189,65 @@ public sealed record ScanResult(
 {
     /// <summary>Number of data files that matched the filter.</summary>
     public int FilesMatched => DataFiles.Count;
+}
+
+/// <summary>
+/// Wraps a <see cref="DataFile"/> for evaluation by the shared
+/// <see cref="StatisticsEvaluator"/>. Resolves column names to field IDs
+/// against the file's bound stats.
+/// </summary>
+internal sealed class DataFileStats
+{
+    private readonly DataFile _file;
+
+    public DataFileStats(DataFile file)
+    {
+        _file = file;
+    }
+
+    public DataFile File => _file;
+
+    public LiteralValue? GetMin(int fieldId) =>
+        _file.ColumnLowerBounds is { } b && b.TryGetValue(fieldId, out var v)
+            ? v : (LiteralValue?)null;
+
+    public LiteralValue? GetMax(int fieldId) =>
+        _file.ColumnUpperBounds is { } b && b.TryGetValue(fieldId, out var v)
+            ? v : (LiteralValue?)null;
+
+    public long? GetNullCount(int fieldId) =>
+        _file.NullValueCounts is { } b && b.TryGetValue(fieldId, out long v)
+            ? v : (long?)null;
+
+    public long ValueCount => _file.RecordCount;
+}
+
+/// <summary>
+/// Adapts <see cref="DataFileStats"/> for the shared
+/// <see cref="StatisticsEvaluator"/>. The shared accessor contract is keyed
+/// by column name; Iceberg stores stats by field ID, so this adapter holds
+/// the schema's name→id map for translation.
+/// </summary>
+internal sealed class IcebergStatisticsAccessor : IStatisticsAccessor<DataFileStats>
+{
+    private readonly IReadOnlyDictionary<string, int> _nameToId;
+
+    public IcebergStatisticsAccessor(IReadOnlyDictionary<string, int> nameToId)
+    {
+        _nameToId = nameToId;
+    }
+
+    public LiteralValue? GetMinValue(DataFileStats stats, string column) =>
+        _nameToId.TryGetValue(column, out int id) ? stats.GetMin(id) : null;
+
+    public LiteralValue? GetMaxValue(DataFileStats stats, string column) =>
+        _nameToId.TryGetValue(column, out int id) ? stats.GetMax(id) : null;
+
+    public long? GetNullCount(DataFileStats stats, string column) =>
+        _nameToId.TryGetValue(column, out int id) ? stats.GetNullCount(id) : null;
+
+    public long? GetValueCount(DataFileStats stats, string column) => stats.ValueCount;
+
+    public bool IsMinExact(DataFileStats stats, string column) => true;
+    public bool IsMaxExact(DataFileStats stats, string column) => true;
 }

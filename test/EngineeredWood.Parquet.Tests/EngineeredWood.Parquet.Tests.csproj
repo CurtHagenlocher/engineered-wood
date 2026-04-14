@@ -25,6 +25,7 @@
   <ItemGroup>
     <ProjectReference Include="..\..\src\EngineeredWood.Parquet\EngineeredWood.Parquet.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Azure\EngineeredWood.Azure.csproj" />
+    <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
   </ItemGroup>
 
 </Project>

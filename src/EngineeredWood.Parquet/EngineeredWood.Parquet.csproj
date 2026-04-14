@@ -10,6 +10,7 @@
 
   <ItemGroup>
     <ProjectReference Include="..\EngineeredWood.Core\EngineeredWood.Core.csproj" />
+    <ProjectReference Include="..\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
   </ItemGroup>
 
   <ItemGroup>

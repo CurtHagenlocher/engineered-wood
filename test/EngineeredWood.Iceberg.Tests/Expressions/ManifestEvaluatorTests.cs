@@ -1,280 +1,184 @@
-using EngineeredWood.Iceberg.Expressions;
+using EngineeredWood.Expressions;
+using EngineeredWood.Iceberg.Manifest;
+using EngineeredWood.IO.Local;
+using Ex = EngineeredWood.Iceberg.Expressions.Expressions;
 
 namespace EngineeredWood.Iceberg.Tests.Expressions;
 
-public class ManifestEvaluatorTests
+/// <summary>
+/// Iceberg's manifest-level filtering goes through the shared
+/// <see cref="StatisticsEvaluator"/> using an Iceberg-specific
+/// <see cref="IStatisticsAccessor{T}"/>. These tests exercise that
+/// integration end-to-end via <see cref="Iceberg.Expressions.TableScan.PlanFiles"/>.
+///
+/// Per-predicate evaluation logic lives in
+/// <c>EngineeredWood.Expressions.Tests.StatisticsEvaluatorTests</c>; tests
+/// here cover Iceberg-specific concerns (field ID translation, schema-based
+/// binding, multi-file pruning).
+/// </summary>
+public class ManifestEvaluatorTests : IDisposable
 {
-    // Field IDs
-    private const int Id = 1;
-    private const int Name = 2;
-    private const int Score = 3;
+    private readonly string _tempDir;
+    private readonly LocalTableFileSystem _fs;
+    private readonly Schema _schema = new(0, [
+        new NestedField(1, "id", IcebergType.Long, true),
+        new NestedField(2, "name", IcebergType.String, true),
+        new NestedField(3, "score", IcebergType.Double, false),
+    ]);
 
-    private static BoundReference BRef(int fieldId, IcebergType type) =>
-        new(fieldId, $"f{fieldId}", type);
+    public ManifestEvaluatorTests()
+    {
+        _tempDir = Path.Combine(Path.GetTempPath(), $"iceberg-eval-{Guid.NewGuid():N}");
+        Directory.CreateDirectory(_tempDir);
+        _fs = new LocalTableFileSystem(_tempDir);
+    }
 
-    private static Expression Cmp(ComparisonOperator op, int fieldId, LiteralValue value) =>
-        new ComparisonPredicate(op, BRef(fieldId, IcebergType.Long), new LiteralExpression(value));
+    public void Dispose()
+    {
+        if (Directory.Exists(_tempDir))
+            Directory.Delete(_tempDir, recursive: true);
+    }
 
-    private static Expression Unary(UnaryOperator op, int fieldId) =>
-        new UnaryPredicate(op, BRef(fieldId, IcebergType.Long));
+    private TableMetadata Meta() =>
+        TableMetadata.Create(_schema, location: Path.Combine(_tempDir, "table"));
 
-    private static Expression InSet(int fieldId, params LiteralValue[] values) =>
-        new SetPredicate(SetOperator.In, BRef(fieldId, IcebergType.Long), values);
-
-    private static DataFileStats Stats(
-        long recordCount = 1000,
+    private static DataFile File(string path, long recordCount,
         Dictionary<int, LiteralValue>? lower = null,
         Dictionary<int, LiteralValue>? upper = null,
         Dictionary<int, long>? nullCounts = null) =>
         new()
         {
-            RecordCount = recordCount,
-            LowerBounds = lower ?? new Dictionary<int, LiteralValue>(),
-            UpperBounds = upper ?? new Dictionary<int, LiteralValue>(),
-            NullCounts = nullCounts ?? new Dictionary<int, long>(),
+            FilePath = path, RecordCount = recordCount, FileSizeInBytes = 1000,
+            ColumnLowerBounds = lower,
+            ColumnUpperBounds = upper,
+            NullValueCounts = nullCounts,
         };
 
-    // --- Eq ---
-
     [Fact]
-    public void Eq_ValueInRange_MightMatch()
+    public void Eq_ValueOutsideRange_FilePruned()
     {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L) },
-            upper: new() { [Id] = LiteralValue.Of(100L) });
-        Assert.True(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Eq, Id, LiteralValue.Of(50L)), stats));
+        var f = File("a.parquet", 100,
+            lower: new() { [1] = LiteralValue.Of(10L) },
+            upper: new() { [1] = LiteralValue.Of(100L) },
+            nullCounts: new() { [1] = 0 });
+
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.Equal("id", 200L))
+            .PlanFiles([f]);
+
+        Assert.Equal(0, result.FilesMatched);
+        Assert.Equal(1, result.FilesSkipped);
     }
 
     [Fact]
-    public void Eq_ValueBelowRange_NoMatch()
+    public void Eq_ValueInRange_FileKept()
     {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L) },
-            upper: new() { [Id] = LiteralValue.Of(100L) });
-        Assert.False(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Eq, Id, LiteralValue.Of(5L)), stats));
+        var f = File("a.parquet", 100,
+            lower: new() { [1] = LiteralValue.Of(10L) },
+            upper: new() { [1] = LiteralValue.Of(100L) });
+
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.Equal("id", 50L))
+            .PlanFiles([f]);
+
+        Assert.Equal(1, result.FilesMatched);
     }
 
     [Fact]
-    public void Eq_ValueAboveRange_NoMatch()
+    public void IsNull_NoNulls_FilePruned()
     {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L) },
-            upper: new() { [Id] = LiteralValue.Of(100L) });
-        Assert.False(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Eq, Id, LiteralValue.Of(200L)), stats));
+        var f = File("a.parquet", 100, nullCounts: new() { [3] = 0 });
+
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.IsNull("score"))
+            .PlanFiles([f]);
+
+        Assert.Equal(0, result.FilesMatched);
+        Assert.Equal(1, result.FilesSkipped);
     }
 
     [Fact]
-    public void Eq_AllNulls_NoMatch()
+    public void NotNull_AllNulls_FilePruned()
     {
-        var stats = Stats(recordCount: 100, nullCounts: new() { [Id] = 100 });
-        Assert.False(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Eq, Id, LiteralValue.Of(1L)), stats));
-    }
+        var f = File("a.parquet", 100, nullCounts: new() { [3] = 100 });
 
-    // --- Lt ---
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.NotNull("score"))
+            .PlanFiles([f]);
 
-    [Fact]
-    public void Lt_LowerBelowValue_MightMatch()
-    {
-        var stats = Stats(lower: new() { [Id] = LiteralValue.Of(10L) });
-        Assert.True(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Lt, Id, LiteralValue.Of(50L)), stats));
+        Assert.Equal(0, result.FilesMatched);
+        Assert.Equal(1, result.FilesSkipped);
     }
 
     [Fact]
-    public void Lt_LowerAtValue_NoMatch()
+    public void StringEq_OutOfRange_FilePruned()
     {
-        var stats = Stats(lower: new() { [Id] = LiteralValue.Of(50L) });
-        Assert.False(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Lt, Id, LiteralValue.Of(50L)), stats));
-    }
+        var f = File("a.parquet", 100,
+            lower: new() { [2] = LiteralValue.Of("alice") },
+            upper: new() { [2] = LiteralValue.Of("dave") },
+            nullCounts: new() { [2] = 0 });
 
-    // --- Gt ---
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.Equal("name", "zoe"))
+            .PlanFiles([f]);
 
-    [Fact]
-    public void Gt_UpperAboveValue_MightMatch()
-    {
-        var stats = Stats(upper: new() { [Id] = LiteralValue.Of(100L) });
-        Assert.True(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Gt, Id, LiteralValue.Of(50L)), stats));
+        Assert.Equal(0, result.FilesMatched);
     }
 
     [Fact]
-    public void Gt_UpperAtValue_NoMatch()
+    public void In_NoValuesInRange_FilePruned()
     {
-        var stats = Stats(upper: new() { [Id] = LiteralValue.Of(50L) });
-        Assert.False(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Gt, Id, LiteralValue.Of(50L)), stats));
-    }
+        var f = File("a.parquet", 100,
+            lower: new() { [1] = LiteralValue.Of(10L) },
+            upper: new() { [1] = LiteralValue.Of(20L) });
 
-    // --- LtEq / GtEq ---
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.In("id", 1L, 25L))
+            .PlanFiles([f]);
 
-    [Fact]
-    public void LtEq_LowerAtValue_MightMatch()
-    {
-        var stats = Stats(lower: new() { [Id] = LiteralValue.Of(50L) });
-        Assert.True(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.LtEq, Id, LiteralValue.Of(50L)), stats));
+        Assert.Equal(0, result.FilesMatched);
     }
 
     [Fact]
-    public void GtEq_UpperAtValue_MightMatch()
+    public void In_SomeValuesInRange_FileKept()
     {
-        var stats = Stats(upper: new() { [Id] = LiteralValue.Of(50L) });
-        Assert.True(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.GtEq, Id, LiteralValue.Of(50L)), stats));
-    }
+        var f = File("a.parquet", 100,
+            lower: new() { [1] = LiteralValue.Of(10L) },
+            upper: new() { [1] = LiteralValue.Of(20L) });
 
-    // --- IsNull / NotNull ---
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.In("id", 1L, 15L, 25L))
+            .PlanFiles([f]);
 
-    [Fact]
-    public void IsNull_NoNulls_NoMatch()
-    {
-        var stats = Stats(nullCounts: new() { [Id] = 0 });
-        Assert.False(ManifestEvaluator.MightMatch(Unary(UnaryOperator.IsNull, Id), stats));
+        Assert.Equal(1, result.FilesMatched);
     }
 
     [Fact]
-    public void IsNull_HasNulls_MightMatch()
+    public void NoStats_FileKept()
     {
-        var stats = Stats(nullCounts: new() { [Id] = 5 });
-        Assert.True(ManifestEvaluator.MightMatch(Unary(UnaryOperator.IsNull, Id), stats));
+        // Conservative: with no stats, can't prove file is empty.
+        var f = File("a.parquet", 100);
+
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.Equal("id", 42L))
+            .PlanFiles([f]);
+
+        Assert.Equal(1, result.FilesMatched);
     }
 
     [Fact]
-    public void NotNull_AllNulls_NoMatch()
+    public void And_OneSubpredicateFalsifies_FilePruned()
     {
-        var stats = Stats(recordCount: 100, nullCounts: new() { [Id] = 100 });
-        Assert.False(ManifestEvaluator.MightMatch(Unary(UnaryOperator.NotNull, Id), stats));
-    }
+        var f = File("a.parquet", 100,
+            lower: new() { [1] = LiteralValue.Of(10L) },
+            upper: new() { [1] = LiteralValue.Of(100L) });
 
-    // --- In ---
+        var result = new Iceberg.Expressions.TableScan(Meta(), _fs)
+            .Filter(Ex.And(
+                Ex.GreaterThan("id", 5L),
+                Ex.LessThan("id", 5L)))
+            .PlanFiles([f]);
 
-    [Fact]
-    public void In_SomeValuesInRange_MightMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L) },
-            upper: new() { [Id] = LiteralValue.Of(20L) });
-        Assert.True(ManifestEvaluator.MightMatch(
-            InSet(Id, LiteralValue.Of(5L), LiteralValue.Of(15L), LiteralValue.Of(25L)), stats));
-    }
-
-    [Fact]
-    public void In_NoValuesInRange_NoMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L) },
-            upper: new() { [Id] = LiteralValue.Of(20L) });
-        Assert.False(ManifestEvaluator.MightMatch(
-            InSet(Id, LiteralValue.Of(1L), LiteralValue.Of(25L)), stats));
-    }
-
-    // --- String predicates ---
-
-    [Fact]
-    public void Eq_String_InRange_MightMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Name] = LiteralValue.Of("alice") },
-            upper: new() { [Name] = LiteralValue.Of("dave") });
-        Assert.True(ManifestEvaluator.MightMatch(
-            new ComparisonPredicate(ComparisonOperator.Eq,
-                BRef(Name, IcebergType.String), new LiteralExpression(LiteralValue.Of("bob"))),
-            stats));
-    }
-
-    [Fact]
-    public void Eq_String_OutOfRange_NoMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Name] = LiteralValue.Of("alice") },
-            upper: new() { [Name] = LiteralValue.Of("dave") });
-        Assert.False(ManifestEvaluator.MightMatch(
-            new ComparisonPredicate(ComparisonOperator.Eq,
-                BRef(Name, IcebergType.String), new LiteralExpression(LiteralValue.Of("zoe"))),
-            stats));
-    }
-
-    [Fact]
-    public void StartsWith_PrefixInRange_MightMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Name] = LiteralValue.Of("abc") },
-            upper: new() { [Name] = LiteralValue.Of("def") });
-        Assert.True(ManifestEvaluator.MightMatch(
-            new ComparisonPredicate(ComparisonOperator.StartsWith,
-                BRef(Name, IcebergType.String), new LiteralExpression(LiteralValue.Of("bc"))),
-            stats));
-    }
-
-    [Fact]
-    public void StartsWith_PrefixAboveRange_NoMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Name] = LiteralValue.Of("abc") },
-            upper: new() { [Name] = LiteralValue.Of("abd") });
-        Assert.False(ManifestEvaluator.MightMatch(
-            new ComparisonPredicate(ComparisonOperator.StartsWith,
-                BRef(Name, IcebergType.String), new LiteralExpression(LiteralValue.Of("xyz"))),
-            stats));
-    }
-
-    // --- Compound expressions ---
-
-    [Fact]
-    public void And_BothMatch_MightMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L), [Score] = LiteralValue.Of(1.0) },
-            upper: new() { [Id] = LiteralValue.Of(100L), [Score] = LiteralValue.Of(99.0) });
-
-        var expr = new AndExpression(
-            Cmp(ComparisonOperator.Gt, Id, LiteralValue.Of(5L)),
-            new ComparisonPredicate(ComparisonOperator.Lt,
-                BRef(Score, IcebergType.Double), new LiteralExpression(LiteralValue.Of(50.0))));
-
-        Assert.True(ManifestEvaluator.MightMatch(expr, stats));
-    }
-
-    [Fact]
-    public void And_OneDoesNotMatch_NoMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L) },
-            upper: new() { [Id] = LiteralValue.Of(100L) });
-
-        var expr = new AndExpression(
-            Cmp(ComparisonOperator.Gt, Id, LiteralValue.Of(5L)),
-            Cmp(ComparisonOperator.Lt, Id, LiteralValue.Of(5L)));
-
-        Assert.False(ManifestEvaluator.MightMatch(expr, stats));
-    }
-
-    [Fact]
-    public void Or_OneMatches_MightMatch()
-    {
-        var stats = Stats(
-            lower: new() { [Id] = LiteralValue.Of(10L) },
-            upper: new() { [Id] = LiteralValue.Of(100L) });
-
-        var expr = new OrExpression(
-            Cmp(ComparisonOperator.Eq, Id, LiteralValue.Of(50L)),
-            Cmp(ComparisonOperator.Eq, Id, LiteralValue.Of(200L)));
-
-        Assert.True(ManifestEvaluator.MightMatch(expr, stats));
-    }
-
-    // --- No stats (conservative) ---
-
-    [Fact]
-    public void NoStats_AlwaysMightMatch()
-    {
-        var stats = Stats();
-        Assert.True(ManifestEvaluator.MightMatch(
-            Cmp(ComparisonOperator.Eq, Id, LiteralValue.Of(42L)), stats));
+        Assert.Equal(0, result.FilesMatched);
     }
 }

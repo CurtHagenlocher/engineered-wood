@@ -1,8 +1,14 @@
-using EngineeredWood.Iceberg.Expressions;
+using EngineeredWood.Expressions;
 using Ex = EngineeredWood.Iceberg.Expressions.Expressions;
 
 namespace EngineeredWood.Iceberg.Tests.Expressions;
 
+/// <summary>
+/// Iceberg uses the shared <see cref="ExpressionBinder"/> with a name→id
+/// resolver derived from its <see cref="Schema"/>. These tests exercise that
+/// integration via a binder constructed the same way <see cref="Iceberg.Expressions.TableScan"/>
+/// constructs it internally.
+/// </summary>
 public class BinderTests
 {
     private readonly Schema _schema = new(0, [
@@ -11,25 +17,29 @@ public class BinderTests
         new NestedField(3, "score", IcebergType.Double, false),
     ]);
 
+    private ExpressionBinder MakeBinder() =>
+        new(_schema.Fields.ToDictionary(f => f.Name, f => f.Id), allowUnresolved: true);
+
     [Fact]
     public void Bind_ResolvesColumnNameToFieldId()
     {
         var expr = Ex.Equal("id", 42L);
-        var bound = ExpressionBinder.Bind(expr, _schema);
+        var bound = MakeBinder().Bind(expr);
 
-        Assert.IsType<ComparisonPredicate>(bound);
-        var pred = (ComparisonPredicate)bound;
-        Assert.IsType<BoundReference>(pred.Left);
-        Assert.Equal(1, ((BoundReference)pred.Left).FieldId);
-        Assert.Equal(ComparisonOperator.Eq, pred.Op);
+        var pred = Assert.IsType<ComparisonPredicate>(bound);
+        var b = Assert.IsType<BoundReference>(pred.Left);
+        Assert.Equal(1, b.FieldId);
+        Assert.Equal("id", b.Name);
+        Assert.Equal(ComparisonOperator.Equal, pred.Op);
     }
 
     [Fact]
-    public void Bind_UnknownColumn_ReturnsTrue()
+    public void Bind_UnknownColumn_LeavesUnbound()
     {
         var expr = Ex.Equal("nonexistent", 1);
-        var bound = ExpressionBinder.Bind(expr, _schema);
-        Assert.IsType<TrueExpression>(bound);
+        var bound = MakeBinder().Bind(expr);
+        var pred = Assert.IsType<ComparisonPredicate>(bound);
+        Assert.IsType<UnboundReference>(pred.Left);
     }
 
     [Fact]
@@ -39,12 +49,12 @@ public class BinderTests
             Ex.Equal("id", 1L),
             Ex.GreaterThan("score", 90.0));
 
-        var bound = ExpressionBinder.Bind(expr, _schema);
-        Assert.IsType<AndExpression>(bound);
+        var bound = MakeBinder().Bind(expr);
+        var and = Assert.IsType<AndPredicate>(bound);
+        Assert.Equal(2, and.Children.Count);
 
-        var and = (AndExpression)bound;
-        var left = (ComparisonPredicate)and.Left;
-        var right = (ComparisonPredicate)and.Right;
+        var left = Assert.IsType<ComparisonPredicate>(and.Children[0]);
+        var right = Assert.IsType<ComparisonPredicate>(and.Children[1]);
         Assert.Equal(1, ((BoundReference)left.Left).FieldId);
         Assert.Equal(3, ((BoundReference)right.Left).FieldId);
     }
@@ -56,40 +66,29 @@ public class BinderTests
             Ex.Equal("name", "alice"),
             Ex.Equal("name", "bob"));
 
-        var bound = ExpressionBinder.Bind(expr, _schema);
-        Assert.IsType<OrExpression>(bound);
+        var bound = MakeBinder().Bind(expr);
+        Assert.IsType<OrPredicate>(bound);
     }
 
     [Fact]
     public void Bind_Not_BindsChild()
     {
         var expr = Ex.Not(Ex.IsNull("name"));
-        var bound = ExpressionBinder.Bind(expr, _schema);
-        Assert.IsType<NotExpression>(bound);
+        var bound = MakeBinder().Bind(expr);
+        var not = Assert.IsType<NotPredicate>(bound);
 
-        var not = (NotExpression)bound;
-        Assert.IsType<UnaryPredicate>(not.Child);
-        var unary = (UnaryPredicate)not.Child;
-        Assert.IsType<BoundReference>(unary.Child);
+        var unary = Assert.IsType<UnaryPredicate>(not.Child);
+        Assert.IsType<BoundReference>(unary.Operand);
     }
 
     [Fact]
-    public void Bind_PreservesFieldType()
+    public void Bind_FunctionCall_BindsArguments()
     {
-        var expr = Ex.Equal("name", "test");
-        var bound = (ComparisonPredicate)ExpressionBinder.Bind(expr, _schema);
-        var r = (BoundReference)bound.Left;
-        Assert.Equal(IcebergType.String, r.FieldType);
-    }
+        var expr = Ex.Equal(Ex.Apply("day", Ex.Ref("id")), Ex.Lit(1L));
+        var bound = MakeBinder().Bind(expr);
 
-    [Fact]
-    public void Bind_ApplyExpression_BindsArguments()
-    {
-        var expr = Ex.Apply("day", Ex.Ref("id"));
-        var bound = ExpressionBinder.Bind(expr, _schema);
-
-        Assert.IsType<ApplyExpression>(bound);
-        var apply = (ApplyExpression)bound;
-        Assert.IsType<BoundReference>(apply.Arguments[0]);
+        var cmp = Assert.IsType<ComparisonPredicate>(bound);
+        var fc = Assert.IsType<FunctionCall>(cmp.Left);
+        Assert.IsType<BoundReference>(fc.Arguments[0]);
     }
 }

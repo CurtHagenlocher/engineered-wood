@@ -24,6 +24,7 @@
     <ProjectReference Include="..\..\src\EngineeredWood.DeltaLake\EngineeredWood.DeltaLake.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.DeltaLake.Table\EngineeredWood.DeltaLake.Table.csproj" />
     <ProjectReference Include="..\..\src\EngineeredWood.Core\EngineeredWood.Core.csproj" />
+    <ProjectReference Include="..\..\src\EngineeredWood.Expressions\EngineeredWood.Expressions.csproj" />
   </ItemGroup>
 
   <ItemGroup>

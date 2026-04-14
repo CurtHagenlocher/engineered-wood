@@ -19,4 +19,67 @@ public sealed record ColumnStats
 
     /// <summary>Null count per column (column name → count).</summary>
     public IReadOnlyDictionary<string, long>? NullCount { get; init; }
+
+    /// <summary>
+    /// Parses a Delta stats JSON string (the value of <see cref="AddFile.Stats"/>)
+    /// into a <see cref="ColumnStats"/>. Returns <c>null</c> if the input is
+    /// null, empty, or doesn't parse.
+    /// </summary>
+    public static ColumnStats? Parse(string? json)
+    {
+        if (string.IsNullOrEmpty(json))
+            return null;
+
+        try
+        {
+            using var doc = JsonDocument.Parse(json!);
+            var root = doc.RootElement;
+
+            long numRecords = 0;
+            if (root.TryGetProperty("numRecords", out var nr)
+                && nr.ValueKind == JsonValueKind.Number)
+                numRecords = nr.GetInt64();
+
+            return new ColumnStats
+            {
+                NumRecords = numRecords,
+                MinValues = ReadValueMap(root, "minValues"),
+                MaxValues = ReadValueMap(root, "maxValues"),
+                NullCount = ReadCountMap(root, "nullCount"),
+            };
+        }
+        catch (JsonException)
+        {
+            return null;
+        }
+    }
+
+    private static IReadOnlyDictionary<string, JsonElement>? ReadValueMap(
+        JsonElement root, string property)
+    {
+        if (!root.TryGetProperty(property, out var element)
+            || element.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var map = new Dictionary<string, JsonElement>(StringComparer.Ordinal);
+        foreach (var prop in element.EnumerateObject())
+            map[prop.Name] = prop.Value.Clone();
+        return map;
+    }
+
+    private static IReadOnlyDictionary<string, long>? ReadCountMap(
+        JsonElement root, string property)
+    {
+        if (!root.TryGetProperty(property, out var element)
+            || element.ValueKind != JsonValueKind.Object)
+            return null;
+
+        var map = new Dictionary<string, long>(StringComparer.Ordinal);
+        foreach (var prop in element.EnumerateObject())
+        {
+            if (prop.Value.ValueKind == JsonValueKind.Number)
+                map[prop.Name] = prop.Value.GetInt64();
+        }
+        return map;
+    }
 }

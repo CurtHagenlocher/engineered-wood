@@ -1,4 +1,4 @@
-using EngineeredWood.Iceberg.Expressions;
+using EngineeredWood.Expressions;
 using Ex = EngineeredWood.Iceberg.Expressions.Expressions;
 
 namespace EngineeredWood.Iceberg.Tests.Expressions;
@@ -8,37 +8,37 @@ public class ExpressionTests
     [Fact]
     public void And_WithFalse_ReturnsFalse()
     {
-        var result = Ex.And(Expression.True, Expression.False);
-        Assert.IsType<FalseExpression>(result);
+        var result = Ex.And(Ex.AlwaysTrue(), Ex.AlwaysFalse());
+        Assert.IsType<FalsePredicate>(result);
     }
 
     [Fact]
     public void And_WithTrue_ReturnsOther()
     {
         var pred = Ex.Equal("x", 1);
-        var result = Ex.And(Expression.True, pred);
+        var result = Ex.And(Ex.AlwaysTrue(), pred);
         Assert.Same(pred, result);
     }
 
     [Fact]
     public void Or_WithTrue_ReturnsTrue()
     {
-        var result = Ex.Or(Expression.False, Expression.True);
-        Assert.IsType<TrueExpression>(result);
+        var result = Ex.Or(Ex.AlwaysFalse(), Ex.AlwaysTrue());
+        Assert.IsType<TruePredicate>(result);
     }
 
     [Fact]
     public void Or_WithFalse_ReturnsOther()
     {
         var pred = Ex.Equal("x", 1);
-        var result = Ex.Or(Expression.False, pred);
+        var result = Ex.Or(Ex.AlwaysFalse(), pred);
         Assert.Same(pred, result);
     }
 
     [Fact]
     public void Not_True_ReturnsFalse()
     {
-        Assert.IsType<FalseExpression>(Ex.Not(Expression.True));
+        Assert.IsType<FalsePredicate>(Ex.Not(Ex.AlwaysTrue()));
     }
 
     [Fact]
@@ -69,20 +69,18 @@ public class ExpressionTests
     public void Equal_ProducesComparisonPredicate()
     {
         var expr = Ex.Equal("id", 42L);
-        Assert.IsType<ComparisonPredicate>(expr);
-        var cmp = (ComparisonPredicate)expr;
+        var cmp = Assert.IsType<ComparisonPredicate>(expr);
         Assert.IsType<UnboundReference>(cmp.Left);
         Assert.IsType<LiteralExpression>(cmp.Right);
-        Assert.Equal(ComparisonOperator.Eq, cmp.Op);
+        Assert.Equal(ComparisonOperator.Equal, cmp.Op);
     }
 
     [Fact]
     public void IsNull_ProducesUnaryPredicate()
     {
         var expr = Ex.IsNull("name");
-        Assert.IsType<UnaryPredicate>(expr);
-        var u = (UnaryPredicate)expr;
-        Assert.IsType<UnboundReference>(u.Child);
+        var u = Assert.IsType<UnaryPredicate>(expr);
+        Assert.IsType<UnboundReference>(u.Operand);
         Assert.Equal(UnaryOperator.IsNull, u.Op);
     }
 
@@ -90,9 +88,8 @@ public class ExpressionTests
     public void In_ProducesSetPredicate()
     {
         var expr = Ex.In("id", 1L, 2L, 3L);
-        Assert.IsType<SetPredicate>(expr);
-        var s = (SetPredicate)expr;
-        Assert.IsType<UnboundReference>(s.Child);
+        var s = Assert.IsType<SetPredicate>(expr);
+        Assert.IsType<UnboundReference>(s.Operand);
         Assert.Equal(3, s.Values.Count);
     }
 
@@ -105,12 +102,11 @@ public class ExpressionTests
     }
 
     [Fact]
-    public void Apply_ProducesApplyExpression()
+    public void Apply_ProducesFunctionCall()
     {
         var expr = Ex.Apply("day", Ex.Ref("ts"));
-        Assert.IsType<ApplyExpression>(expr);
-        var a = (ApplyExpression)expr;
-        Assert.Equal("day", a.Function.Name);
+        var a = Assert.IsType<FunctionCall>(expr);
+        Assert.Equal("day", a.Name);
         Assert.Single(a.Arguments);
     }
 
@@ -118,8 +114,7 @@ public class ExpressionTests
     public void GenericEqual_TakesExpressions()
     {
         var expr = Ex.Equal(Ex.Ref("a"), Ex.Ref("b"));
-        Assert.IsType<ComparisonPredicate>(expr);
-        var cmp = (ComparisonPredicate)expr;
+        var cmp = Assert.IsType<ComparisonPredicate>(expr);
         Assert.IsType<UnboundReference>(cmp.Left);
         Assert.IsType<UnboundReference>(cmp.Right);
     }

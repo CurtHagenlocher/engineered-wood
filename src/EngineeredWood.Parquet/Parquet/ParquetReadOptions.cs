@@ -1,3 +1,5 @@
+using EngineeredWood.Expressions;
+
 namespace EngineeredWood.Parquet;
 
 /// <summary>
@@ -54,6 +56,29 @@ public sealed class ParquetReadOptions
     /// When <see langword="null"/> (the default), no size limit is applied.
     /// </summary>
     public long? MaxBatchByteSize { get; init; }
+
+    /// <summary>
+    /// Optional row group filter predicate. When set, the reader evaluates the
+    /// predicate against each row group's column statistics; row groups that
+    /// can be proven empty of matching rows (per <see cref="StatisticsEvaluator"/>)
+    /// are skipped without reading data pages.
+    /// </summary>
+    /// <remarks>
+    /// Predicates that statistics can't evaluate (function calls, two-column
+    /// comparisons, missing stats) are conservatively kept. The reader does not
+    /// re-apply the predicate to rows; callers wanting exact row-level
+    /// filtering must do that on the returned batches themselves.
+    /// </remarks>
+    public Predicate? Filter { get; init; }
+
+    /// <summary>
+    /// When <see langword="true"/> and <see cref="Filter"/> is set, the reader
+    /// also probes Bloom filters for equality and IN predicates that the
+    /// statistics evaluator could not decide. Requires extra I/O per candidate
+    /// row group (one read per column with a Bloom filter), so this is opt-in.
+    /// Default: <see langword="false"/>.
+    /// </summary>
+    public bool FilterUseBloomFilters { get; init; }
 
     /// <summary>
     /// Whether to validate CRC-32C checksums when present in page headers.

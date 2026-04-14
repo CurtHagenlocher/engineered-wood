@@ -1,0 +1,44 @@
+using Apache.Arrow;
+
+namespace EngineeredWood.Expressions.Arrow;
+
+/// <summary>
+/// Evaluates expressions and predicates against an Arrow
+/// <see cref="RecordBatch"/>, producing typed Arrow arrays.
+/// </summary>
+public interface IRowEvaluator
+{
+    /// <summary>
+    /// Evaluates a predicate against every row in the batch. Returns a
+    /// <see cref="BooleanArray"/> of the same length: each element is
+    /// <c>true</c>/<c>false</c> per SQL semantics, or <c>null</c> when the
+    /// predicate produced an unknown result for that row (e.g. comparison
+    /// with a NULL operand).
+    /// </summary>
+    BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch);
+
+    /// <summary>
+    /// Evaluates a value expression against every row. The returned array's
+    /// type depends on the expression kind: column references return the
+    /// underlying column, literals return a constant array, function calls
+    /// return whatever the registered function produces.
+    /// </summary>
+    IArrowArray EvaluateExpression(Expression expression, RecordBatch batch);
+}
+
+/// <summary>
+/// Pluggable registry for function calls invoked during row evaluation.
+/// Format-specific function libraries (e.g. Spark SQL functions) implement
+/// this interface to provide their own functions to the evaluator.
+/// </summary>
+public interface IFunctionRegistry
+{
+    /// <summary>Returns true if a function with the given name is registered.</summary>
+    bool IsRegistered(string name);
+
+    /// <summary>
+    /// Invokes a function. Implementations must return an array of length
+    /// <paramref name="rowCount"/>.
+    /// </summary>
+    IArrowArray Invoke(string name, IReadOnlyList<IArrowArray> args, int rowCount);
+}
