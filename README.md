@@ -1,6 +1,6 @@
 # EngineeredWood
 
-A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, and **Apache Avro** — as Apache Arrow `RecordBatch` objects, optimized for cloud storage.
+A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro** — and table formats — **Delta Lake** and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects, optimized for cloud storage.
 
 ## What
 
@@ -25,19 +25,30 @@ There are two motivations for this project, and they're equally important:
 
 ```
 src/
-  EngineeredWood.Core/          Shared abstractions: I/O, compression, Arrow helpers
-  EngineeredWood.Parquet/       Parquet reader and writer
-  EngineeredWood.Orc/           ORC reader and writer
-  EngineeredWood.Avro/          Avro reader and writer
-  EngineeredWood.Azure/         Azure Blob Storage backends
+  EngineeredWood.Core/                   Shared abstractions: I/O, compression, Arrow helpers
+  EngineeredWood.Expressions/            Format-agnostic expression trees + statistics evaluator
+  EngineeredWood.Expressions.Arrow/      Row-level expression evaluation against RecordBatch
+  EngineeredWood.Parquet/                Parquet reader and writer
+  EngineeredWood.Orc/                    ORC reader and writer
+  EngineeredWood.Avro/                   Avro reader and writer
+  EngineeredWood.DeltaLake/              Delta Lake transaction log (low-level)
+  EngineeredWood.DeltaLake.Table/        Delta Lake table API (high-level Arrow I/O)
+  EngineeredWood.Iceberg/                Apache Iceberg metadata + scan planning
+  EngineeredWood.Azure/                  Azure Blob Storage backends
 test/
-  EngineeredWood.Parquet.Tests/         xUnit tests for Parquet
-  EngineeredWood.Parquet.Benchmarks/    BenchmarkDotNet suites for Parquet
-  EngineeredWood.Parquet.Compatibility/ 92-file cross-tool validation
-  EngineeredWood.Orc.Tests/             xUnit tests for ORC
-  EngineeredWood.Orc.Benchmarks/        BenchmarkDotNet suites for ORC
-  EngineeredWood.Avro.Tests/            xUnit tests for Avro
-  EngineeredWood.Avro.Benchmarks/       BenchmarkDotNet suites for Avro
+  EngineeredWood.Parquet.Tests/             xUnit tests for Parquet
+  EngineeredWood.Parquet.Benchmarks/        BenchmarkDotNet suites for Parquet
+  EngineeredWood.Parquet.Compatibility/     92-file cross-tool validation
+  EngineeredWood.Orc.Tests/                 xUnit tests for ORC
+  EngineeredWood.Orc.Benchmarks/            BenchmarkDotNet suites for ORC
+  EngineeredWood.Avro.Tests/                xUnit tests for Avro
+  EngineeredWood.Avro.Benchmarks/           BenchmarkDotNet suites for Avro
+  EngineeredWood.DeltaLake.Tests/           xUnit tests for the Delta log layer
+  EngineeredWood.DeltaLake.Table.Tests/     xUnit tests for the Delta table API
+  EngineeredWood.DeltaLake.Benchmarks/      BenchmarkDotNet suites for Delta Lake
+  EngineeredWood.Iceberg.Tests/             xUnit tests for Iceberg
+  EngineeredWood.Expressions.Tests/         xUnit tests for the expression library
+  EngineeredWood.Expressions.Arrow.Tests/   xUnit tests for the Arrow row evaluator
 ```
 
 ## Features — Parquet
@@ -48,6 +59,7 @@ test/
 - Parallel column I/O with configurable concurrency strategies
 - Column projection by name (including dotted paths for nested columns)
 - Streaming via `IAsyncEnumerable<RecordBatch>` (`ReadAllAsync`)
+- **Predicate pushdown**: row group pruning via column statistics, with optional Bloom filter probing for equality and `IN` predicates
 - Three BYTE_ARRAY output modes: standard (32-bit offsets), view types (inline short strings), large offsets (64-bit, removes 2 GB limit)
 
 ### Writing
@@ -158,6 +170,80 @@ All 19 ORC types are supported for both reading and writing:
 | zstandard | yes | yes |
 | lz4 | yes | yes |
 
+## Features — Delta Lake
+
+EngineeredWood ships two layers: a low-level transaction log API
+(`EngineeredWood.DeltaLake`) for metadata/stats consumers and a high-level
+table API (`EngineeredWood.DeltaLake.Table`) for Arrow-based read/write.
+Reader v3 / Writer v7 with full named feature support.
+
+### Reading
+
+- Snapshot-based read at current version, a specific version, or a timestamp (time travel)
+- `IAsyncEnumerable<RecordBatch>` streaming, column projection, partition column re-materialization
+- **Predicate pushdown**: file-level pruning via partition values and `AddFile` statistics in a single evaluator pass
+- Deletion vector filtering (RoaringBitmap, inline + file-based)
+- Type widening on read (int/float/date/decimal widenings via `delta.typeChanges` metadata)
+- Column mapping (id and name modes); row tracking; in-commit timestamps
+
+### Writing
+
+- Append and overwrite; partitioned writes; identity column generation
+- Auto-checkpoint (V1 Parquet and V2 JSON+sidecar formats)
+- Compaction and vacuum; log compaction
+- Change data feed (insert / delete / update pre/post-image)
+- Iceberg compatibility (V1 and V2): partition column materialization,
+  schema validation, stats enforcement so an external converter can
+  produce valid Iceberg metadata
+
+### Supported reader features
+
+`columnMapping`, `deletionVectors`, `timestampNtz`, `typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`
+
+### Supported writer features
+
+`changeDataFeed`, `columnMapping`, `deletionVectors`, `domainMetadata`,
+`icebergCompatV1`, `icebergCompatV2`, `identityColumns`, `inCommitTimestamp`,
+`rowTracking`, `timestampNtz`, `typeWidening`, `v2Checkpoint`, `vacuumProtocolCheck`
+
+## Features — Iceberg
+
+`EngineeredWood.Iceberg` provides Apache Iceberg metadata parsing,
+manifest reading/writing, table metadata (v1, v2, v3), partition specs,
+sort orders, snapshots, and scan planning. It is metadata-only — data files
+are read with the Parquet/ORC/Avro readers in this same library.
+
+- Table metadata in JSON (v1, v2, v3 including geometry/geography, variant, default values, row IDs)
+- Manifest file/list read + write (Avro-encoded)
+- Partition transforms (identity, void, bucket, truncate, year, month, day, hour)
+- Catalog interfaces with file-system and in-memory implementations
+- `TableScan` with predicate-based file pruning via the shared
+  `EngineeredWood.Expressions` library
+
+## Features — Expressions
+
+A format-agnostic expression library used by Parquet, Delta Lake, and Iceberg
+for predicate pushdown, and available to consumers for row-level evaluation.
+
+- **`EngineeredWood.Expressions`** (no Arrow dependency):
+  - Expression and predicate trees (`UnboundReference`, `BoundReference`,
+    `LiteralExpression`, `FunctionCall`, comparison/unary/set predicates,
+    boolean combinators)
+  - `LiteralValue` struct with 17 typed kinds, cross-type numeric promotion,
+    and high-precision decimal via `BigInteger`
+  - `ExpressionBinder` for resolving column names to stable IDs against a schema
+  - `StatisticsEvaluator` with three-valued logic (AlwaysTrue / AlwaysFalse / Unknown)
+    over a generic `IStatisticsAccessor<TStats>` adapter
+- **`EngineeredWood.Expressions.Arrow`** (depends on Apache.Arrow):
+  - `ArrowRowEvaluator` walks an expression tree against a `RecordBatch`,
+    producing a `BooleanArray` for predicates with full SQL three-valued
+    null semantics
+  - `IFunctionRegistry` for pluggable function dispatch (date/time, string,
+    cast, etc. — registry implementations live with the parser that produces them)
+
+See [`doc/predicate-pushdown-design.md`](doc/predicate-pushdown-design.md)
+for the architecture and remaining phases.
+
 ## Shared infrastructure
 
 ### Compression
@@ -213,6 +299,31 @@ await writer.WriteRowGroupAsync(recordBatch);
 await writer.CloseAsync();
 ```
 
+### Parquet — Predicate pushdown
+
+```csharp
+using Ex = EngineeredWood.Expressions.Expressions;
+
+await using var file = new LocalRandomAccessFile("data.parquet");
+await using var reader = new ParquetFileReader(file, ownsFile: false,
+    new ParquetReadOptions
+    {
+        // Skip row groups whose statistics prove no rows match.
+        Filter = Ex.And(
+            Ex.GreaterThanOrEqual("event_count", 100L),
+            Ex.Equal("region", "us")),
+
+        // Optional: also probe Bloom filters for Equal/IN predicates
+        // (extra I/O per candidate row group).
+        FilterUseBloomFilters = true,
+    });
+
+await foreach (var batch in reader.ReadAllAsync())
+{
+    // Reader does file/row-group level pruning only — no row-level filtering.
+}
+```
+
 ### ORC — Reading
 
 ```csharp
@@ -261,6 +372,48 @@ using var writer = new AvroWriterBuilder(arrowSchema)
 
 writer.Write(recordBatch);
 writer.Finish();
+```
+
+### Delta Lake — Reading and writing
+
+```csharp
+using EngineeredWood.DeltaLake.Table;
+using EngineeredWood.IO.Local;
+using Ex = EngineeredWood.Expressions.Expressions;
+
+var fs = new LocalTableFileSystem("/path/to/table");
+await using var table = await DeltaTable.OpenAsync(fs);
+
+// Append data
+await table.WriteAsync([recordBatch]);
+
+// Read at the current version with column projection and predicate pushdown
+await foreach (var batch in table.ReadAllAsync(
+    columns: ["id", "value"],
+    filter: Ex.And(
+        Ex.Equal("region", "us"),       // partition prune
+        Ex.GreaterThan("id", 1000L))))  // file-level stats prune
+{
+    // ...
+}
+
+// Time travel
+await foreach (var batch in table.ReadAtVersionAsync(version: 5)) { /* ... */ }
+```
+
+### Iceberg — Scan planning
+
+```csharp
+using EngineeredWood.Iceberg.Expressions;
+using Ex = EngineeredWood.Iceberg.Expressions.Expressions;
+
+var scan = new TableScan(metadata, fileSystem)
+    .Filter(Ex.Equal("region", "us"))
+    .Filter(Ex.GreaterThan("event_count", 100L));
+
+var result = await scan.PlanFilesAsync();
+// result.DataFiles contains files that may match — read them with the
+// Parquet/ORC/Avro readers in this same library.
 ```
 
 ## Building
