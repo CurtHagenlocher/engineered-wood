@@ -36,59 +36,59 @@ public class RowGroupReadBenchmarks
     }
 
     [Benchmark(Baseline = true, Description = "EW_ReadAll_SeqDecode")]
-    public async Task<Apache.Arrow.RecordBatch> EW_ReadAll_SeqDecode()
+    public async Task EW_ReadAll_SeqDecode()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file);
-        return await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "EW_ReadAll_ViewTypes")]
-    public async Task<Apache.Arrow.RecordBatch> EW_ReadAll_ViewTypes()
+    public async Task EW_ReadAll_ViewTypes()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file, options: new ParquetReadOptions { UseViewTypes = true });
-        return await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "EW_ReadAll_LargeOffsets")]
-    public async Task<Apache.Arrow.RecordBatch> EW_ReadAll_LargeOffsets()
+    public async Task EW_ReadAll_LargeOffsets()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file, options: new ParquetReadOptions { ByteArrayOutput = ByteArrayOutputKind.LargeOffsets });
-        return await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "EW_Incremental_Seq")]
-    public async Task<Apache.Arrow.RecordBatch> EW_Incremental_Seq()
+    public async Task EW_Incremental_Seq()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file);
-        return await reader.ReadRowGroupIncrementalAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupIncrementalAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "EW_Incremental_ViewTypes")]
-    public async Task<Apache.Arrow.RecordBatch> EW_Incremental_ViewTypes()
+    public async Task EW_Incremental_ViewTypes()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file, options: new ParquetReadOptions { UseViewTypes = true });
-        return await reader.ReadRowGroupIncrementalAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupIncrementalAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "EW_ReadAll_Parallel")]
-    public async Task<Apache.Arrow.RecordBatch> EW_ReadAll_Parallel()
+    public async Task EW_ReadAll_Parallel()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file);
-        return await reader.ReadRowGroupParallelAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupParallelAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "EW_Incremental_Parallel")]
-    public async Task<Apache.Arrow.RecordBatch> EW_Incremental_Parallel()
+    public async Task EW_Incremental_Parallel()
     {
         using var file = new LocalRandomAccessFile(FilePath);
         using var reader = new ParquetFileReader(file);
-        return await reader.ReadRowGroupIncrementalParallelAsync(0).ConfigureAwait(false);
+        using var batch = await reader.ReadRowGroupIncrementalParallelAsync(0).ConfigureAwait(false);
     }
 
     [Benchmark(Description = "ParquetSharp")]
