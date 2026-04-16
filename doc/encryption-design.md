@@ -1,5 +1,10 @@
 # Encryption Support Design Document
 
+**Status:** Not yet implemented. No encryption code exists in
+`EngineeredWood.Parquet` or `EngineeredWood.Orc` as of this writing — this
+document is forward-looking design only. Encrypted Parquet test files are
+currently skipped by the test sweeps.
+
 ## Overview
 
 Both Parquet and ORC support column-level encryption, but with fundamentally different designs. This document captures the spec details and open design decisions for implementing encryption in EngineeredWood.

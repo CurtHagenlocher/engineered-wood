@@ -17,12 +17,22 @@ combinators. The current and planned uses are:
 | Generated columns | Delta Lake | Compute a column's value from an expression on write |
 | Post-filter | Any reader | Drop rows that survived coarse pruning but don't match |
 
-Today, only Iceberg has an expression tree (mature, schema-bound, with three-valued
-statistics evaluation). Parquet has a design but no implementation. ORC, Delta, and
-the row-level evaluator have nothing.
-
 This document covers the architecture for unifying these needs across formats and
 the implementation phases to get there.
+
+**Implementation status.** Phases 1–8 are implemented and shipping: the shared
+`EngineeredWood.Expressions` library (tree, `LiteralValue`, `ExpressionBinder`,
+`StatisticsEvaluator`), statistics-based pruning for Parquet (row groups + bloom
+filters) and Delta Lake (partition + stats in one unified pass), Iceberg
+migrated onto the shared library, and the Arrow-based row evaluator in
+`EngineeredWood.Expressions.Arrow`. Phases 9–14 (SparkSql parser, Delta
+CHECK/generated-column wiring, Parquet column/offset index, ORC stripe pruning)
+are not yet started. See the phase table at the bottom for per-phase status.
+
+When this document was first written, only Iceberg had an expression tree —
+Parquet had a design but no implementation, and ORC, Delta, and the row-level
+evaluator had nothing. The sections that follow describe the architecture that
+was proposed then and has since been built out through Phase 8.
 
 ## Architecture
 
@@ -99,7 +109,7 @@ public abstract record Expression;
 public sealed record UnboundReference(string Name) : Expression;
 public sealed record BoundReference(int FieldId, string Name) : Expression;
 public sealed record LiteralExpression(LiteralValue Value) : Expression;
-public sealed record FunctionCall(string Name, IReadOnlyList<Expression> Args) : Expression;
+public sealed record FunctionCall(string Name, IReadOnlyList<Expression> Arguments) : Expression;
 
 // Boolean predicates
 public abstract record Predicate : Expression;
@@ -271,8 +281,8 @@ for value expressions and `BooleanArray` for predicates.
 ```csharp
 public interface IRowEvaluator
 {
-    BooleanArray Evaluate(Predicate predicate, RecordBatch batch);
-    IArrowArray Evaluate(Expression expression, RecordBatch batch);
+    BooleanArray EvaluatePredicate(Predicate predicate, RecordBatch batch);
+    IArrowArray EvaluateExpression(Expression expression, RecordBatch batch);
 }
 
 public sealed class ArrowRowEvaluator : IRowEvaluator
@@ -385,7 +395,7 @@ public async IAsyncEnumerable<RecordBatch> ReadAllAsync(
             if (_options.FilterUseBloomFilters
                 && result == FilterResult.Unknown)
             {
-                var bloomResult = await BloomFilterEvaluator.EvaluateAsync(
+                var bloomResult = await BloomFilterPredicateEvaluator.EvaluateAsync(
                     _options.Filter, _file, metadata.RowGroups[i], _schema, ct)
                     .ConfigureAwait(false);
                 if (bloomResult == FilterResult.AlwaysFalse)
@@ -402,8 +412,9 @@ public async IAsyncEnumerable<RecordBatch> ReadAllAsync(
 ### Bloom filter integration
 
 `ParquetFileReader.GetCandidateRowGroupsAsync` already probes bloom filters for
-a column + value list. The new `BloomFilterEvaluator` walks an `Expression` tree
-to find `Equal`/`In` predicates and probes them per row group:
+a column + value list. The new `BloomFilterPredicateEvaluator` walks an
+`Expression` tree to find `Equal`/`In` predicates and probes them per row
+group:
 
 1. Walk the predicate to find equality-shaped sub-predicates
 2. For each, probe the bloom filter (if present) for the row group/column
@@ -569,22 +580,22 @@ indexes in `ColumnChunkWriter`.
 
 ## Implementation Phases
 
-| Phase | Scope | Project | Depends On |
-|---|---|---|---|
-| **Phase 1** | `EngineeredWood.Expressions` core: tree, `LiteralValue`, factories | new project | nothing |
-| **Phase 2** | `IStatisticsAccessor<TStats>`, `StatisticsEvaluator` | Expressions | Phase 1 |
-| **Phase 3** | `ExpressionBinder`, schema binding | Expressions | Phase 1 |
-| **Phase 4** | Migrate Iceberg expressions to consume the shared library | Iceberg | Phases 1-3 |
-| **Phase 5** | `ParquetStatisticsAccessor`; `ParquetReadOptions.Filter`; row group pruning | Parquet | Phase 2 |
-| **Phase 6** | Bloom filter probing in Parquet | Parquet | Phase 5 |
-| **Phase 7** | Delta Lake stats-based file pruning + partition pruning | DeltaLake.Table | Phase 2 |
-| **Phase 8** | `EngineeredWood.Expressions.Arrow`: `ArrowRowEvaluator`, `IFunctionRegistry` | new project | Phase 1 |
-| **Phase 9** | `EngineeredWood.SparkSql`: subsetting tool, ANTLR grammar, parser, function registry | new project | Phases 1, 8 |
-| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes | DeltaLake.Table | Phases 8, 9 |
-| **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | Phase 2 |
-| **Phase 12** | Page-level pushdown using column index | Parquet | Phases 5, 11 |
-| **Phase 13** | Column/offset index writing | Parquet | Phase 11 |
-| **Phase 14** | ORC stripe pruning | Orc | Phase 2 |
+| Phase | Scope | Project | Depends On | Status |
+|---|---|---|---|---|
+| **Phase 1** | `EngineeredWood.Expressions` core: tree, `LiteralValue`, factories | new project | nothing | Done |
+| **Phase 2** | `IStatisticsAccessor<TStats>`, `StatisticsEvaluator` | Expressions | Phase 1 | Done |
+| **Phase 3** | `ExpressionBinder`, schema binding | Expressions | Phase 1 | Done |
+| **Phase 4** | Migrate Iceberg expressions to consume the shared library | Iceberg | Phases 1-3 | Done |
+| **Phase 5** | `ParquetStatisticsAccessor`; `ParquetReadOptions.Filter`; row group pruning | Parquet | Phase 2 | Done |
+| **Phase 6** | Bloom filter probing in Parquet | Parquet | Phase 5 | Done |
+| **Phase 7** | Delta Lake stats-based file pruning + partition pruning | DeltaLake.Table | Phase 2 | Done |
+| **Phase 8** | `EngineeredWood.Expressions.Arrow`: `ArrowRowEvaluator`, `IFunctionRegistry` | new project | Phase 1 | Done |
+| **Phase 9** | `EngineeredWood.SparkSql`: subsetting tool, ANTLR grammar, parser, function registry | new project | Phases 1, 8 | Not started |
+| **Phase 10** | Wire CHECK constraints and generated columns into Delta Lake writes | DeltaLake.Table | Phases 8, 9 | Not started |
+| **Phase 11** | Column/offset index parsing (Parquet read) | Parquet | Phase 2 | Not started |
+| **Phase 12** | Page-level pushdown using column index | Parquet | Phases 5, 11 | Not started |
+| **Phase 13** | Column/offset index writing | Parquet | Phase 11 | Not started |
+| **Phase 14** | ORC stripe pruning | Orc | Phase 2 | Not started |
 
 ### Ordering rationale
 
@@ -633,10 +644,9 @@ format support (ORC). Defer until the simpler wins land.
    need to mix them (function arguments, CASE branches).
 
 3. **Should the Iceberg migration happen before or after Parquet pushdown?**
-   Migrating Iceberg first proves the API shape against an existing user.
-   Doing Parquet first delivers user-visible value sooner. Recommendation:
-   migrate Iceberg first (Phase 4 before Phase 5) — the API shape risk is real,
-   and Iceberg has the test coverage to catch regressions.
+   Resolved: Iceberg migrated first (Phase 4 before Phase 5), as
+   recommended. The API shape held up against the existing Iceberg tests
+   before Parquet and Delta consumers were added.
 
 4. **Bloom filter probing automatic or opt-in?** Requires I/O even when stats
    alone prove `AlwaysFalse`. Recommendation: opt-in via
