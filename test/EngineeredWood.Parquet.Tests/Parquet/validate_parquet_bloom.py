@@ -1,3 +1,6 @@
+# Copyright (c) Curt Hagenlocher. All rights reserved.
+# Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
 """Validates Parquet bloom filters written by EngineeredWood.
 
 Reads a Parquet file, extracts bloom filter blocks from the metadata,

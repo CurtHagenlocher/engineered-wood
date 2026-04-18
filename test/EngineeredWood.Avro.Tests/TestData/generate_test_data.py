@@ -1,3 +1,6 @@
+# Copyright (c) Curt Hagenlocher. All rights reserved.
+# Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
 """
 Generates Avro test data files using fastavro for cross-validation with EngineeredWood.Avro.
 Run: python generate_test_data.py

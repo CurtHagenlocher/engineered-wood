@@ -1,3 +1,6 @@
+# Copyright (c) Curt Hagenlocher. All rights reserved.
+# Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
+
 """Validates ORC bloom filters written by EngineeredWood.
 
 Uses PyArrow to read the ORC file structure and manually parses bloom filter
