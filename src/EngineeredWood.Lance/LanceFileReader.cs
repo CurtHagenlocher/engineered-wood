@@ -840,12 +840,45 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         StructType outer, StructType inner, FieldColumnRange range,
         CancellationToken cancellationToken)
     {
-        int leafCount = inner.Fields.Count;
-        if (range.ColumnCount != leafCount)
+        if (range.ColumnCount != inner.Fields.Count)
             throw new LanceFormatException(
                 $"struct-of-struct field declared {range.ColumnCount} columns " +
-                $"but inner struct has {leafCount} children.");
+                $"but inner struct has {inner.Fields.Count} children.");
 
+        var (innerArr, outerValidity, outerNullCount, numRows) =
+            await ReadV21StructAsStructChildAsync(inner, range.StartColumn, cancellationToken)
+                .ConfigureAwait(false);
+
+        ArrowBuffer outerValidityBuf = (outerValidity is not null && outerNullCount > 0)
+            ? new ArrowBuffer(outerValidity)
+            : ArrowBuffer.Empty;
+        return new StructArray(new ArrayData(
+            outer, numRows, outerNullCount, 0,
+            new[] { outerValidityBuf },
+            new[] { innerArr.Data }));
+    }
+
+    /// <summary>
+    /// Read a single inner-struct child column-group embedded inside a v2.1
+    /// outer struct. The inner struct must have only primitive (FixedWidthType)
+    /// children; each leaf column carries 3 layers <c>[item, inner_struct,
+    /// outer_struct]</c> and all leaves share a single def buffer. Returns
+    /// the inner <see cref="StructArray"/> together with the outer struct's
+    /// per-row validity bitmap (Arrow convention: bit set = struct valid),
+    /// or <c>null</c> when the outer layer is <c>ALL_VALID_ITEM</c>, so the
+    /// caller can reconcile across siblings.
+    /// </summary>
+    private async Task<(Apache.Arrow.StructArray Array, byte[]? OuterValidity, int OuterNullCount, int NumRows)>
+        ReadV21StructAsStructChildAsync(
+            StructType inner, int startColumn, CancellationToken cancellationToken)
+    {
+        foreach (var child in inner.Fields)
+            if (child.DataType is not FixedWidthType)
+                throw new NotImplementedException(
+                    $"struct-as-struct-child grandchild '{child.Name}' has non-primitive type {child.DataType}; " +
+                    "only fixed-width primitive grandchildren are supported in this slice.");
+
+        int leafCount = inner.Fields.Count;
         byte[][] childValues = new byte[leafCount][];
         ushort[]? canonicalDef = null;
         int numRows = -1;
@@ -856,13 +889,13 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         for (int i = 0; i < leafCount; i++)
         {
             var child = inner.Fields[i];
-            int columnIndex = range.StartColumn + i;
+            int columnIndex = startColumn + i;
             ColumnMetadata cm = _columnMetadatas[columnIndex];
             if (cm.Pages.Count == 0)
-                throw new LanceFormatException($"struct-of-struct child column {columnIndex} has no pages.");
+                throw new LanceFormatException($"struct-as-struct-child column {columnIndex} has no pages.");
             if (cm.Pages.Count > 1)
                 throw new NotImplementedException(
-                    $"Multi-page struct-of-struct child reads are not yet supported (column {columnIndex}).");
+                    $"Multi-page struct-as-struct-child reads are not yet supported (column {columnIndex}).");
 
             var page = cm.Pages[0];
             var bufferOwners = await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
@@ -875,22 +908,22 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 var pageLayout = EncodingUnpacker.UnpackPageLayout(page.Encoding);
                 if (pageLayout.LayoutCase != Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout)
                     throw new NotImplementedException(
-                        $"struct-of-struct child column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
+                        $"struct-as-struct-child column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
 
                 var mb = pageLayout.MiniBlockLayout;
                 if (mb.Layers.Count != 3)
                     throw new NotImplementedException(
-                        $"struct-of-struct child column {columnIndex} expects 3 layers, got {mb.Layers.Count}.");
+                        $"struct-as-struct-child column {columnIndex} expects 3 layers, got {mb.Layers.Count}.");
                 var iL = mb.Layers[0]; var nL = mb.Layers[1]; var oL = mb.Layers[2];
-                ValidateItemLayer(iL, "struct-of-struct item");
-                ValidateItemLayer(nL, "struct-of-struct inner-struct");
-                ValidateItemLayer(oL, "struct-of-struct outer-struct");
+                ValidateItemLayer(iL, "struct-as-struct-child item");
+                ValidateItemLayer(nL, "struct-as-struct-child inner-struct");
+                ValidateItemLayer(oL, "struct-as-struct-child outer-struct");
 
                 var (vals, rep, def, _, visible) = Encodings.V21.MiniBlockLayoutDecoder
                     .DecodeNestedLeafChunk(mb, child.DataType, pageContext);
                 if (rep is not null)
                     throw new LanceFormatException(
-                        "struct-of-struct must not have rep_compression (no list layer).");
+                        "struct-as-struct-child must not have rep_compression (no list layer).");
                 childValues[i] = vals;
 
                 if (i == 0)
@@ -903,14 +936,14 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 {
                     if (visible != numRows)
                         throw new LanceFormatException(
-                            $"struct-of-struct child '{child.Name}' has {visible} rows but sibling has {numRows}.");
+                            $"struct-as-struct-child '{child.Name}' has {visible} rows but sibling has {numRows}.");
                     if ((def is null) != (canonicalDef is null))
                         throw new LanceFormatException(
-                            $"struct-of-struct child '{child.Name}' def-buffer presence disagrees with sibling.");
+                            $"struct-as-struct-child '{child.Name}' def-buffer presence disagrees with sibling.");
                     if (def is not null && canonicalDef is not null
                         && !def.AsSpan().SequenceEqual(canonicalDef))
                         throw new LanceFormatException(
-                            $"struct-of-struct child '{child.Name}' def buffer disagrees with sibling.");
+                            $"struct-as-struct-child '{child.Name}' def buffer disagrees with sibling.");
                 }
             }
             finally
@@ -937,19 +970,14 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         for (int i = 0; i < numRows; i++)
         {
             int defValue = canonicalDef is null ? 0 : canonicalDef[i];
-            // For struct-of-struct (no list), every def value must be 0 or
-            // one of the configured null slots. Higher means a corrupt file.
             if (defValue != 0
                 && defValue != leafNullDef
                 && defValue != innerNullDef
                 && defValue != outerNullDef)
                 throw new LanceFormatException(
-                    $"Unexpected def value {defValue} at row {i} for struct-of-struct " +
+                    $"Unexpected def value {defValue} at row {i} for struct-as-struct-child " +
                     $"(layers=[{leafLayer},{innerLayer},{outerLayer}]).");
 
-            // Cascading validity: a row is leaf-valid only when fully valid;
-            // inner-valid when leaf-only-null still leaves struct paths intact;
-            // outer-valid until outer itself goes null.
             bool leafValid = defValue == 0;
             bool innerValid = leafValid || defValue == leafNullDef;
             bool outerValid = innerValid || defValue == innerNullDef;
@@ -986,13 +1014,7 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             new[] { innerValidityBuf },
             leafArrays.Select(a => a.Data).ToArray()));
 
-        ArrowBuffer outerValidityBuf = (outerValidity is not null && outerNullCount > 0)
-            ? new ArrowBuffer(outerValidity)
-            : ArrowBuffer.Empty;
-        return new StructArray(new ArrayData(
-            outer, numRows, outerNullCount, 0,
-            new[] { outerValidityBuf },
-            new[] { innerArr.Data }));
+        return (innerArr, outerValidity, outerNullCount, numRows);
     }
 
     /// <summary>
@@ -1240,6 +1262,12 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     lt, columnCursor, cancellationToken).ConfigureAwait(false);
                 childArr = arr; outerValidity = v; outerNullCount = nc; childRows = r;
             }
+            else if (child.DataType is StructType innerStruct)
+            {
+                var (arr, v, nc, r) = await ReadV21StructAsStructChildAsync(
+                    innerStruct, columnCursor, cancellationToken).ConfigureAwait(false);
+                childArr = arr; outerValidity = v; outerNullCount = nc; childRows = r;
+            }
             else if (child.DataType is FixedWidthType)
             {
                 var (arr, v, nc) = await ReadV21StructChildAsync(
@@ -1250,7 +1278,7 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             {
                 throw new NotImplementedException(
                     $"Mixed-shape outer struct child '{child.Name}' of type {child.DataType} " +
-                    "is not yet supported (only primitives and list-of-primitive).");
+                    "is not yet supported (only primitives, list-of-primitive, and struct-of-primitive).");
             }
 
             childArrays[i] = childArr;

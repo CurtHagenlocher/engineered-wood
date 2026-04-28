@@ -239,6 +239,26 @@ def main() -> None:
                   type=list_struct_type)}),
               version="2.1")
 
+    # Mixed-shape outer struct with a struct grandchild. Layer shapes per
+    # leaf:
+    #   x:       [item, outer_struct]                 (2 layers, no rep)
+    #   ab.a:    [item, inner_struct, outer_struct]   (3 layers, no rep)
+    #   ab.b:    [item, inner_struct, outer_struct]   (3 layers, no rep)
+    mixed_struct_child_type = pa.struct([
+        ("x", pa.int32()),
+        ("ab", pa.struct([("a", pa.int32()), ("b", pa.int32())])),
+    ])
+    write_one("struct_mixed_with_struct_child_v21",
+              pa.table({"s": pa.array(
+                  [{"x": 11, "ab": {"a": 17, "b": 113}},
+                   {"x": 22, "ab": None},                   # inner null
+                   None,                                     # outer null
+                   {"x": 44, "ab": {"a": 41, "b": 313}},
+                   {"x": 55, "ab": {"a": 53, "b": 419}},
+                   {"x": 66, "ab": {"a": 67, "b": 521}}],
+                  type=mixed_struct_child_type)}),
+              version="2.1")
+
     # Mixed-shape outer struct: outer has children of different "shapes"
     # (one primitive, one list). The two leaf columns will have different
     # layer counts: x's layers = [item, outer_struct]; xs's layers =

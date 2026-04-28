@@ -523,6 +523,56 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task Struct_MixedShape_WithStructGrandchild()
+    {
+        // Outer struct has a primitive child x and a struct grandchild ab.
+        // Per-leaf layer shapes:
+        //   x:    [item, outer_struct]                    (2 layers)
+        //   ab.a: [item, inner_struct, outer_struct]      (3 layers)
+        //   ab.b: [item, inner_struct, outer_struct]      (3 layers)
+        // Cross-column reconciliation is at the outer-struct validity
+        // level: col[0] uses def=2 for outer-null while col[1]/col[2] use
+        // def=3, but all three produce the same outer-null bitmap.
+        //
+        // Six rows: [{x:11,ab:{a:17,b:113}}, {x:22,ab:None}, None,
+        //            {x:44,ab:{a:41,b:313}}, {x:55,ab:{a:53,b:419}},
+        //            {x:66,ab:{a:67,b:521}}]
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_mixed_with_struct_child_v21.lance"));
+        var s = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(6, s.Length);
+        Assert.Equal(1, s.NullCount);
+        Assert.True(s.IsNull(2));
+        Assert.False(s.IsNull(1));   // outer valid; ab is null but s itself is fine
+
+        var x = (Int32Array)s.Fields[0];
+        Assert.Equal(11, x.GetValue(0));
+        Assert.Equal(22, x.GetValue(1));
+        Assert.Null(x.GetValue(2));   // cascaded from outer-null
+        Assert.Equal(44, x.GetValue(3));
+        Assert.Equal(66, x.GetValue(5));
+
+        var ab = (Apache.Arrow.StructArray)s.Fields[1];
+        Assert.Equal(6, ab.Length);
+        Assert.Equal(2, ab.NullCount);   // row 1 (inner null) + row 2 (cascaded)
+        Assert.False(ab.IsNull(0));
+        Assert.True(ab.IsNull(1));
+        Assert.True(ab.IsNull(2));
+        Assert.False(ab.IsNull(3));
+
+        var a = (Int32Array)ab.Fields[0];
+        var b = (Int32Array)ab.Fields[1];
+        Assert.Equal(17, a.GetValue(0));
+        Assert.Null(a.GetValue(1));
+        Assert.Null(a.GetValue(2));
+        Assert.Equal(41, a.GetValue(3));
+        Assert.Equal(67, a.GetValue(5));
+        Assert.Equal(113, b.GetValue(0));
+        Assert.Null(b.GetValue(1));
+        Assert.Null(b.GetValue(2));
+        Assert.Equal(521, b.GetValue(5));
+    }
+
+    [Fact]
     public async Task Struct_MixedShapeChildren()
     {
         // Outer struct has TWO children of different physical shapes:
