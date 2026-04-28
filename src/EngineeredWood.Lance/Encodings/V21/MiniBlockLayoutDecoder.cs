@@ -559,7 +559,7 @@ internal static class MiniBlockLayoutDecoder
         return mod == 0 ? offset : offset + (alignment - mod);
     }
 
-    private static IArrowArray BuildFixedWidthArray(
+    internal static IArrowArray BuildFixedWidthArray(
         IArrowType targetType, int length,
         byte[] valueBytes, byte[]? validityBitmap, int nullCount)
     {
@@ -729,6 +729,127 @@ internal static class MiniBlockLayoutDecoder
 
         var arr = BuildFixedWidthArray(childType, length, valueBytes, leafValidity, leafNullCount);
         return (arr, structValidity, structNullCount);
+    }
+
+    // --- v2.1 list-of-struct: low-level chunk reader for shared rep/def + per-leaf values ---
+
+    /// <summary>
+    /// Read a single chunk of a leaf column belonging to a v2.1
+    /// list-of-struct. Returns the raw rep/def buffers and the leaf's value
+    /// bytes; assembly into Arrow <see cref="ListArray"/> / <see
+    /// cref="StructArray"/> is the caller's job, since rep/def are shared
+    /// across all sibling leaves and must be reconciled there.
+    ///
+    /// <para>Layers must be three-deep: <c>[item, struct, list]</c>. The
+    /// item layer must be <c>ALL_VALID_ITEM</c> or <c>NULLABLE_ITEM</c>;
+    /// the struct layer must be one of those too; the list layer can be
+    /// any of the four list variants. Value compression must be
+    /// <see cref="Flat"/> (fixed-width primitive leaves only). Single chunk
+    /// per page.</para>
+    /// </summary>
+    public static (byte[] ValueBytes, ushort[] Rep, ushort[]? Def, int ValueBytesPerItem, int VisibleItems)
+        DecodeForListStructChild(MiniBlockLayout layout, IArrowType childType, in PageContext context)
+    {
+        if (layout.NumBuffers != 1)
+            throw new NotImplementedException(
+                $"List-of-struct child MiniBlockLayout num_buffers={layout.NumBuffers} is not supported (must be 1).");
+        if (layout.Dictionary is not null)
+            throw new NotImplementedException(
+                "List-of-struct child MiniBlockLayout with a dictionary is not supported.");
+        if (layout.Layers.Count != 3)
+            throw new NotImplementedException(
+                $"List-of-struct child MiniBlockLayout expects 3 layers, got {layout.Layers.Count}.");
+
+        RepDefLayer itemLayer = layout.Layers[0];
+        RepDefLayer structLayer = layout.Layers[1];
+        RepDefLayer listLayer = layout.Layers[2];
+        if (itemLayer != RepDefLayer.RepdefAllValidItem && itemLayer != RepDefLayer.RepdefNullableItem)
+            throw new NotImplementedException(
+                $"List-of-struct item layer '{itemLayer}' is not supported.");
+        if (structLayer != RepDefLayer.RepdefAllValidItem && structLayer != RepDefLayer.RepdefNullableItem)
+            throw new NotImplementedException(
+                $"List-of-struct struct layer '{structLayer}' is not supported.");
+        if (listLayer != RepDefLayer.RepdefAllValidList
+            && listLayer != RepDefLayer.RepdefNullableList
+            && listLayer != RepDefLayer.RepdefEmptyableList
+            && listLayer != RepDefLayer.RepdefNullAndEmptyList)
+            throw new NotImplementedException(
+                $"List-of-struct list layer '{listLayer}' is not supported.");
+
+        bool hasRep = layout.RepCompression is not null;
+        bool hasDef = layout.DefCompression is not null;
+        if (!hasRep)
+            throw new LanceFormatException("List-of-struct requires rep_compression.");
+        bool needDef = itemLayer == RepDefLayer.RepdefNullableItem
+                       || structLayer == RepDefLayer.RepdefNullableItem
+                       || listLayer != RepDefLayer.RepdefAllValidList;
+        if (needDef && !hasDef)
+            throw new LanceFormatException("List-of-struct with a nullable layer requires def_compression.");
+        if (!needDef && hasDef)
+            throw new LanceFormatException("List-of-struct with all-valid layers must not have def_compression.");
+
+        long numItems = checked((long)layout.NumItems);
+        bool hasLargeChunk = layout.HasLargeChunk;
+
+        ReadOnlySpan<byte> chunkMeta = context.PageBuffers[0].Span;
+        ReadOnlySpan<byte> chunkData = context.PageBuffers[1].Span;
+        var chunks = ParseChunkMetadata(chunkMeta, hasLargeChunk, numItems);
+        if (chunks.Count != 1)
+            throw new NotImplementedException(
+                $"Multi-chunk list-of-struct child reads are not yet supported (got {chunks.Count} chunks).");
+
+        CompressiveEncoding valueEnc = layout.ValueCompression
+            ?? throw new LanceFormatException("MiniBlockLayout has no value_compression.");
+        int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, childType);
+
+        ReadOnlySpan<byte> chunkBytes = chunkData.Slice(0, (int)chunks[0].SizeBytes);
+        int cursor = 0;
+        int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2)); cursor += 2;
+        int repSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2)); cursor += 2;
+        int defSize = 0;
+        if (hasDef)
+        {
+            defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += 2;
+        }
+        int valueBufSize = hasLargeChunk
+            ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+            : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+        cursor += hasLargeChunk ? 4 : 2;
+        cursor = AlignUp(cursor, MiniBlockAlignment);
+
+        if (repSize != numLevels * sizeof(ushort))
+            throw new NotImplementedException(
+                $"List-of-struct rep buffer size {repSize} != {numLevels * 2} (non-Flat(16) rep is not supported).");
+        var rep = new ushort[numLevels];
+        for (int i = 0; i < numLevels; i++)
+            rep[i] = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
+        cursor += repSize;
+        cursor = AlignUp(cursor, MiniBlockAlignment);
+
+        ushort[]? def = null;
+        if (hasDef)
+        {
+            if (defSize != numLevels * sizeof(ushort))
+                throw new NotImplementedException(
+                    $"List-of-struct def buffer size {defSize} != {numLevels * 2} (non-Flat(16) def is not supported).");
+            def = new ushort[numLevels];
+            for (int i = 0; i < numLevels; i++)
+                def[i] = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
+            cursor += defSize;
+            cursor = AlignUp(cursor, MiniBlockAlignment);
+        }
+
+        // num_items in the layout counts visible items only.
+        int visibleItems = checked((int)numItems);
+        int valueBytesNeeded = visibleItems * valueBytesPerItem;
+        if (valueBufSize < valueBytesNeeded)
+            throw new LanceFormatException(
+                $"List-of-struct value buffer {valueBufSize} < expected {valueBytesNeeded} for {visibleItems} visible items.");
+        var valueBytes = new byte[valueBytesNeeded];
+        chunkBytes.Slice(cursor, valueBytesNeeded).CopyTo(valueBytes);
+
+        return (valueBytes, rep, def, valueBytesPerItem, visibleItems);
     }
 
     // --- v2.1 string-encoding gap (1/3): MiniBlockLayout-level dictionary ---

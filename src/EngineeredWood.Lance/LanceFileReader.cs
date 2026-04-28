@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using System.Buffers;
+using System.Buffers.Binary;
 using Apache.Arrow;
 using Apache.Arrow.Types;
 using EngineeredWood.IO;
@@ -212,24 +213,33 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     && fslType.ValueDataType is not FixedWidthType)
                     throw new NotImplementedException(
                         "FixedSizeListType with non-primitive items is not yet supported for v2.1.");
-                if (field.DataType is Apache.Arrow.Types.ListType listType
-                    && listType.ValueDataType is (StructType or Apache.Arrow.Types.ListType
-                        or LargeListType or FixedSizeListType))
+                if (field.DataType is Apache.Arrow.Types.ListType listType)
                 {
-                    throw new NotImplementedException(
-                        "Reading list-of-nested types from v2.1 files is not yet supported.");
+                    if (listType.ValueDataType is StructType lsInner)
+                    {
+                        foreach (var grandChild in lsInner.Fields)
+                            if (grandChild.DataType is not FixedWidthType)
+                                throw new NotImplementedException(
+                                    $"list<struct> grandchild '{grandChild.Name}' has non-primitive type {grandChild.DataType}; only fixed-width primitive struct children are supported in this slice.");
+                    }
+                    else if (listType.ValueDataType is (Apache.Arrow.Types.ListType
+                        or LargeListType or FixedSizeListType))
+                    {
+                        throw new NotImplementedException(
+                            $"Reading list of {listType.ValueDataType.GetType().Name} from v2.1 files is not yet supported.");
+                    }
                 }
             }
             // v2.1 column count = number of leaf physical columns.
-            // For a struct of N primitive children, that's N columns; for
-            // any other primitive top-level field, 1 column.
+            // For a struct of N primitive children, that's N columns; for a
+            // list<struct<…N children>> it's also N columns (one per leaf,
+            // sharing the list rep buffer); for any other primitive top-level
+            // field, 1 column.
             fieldColumnRanges = new FieldColumnRange[arrowSchema.FieldsList.Count];
             int columnCursor = 0;
             for (int i = 0; i < arrowSchema.FieldsList.Count; i++)
             {
-                int leaves = arrowSchema.FieldsList[i].DataType is StructType st
-                    ? st.Fields.Count
-                    : 1;
+                int leaves = LeafColumnCount(arrowSchema.FieldsList[i].DataType);
                 fieldColumnRanges[i] = new FieldColumnRange(columnCursor, leaves);
                 columnCursor += leaves;
             }
@@ -257,6 +267,13 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             columnMetadatas,
             fieldColumnRanges);
     }
+
+    private static int LeafColumnCount(IArrowType type) => type switch
+    {
+        StructType st => st.Fields.Count,
+        Apache.Arrow.Types.ListType lt when lt.ValueDataType is StructType inner => inner.Fields.Count,
+        _ => 1,
+    };
 
     private static void ValidateFooterBounds(LanceFooter footer, long fileLength)
     {
@@ -403,10 +420,17 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         if (Version.IsV2_1)
         {
             // Phase 7b: structs of primitives are now supported via
-            // ReadV21StructAsync. Other top-level fields (including primitive
-            // leaves and lists) still go through the single-column path.
+            // ReadV21StructAsync. List-of-struct (one Arrow row per top-level
+            // field, but multiple physical columns sharing the same rep+def
+            // buffers) goes through ReadV21ListOfStructAsync. Other top-level
+            // fields (primitives, list-of-primitive) still go through the
+            // single-column path.
             if (arrowField.DataType is StructType structType)
                 return await ReadV21StructAsync(structType, range, cancellationToken)
+                    .ConfigureAwait(false);
+            if (arrowField.DataType is Apache.Arrow.Types.ListType listType
+                && listType.ValueDataType is StructType lsInner)
+                return await ReadV21ListOfStructAsync(listType, lsInner, range, cancellationToken)
                     .ConfigureAwait(false);
             return await ReadV21SingleColumnAsync(
                 range.StartColumn, arrowField.DataType, cancellationToken).ConfigureAwait(false);
@@ -524,6 +548,227 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         {
             foreach (var owner in bufferOwners) owner.Dispose();
         }
+    }
+
+    private async Task<IArrowArray> ReadV21ListOfStructAsync(
+        Apache.Arrow.Types.ListType listType, StructType inner, FieldColumnRange range,
+        CancellationToken cancellationToken)
+    {
+        if (range.ColumnCount != inner.Fields.Count)
+            throw new LanceFormatException(
+                $"v2.1 list<struct> field declared {range.ColumnCount} physical columns " +
+                $"but Arrow struct has {inner.Fields.Count} children.");
+
+        // Read each leaf column; the rep+def buffers are shared across all
+        // siblings so the first child's buffers are taken as canonical and
+        // any subsequent disagreement is a format violation.
+        int childCount = inner.Fields.Count;
+        var childValues = new byte[childCount][];
+        ushort[]? canonicalRep = null;
+        ushort[]? canonicalDef = null;
+        int visibleItems = -1;
+        Proto.Encodings.V21.RepDefLayer leafLayer = default;
+        Proto.Encodings.V21.RepDefLayer structLayer = default;
+        Proto.Encodings.V21.RepDefLayer listLayer = default;
+
+        for (int i = 0; i < childCount; i++)
+        {
+            var child = inner.Fields[i];
+            int columnIndex = range.StartColumn + i;
+            ColumnMetadata cm = _columnMetadatas[columnIndex];
+            if (cm.Pages.Count == 0)
+                throw new LanceFormatException(
+                    $"List-of-struct child column {columnIndex} has no pages.");
+            if (cm.Pages.Count > 1)
+                throw new NotImplementedException(
+                    $"Multi-page list-of-struct child reads are not yet supported (column {columnIndex}).");
+
+            var page = cm.Pages[0];
+            var bufferOwners = await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var pageBuffers = new ReadOnlyMemory<byte>[bufferOwners.Count];
+                for (int k = 0; k < bufferOwners.Count; k++)
+                    pageBuffers[k] = bufferOwners[k].Memory;
+                var pageContext = new PageContext(pageBuffers);
+                var pageLayout = EncodingUnpacker.UnpackPageLayout(page.Encoding);
+                if (pageLayout.LayoutCase != Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout)
+                    throw new NotImplementedException(
+                        $"List-of-struct child column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
+
+                var (vals, rep, def, _, visible) = Encodings.V21.MiniBlockLayoutDecoder
+                    .DecodeForListStructChild(pageLayout.MiniBlockLayout, child.DataType, pageContext);
+                childValues[i] = vals;
+
+                if (i == 0)
+                {
+                    canonicalRep = rep;
+                    canonicalDef = def;
+                    visibleItems = visible;
+                    leafLayer = pageLayout.MiniBlockLayout.Layers[0];
+                    structLayer = pageLayout.MiniBlockLayout.Layers[1];
+                    listLayer = pageLayout.MiniBlockLayout.Layers[2];
+                }
+                else
+                {
+                    if (visible != visibleItems)
+                        throw new LanceFormatException(
+                            $"List-of-struct child '{child.Name}' has {visible} visible items but sibling has {visibleItems}.");
+                    if (!rep.AsSpan().SequenceEqual(canonicalRep!))
+                        throw new LanceFormatException(
+                            $"List-of-struct child '{child.Name}' rep buffer disagrees with sibling.");
+                    if ((def is null) != (canonicalDef is null))
+                        throw new LanceFormatException(
+                            $"List-of-struct child '{child.Name}' def-buffer presence disagrees with sibling.");
+                    if (def is not null && canonicalDef is not null
+                        && !def.AsSpan().SequenceEqual(canonicalDef))
+                        throw new LanceFormatException(
+                            $"List-of-struct child '{child.Name}' def buffer disagrees with sibling.");
+                }
+            }
+            finally
+            {
+                foreach (var owner in bufferOwners) owner.Dispose();
+            }
+        }
+
+        return AssembleListOfStruct(
+            listType, inner, canonicalRep!, canonicalDef, childValues, visibleItems,
+            leafLayer, structLayer, listLayer);
+    }
+
+    private static IArrowArray AssembleListOfStruct(
+        Apache.Arrow.Types.ListType listType, StructType inner,
+        ushort[] rep, ushort[]? def, byte[][] childValues, int visibleItems,
+        Proto.Encodings.V21.RepDefLayer leafLayer,
+        Proto.Encodings.V21.RepDefLayer structLayer,
+        Proto.Encodings.V21.RepDefLayer listLayer)
+    {
+        bool itemNullable = leafLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullableItem;
+        bool structNullable = structLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullableItem;
+        bool listNullable = listLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullableList
+                            || listLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullAndEmptyList;
+        bool listEmptyable = listLayer == Proto.Encodings.V21.RepDefLayer.RepdefEmptyableList
+                             || listLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullAndEmptyList;
+
+        // def slot assignment (matches lance-rs / pylance output): innermost
+        // nullable layer gets def=1, then increasing as we move outward. For
+        // NULL_AND_EMPTY_LIST, null-list comes before empty-list.
+        int next = 1;
+        int leafNullDef = itemNullable ? next++ : -1;
+        int structNullDef = structNullable ? next++ : -1;
+        int listNullDef = listNullable ? next++ : -1;
+        int listEmptyDef = listEmptyable ? next++ : -1;
+
+        // Count rows up front so we can pre-size offset and validity buffers.
+        int numLevels = rep.Length;
+        int numRows = 0;
+        for (int i = 0; i < numLevels; i++) if (rep[i] == 1) numRows++;
+
+        int[] offsets = new int[numRows + 1];
+        byte[]? listValidity = listNullable ? new byte[(numRows + 7) / 8] : null;
+        byte[]? structValidity = structNullable ? new byte[(visibleItems + 7) / 8] : null;
+        byte[]? leafValidity = (itemNullable || structNullable)
+            ? new byte[(visibleItems + 7) / 8] : null;
+        int listNullCount = 0;
+        int structNullCount = 0;
+        int leafNullCount = 0;
+
+        int rowIdx = -1;
+        int visibleIdx = 0;
+        for (int i = 0; i < numLevels; i++)
+        {
+            bool startsRow = rep[i] == 1;
+            int defValue = def is null ? 0 : def[i];
+
+            if (startsRow)
+            {
+                rowIdx++;
+                offsets[rowIdx] = visibleIdx;
+                if (defValue == listNullDef)
+                {
+                    listNullCount++;  // bit stays clear in listValidity
+                    continue;
+                }
+                if (defValue == listEmptyDef)
+                {
+                    if (listValidity is not null)
+                        listValidity[rowIdx >> 3] |= (byte)(1 << (rowIdx & 7));
+                    continue;  // empty list, no item consumed
+                }
+                if (listValidity is not null)
+                    listValidity[rowIdx >> 3] |= (byte)(1 << (rowIdx & 7));
+                // fall through to per-item processing
+            }
+
+            // Per-item: defValue is either 0 (valid), leafNullDef, or structNullDef.
+            if (defValue == 0)
+            {
+                if (leafValidity is not null)
+                    leafValidity[visibleIdx >> 3] |= (byte)(1 << (visibleIdx & 7));
+                if (structValidity is not null)
+                    structValidity[visibleIdx >> 3] |= (byte)(1 << (visibleIdx & 7));
+            }
+            else if (defValue == leafNullDef)
+            {
+                leafNullCount++;
+                if (structValidity is not null)
+                    structValidity[visibleIdx >> 3] |= (byte)(1 << (visibleIdx & 7));
+            }
+            else if (defValue == structNullDef)
+            {
+                // Cascade: leaf null too. Both bits stay clear.
+                structNullCount++;
+                leafNullCount++;
+            }
+            else
+            {
+                throw new LanceFormatException(
+                    $"Unexpected def value {defValue} at level {i} for list-of-struct (layers=[{leafLayer},{structLayer},{listLayer}]).");
+            }
+            visibleIdx++;
+        }
+        offsets[numRows] = visibleIdx;
+        if (visibleIdx != visibleItems)
+            throw new LanceFormatException(
+                $"List-of-struct visible-item walk produced {visibleIdx} items but the page declared {visibleItems}.");
+
+        // Build the leaf primitive arrays (one per struct child).
+        int childCount = inner.Fields.Count;
+        var childArrays = new IArrowArray[childCount];
+        for (int c = 0; c < childCount; c++)
+        {
+            childArrays[c] = Encodings.V21.MiniBlockLayoutDecoder.BuildFixedWidthArray(
+                inner.Fields[c].DataType,
+                visibleItems,
+                childValues[c],
+                leafValidity,
+                leafNullCount);
+        }
+
+        // Assemble the inner StructArray.
+        ArrowBuffer structValidityBuf = (structValidity is not null && structNullCount > 0)
+            ? new ArrowBuffer(structValidity)
+            : ArrowBuffer.Empty;
+        var structData = new ArrayData(
+            inner, visibleItems, structNullCount, offset: 0,
+            new[] { structValidityBuf },
+            children: childArrays.Select(a => a.Data).ToArray());
+        var structArr = new StructArray(structData);
+
+        // Assemble the outer ListArray.
+        var offsetsBytes = new byte[(numRows + 1) * sizeof(int)];
+        for (int i = 0; i <= numRows; i++)
+            BinaryPrimitives.WriteInt32LittleEndian(offsetsBytes.AsSpan(i * 4, 4), offsets[i]);
+
+        ArrowBuffer listValidityBuf = (listValidity is not null && listNullCount > 0)
+            ? new ArrowBuffer(listValidity)
+            : ArrowBuffer.Empty;
+        var listData = new ArrayData(
+            listType, numRows, listNullCount, offset: 0,
+            new[] { listValidityBuf, new ArrowBuffer(offsetsBytes) },
+            children: new[] { structArr.Data });
+        return new ListArray(listData);
     }
 
     private async Task<IArrowArray> ReadV21SingleColumnAsync(

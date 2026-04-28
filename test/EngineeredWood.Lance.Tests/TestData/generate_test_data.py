@@ -213,6 +213,32 @@ def main() -> None:
                   type=pa.struct([("a", pa.int32()), ("b", pa.int32())]))}),
               version="2.1")
 
+    # List-of-struct, v2.1. Three rep/def layers:
+    #   [<leaf>, <struct>, <list>]
+    # Each struct leaf is a separate physical column; rep+def levels are
+    # shared across leaves and across the list boundary. Three rows of
+    # varying list lengths exercise the rep encoding too.
+    list_struct_type = pa.list_(pa.struct([("a", pa.int32()), ("b", pa.int32())]))
+    write_one("list_struct_v21",
+              pa.table({"xs": pa.array(
+                  [[{"a": 1, "b": 10}, {"a": 2, "b": 20}],
+                   [{"a": 3, "b": 30}],
+                   [{"a": 4, "b": 40}, {"a": 5, "b": 50}, {"a": 6, "b": 60}]],
+                  type=list_struct_type)}),
+              version="2.1")
+
+    # Same but with nullable list, nullable struct, and a couple of edge
+    # rows: a null list, an empty list, and a null struct inside a list.
+    write_one("list_struct_nullable_v21",
+              pa.table({"xs": pa.array(
+                  [[{"a": 1, "b": 10}, {"a": 2, "b": 20}],
+                   None,                                 # null list
+                   [],                                   # empty list
+                   [{"a": 3, "b": 30}, None, {"a": 5, "b": 50}],  # null struct mid-list
+                   [{"a": 6, "b": 60}]],
+                  type=list_struct_type)}),
+              version="2.1")
+
     # Inner-only nullable: outer struct non-nullable in the Arrow schema,
     # one child non-nullable, the other nullable. Forces pylance to pick
     # different RepDefLayer combinations for siblings sharing the same
