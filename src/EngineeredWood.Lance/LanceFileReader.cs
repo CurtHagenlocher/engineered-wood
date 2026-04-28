@@ -440,11 +440,12 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             // single-column path.
             if (arrowField.DataType is StructType structType)
             {
-                // Recurse into compound struct shapes (struct-of-struct,
-                // struct-of-list). For now restrict to outer-struct-with-
-                // exactly-one-compound-child; multi-field mixes still need
-                // per-shape coherence rules and aren't covered by any pylance
-                // fixture we read yet.
+                // Single-compound-child specialisations stay because they
+                // also handle struct children (which the mixed-shape
+                // orchestrator doesn't yet); for everything else, route on
+                // child-shape homogeneity. All-primitive children → existing
+                // multi-leaf path; any compound (list) child mixed with
+                // primitive siblings → mixed-shape path.
                 if (structType.Fields.Count == 1
                     && structType.Fields[0].DataType is StructType ssInner)
                     return await ReadV21StructOfStructAsync(structType, ssInner, range, cancellationToken)
@@ -452,6 +453,12 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 if (structType.Fields.Count == 1
                     && structType.Fields[0].DataType is Apache.Arrow.Types.ListType slInner)
                     return await ReadV21StructOfListAsync(structType, slInner, range, cancellationToken)
+                        .ConfigureAwait(false);
+                bool anyCompound = structType.Fields.Any(f =>
+                    f.DataType is Apache.Arrow.Types.ListType
+                        or LargeListType or FixedSizeListType or StructType);
+                if (anyCompound)
+                    return await ReadV21MixedShapeStructAsync(structType, range, cancellationToken)
                         .ConfigureAwait(false);
                 return await ReadV21StructAsync(structType, range, cancellationToken)
                     .ConfigureAwait(false);
@@ -989,11 +996,10 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Decode <c>struct&lt;list&lt;primitive&gt;&gt;</c>. The leaf column has
-    /// 3 layers <c>[item, list, outer_struct]</c>; rep delimits outer-struct
-    /// rows, def values for list-null/empty and outer-null skip value slots
-    /// while leaf-null still consumes one. Outer-null cascades through the
-    /// list layer (same effect as list-null for value slots).
+    /// Decode <c>struct&lt;list&lt;primitive&gt;&gt;</c>. Single child means
+    /// the column count is 1; we delegate the actual list decode to
+    /// <see cref="ReadV21ListAsStructChildAsync"/> and just wrap the result
+    /// in the outer <see cref="StructArray"/>.
     /// </summary>
     private async Task<IArrowArray> ReadV21StructOfListAsync(
         StructType outer, Apache.Arrow.Types.ListType list, FieldColumnRange range,
@@ -1003,7 +1009,36 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             throw new LanceFormatException(
                 $"struct-of-list field declared {range.ColumnCount} columns but expected 1.");
 
-        int columnIndex = range.StartColumn;
+        var (listArr, outerValidity, outerNullCount, numRows) =
+            await ReadV21ListAsStructChildAsync(list, range.StartColumn, cancellationToken)
+                .ConfigureAwait(false);
+
+        ArrowBuffer outerValidityBuf = (outerValidity is not null && outerNullCount > 0)
+            ? new ArrowBuffer(outerValidity)
+            : ArrowBuffer.Empty;
+        return new StructArray(new ArrayData(
+            outer, numRows, outerNullCount, 0,
+            new[] { outerValidityBuf },
+            new[] { listArr.Data }));
+    }
+
+    /// <summary>
+    /// Read a single list child column embedded inside a v2.1 outer struct.
+    /// Returns the inner <see cref="ListArray"/> together with the outer
+    /// struct's per-row validity bitmap (Arrow convention: bit set = struct
+    /// valid, <c>null</c> when the outer layer is <c>ALL_VALID_ITEM</c>) so
+    /// callers — both the single-list-child wrapper and the mixed-shape
+    /// orchestrator — can reconcile it across siblings.
+    ///
+    /// <para>Layer shape required: <c>[item, list, outer_struct]</c>. Value
+    /// compression must be <see cref="Encodings.V21.MiniBlockLayoutDecoder"/>'s
+    /// supported subset. Single chunk per page.</para>
+    /// </summary>
+    private async Task<(Apache.Arrow.ListArray Array, byte[]? OuterValidity, int OuterNullCount, int NumRows)>
+        ReadV21ListAsStructChildAsync(
+            Apache.Arrow.Types.ListType list, int columnIndex,
+            CancellationToken cancellationToken)
+    {
         ColumnMetadata cm = _columnMetadatas[columnIndex];
         if (cm.Pages.Count == 0)
             throw new LanceFormatException($"struct-of-list child column {columnIndex} has no pages.");
@@ -1154,14 +1189,111 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             children: new[] { leafArr.Data });
         var listArr = new ListArray(listData);
 
-        // Wrap in the outer StructArray.
-        ArrowBuffer outerValidityBuf = (outerValidity is not null && outerNullCount > 0)
-            ? new ArrowBuffer(outerValidity)
+        return (listArr, outerValidity, outerNullCount, numRows);
+    }
+
+    /// <summary>
+    /// Decode a v2.1 outer struct whose children have <em>different</em>
+    /// physical layouts — e.g. a primitive sibling next to a list sibling.
+    /// Each child column carries its own layer shape (2 layers for a
+    /// primitive child, 3 for a list child) but they all share the
+    /// outer-struct layer at the end of their <c>layers</c> array. We
+    /// dispatch per-child to the appropriate single-column reader, then
+    /// reconcile the per-row outer-struct validity across siblings.
+    ///
+    /// <para>Restrictions in this slice: each child must be either a
+    /// primitive (FixedWidthType) or a <see cref="Apache.Arrow.Types.ListType"/>
+    /// of primitives. Nested-struct children inside a mixed-shape outer
+    /// struct still throw — we'd need a struct-as-struct-child reader
+    /// (parallel to <see cref="ReadV21ListAsStructChildAsync"/>) which we
+    /// haven't extracted yet.</para>
+    /// </summary>
+    private async Task<IArrowArray> ReadV21MixedShapeStructAsync(
+        StructType outer, FieldColumnRange range, CancellationToken cancellationToken)
+    {
+        int childCount = outer.Fields.Count;
+        var childArrays = new IArrowArray[childCount];
+        byte[]? canonicalOuterValidity = null;
+        int canonicalOuterNullCount = 0;
+        int numRows = -1;
+
+        int columnCursor = range.StartColumn;
+        int columnEnd = range.StartColumn + range.ColumnCount;
+        for (int i = 0; i < childCount; i++)
+        {
+            var child = outer.Fields[i];
+            IArrowArray childArr;
+            byte[]? outerValidity;
+            int outerNullCount;
+            int childRows;
+            int childLeaves = LeafColumnCount(child.DataType);
+
+            if (columnCursor + childLeaves > columnEnd)
+                throw new LanceFormatException(
+                    $"Mixed-shape struct child '{child.Name}' would consume " +
+                    $"columns past the field's range (cursor={columnCursor}, leaves={childLeaves}, end={columnEnd}).");
+
+            if (child.DataType is Apache.Arrow.Types.ListType lt
+                && lt.ValueDataType is FixedWidthType)
+            {
+                var (arr, v, nc, r) = await ReadV21ListAsStructChildAsync(
+                    lt, columnCursor, cancellationToken).ConfigureAwait(false);
+                childArr = arr; outerValidity = v; outerNullCount = nc; childRows = r;
+            }
+            else if (child.DataType is FixedWidthType)
+            {
+                var (arr, v, nc) = await ReadV21StructChildAsync(
+                    columnCursor, child.DataType, cancellationToken).ConfigureAwait(false);
+                childArr = arr; outerValidity = v; outerNullCount = nc; childRows = arr.Length;
+            }
+            else
+            {
+                throw new NotImplementedException(
+                    $"Mixed-shape outer struct child '{child.Name}' of type {child.DataType} " +
+                    "is not yet supported (only primitives and list-of-primitive).");
+            }
+
+            childArrays[i] = childArr;
+            columnCursor += childLeaves;
+
+            if (numRows < 0) numRows = childRows;
+            else if (childRows != numRows)
+                throw new LanceFormatException(
+                    $"Mixed-shape struct child '{child.Name}' has {childRows} rows but sibling has {numRows}.");
+
+            if (i == 0)
+            {
+                canonicalOuterValidity = outerValidity;
+                canonicalOuterNullCount = outerNullCount;
+            }
+            else if ((outerValidity is null) != (canonicalOuterValidity is null))
+            {
+                throw new LanceFormatException(
+                    $"Mixed-shape struct child '{child.Name}' outer-layer presence disagrees with sibling " +
+                    "(one column has a NULLABLE_ITEM outer layer, the other ALL_VALID_ITEM).");
+            }
+            else if (outerValidity is not null && canonicalOuterValidity is not null)
+            {
+                if (!outerValidity.AsSpan().SequenceEqual(canonicalOuterValidity)
+                    || outerNullCount != canonicalOuterNullCount)
+                    throw new LanceFormatException(
+                        $"Mixed-shape struct child '{child.Name}' outer-struct validity disagrees with sibling " +
+                        "(cross-column rep/def coherence violated).");
+            }
+        }
+
+        if (columnCursor != columnEnd)
+            throw new LanceFormatException(
+                $"Mixed-shape struct consumed {columnCursor - range.StartColumn} columns " +
+                $"but the field's range covers {range.ColumnCount}.");
+
+        ArrowBuffer outerValidityBuf = (canonicalOuterValidity is not null && canonicalOuterNullCount > 0)
+            ? new ArrowBuffer(canonicalOuterValidity)
             : ArrowBuffer.Empty;
         return new StructArray(new ArrayData(
-            outer, numRows, outerNullCount, 0,
+            outer, numRows, canonicalOuterNullCount, 0,
             new[] { outerValidityBuf },
-            new[] { listArr.Data }));
+            children: childArrays.Select(a => a.Data).ToArray()));
     }
 
     private static void ValidateItemLayer(Proto.Encodings.V21.RepDefLayer layer, string label)

@@ -239,6 +239,25 @@ def main() -> None:
                   type=list_struct_type)}),
               version="2.1")
 
+    # Mixed-shape outer struct: outer has children of different "shapes"
+    # (one primitive, one list). The two leaf columns will have different
+    # layer counts: x's layers = [item, outer_struct]; xs's layers =
+    # [item, list, outer_struct]. They still share the outer-struct layer.
+    mixed_outer_type = pa.struct([
+        ("x", pa.int32()),
+        ("xs", pa.list_(pa.int32())),
+    ])
+    write_one("struct_mixed_shapes_v21",
+              pa.table({"s": pa.array(
+                  [{"x": 1, "xs": [10, 11]},
+                   {"x": 2, "xs": [20]},
+                   None,                                 # outer null
+                   {"x": 3, "xs": []},                   # empty list
+                   {"x": 4, "xs": None},                 # null list, primitive valid
+                   {"x": 5, "xs": [50, 51, 52]}],
+                  type=mixed_outer_type)}),
+              version="2.1")
+
     # large_list: same data shape as list but Arrow LargeListType uses
     # i64 offsets. On disk in Lance v2.1 the encoding should be identical
     # to a regular list — only the Arrow schema metadata differs.

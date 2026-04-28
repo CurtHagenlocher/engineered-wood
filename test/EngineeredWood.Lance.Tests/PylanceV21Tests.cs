@@ -523,6 +523,60 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task Struct_MixedShapeChildren()
+    {
+        // Outer struct has TWO children of different physical shapes:
+        //   x:  int32 (2-layer leaf [item, outer_struct])
+        //   xs: list<int32> (3-layer leaf [item, list, outer_struct])
+        // Their def-slot encoding differs (def=2 means outer-null in col[0]
+        // but means list-empty in col[1]); coherence check has to compare
+        // the *outer-struct validity bitmap* derived from each child's
+        // def, not raw def buffers.
+        //
+        // Six rows: [{x:1,xs:[10,11]}, {x:2,xs:[20]}, None, {x:3,xs:[]},
+        //            {x:4,xs:None}, {x:5,xs:[50,51,52]}]
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_mixed_shapes_v21.lance"));
+        var s = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(6, s.Length);
+        Assert.Equal(1, s.NullCount);
+        Assert.True(s.IsNull(2));   // outer-null row
+        Assert.False(s.IsNull(3));
+        Assert.False(s.IsNull(4));
+
+        var x = (Int32Array)s.Fields[0];
+        Assert.Equal(6, x.Length);
+        Assert.Equal(1, x.GetValue(0));
+        Assert.Equal(2, x.GetValue(1));
+        Assert.Null(x.GetValue(2));   // cascaded from outer-null
+        Assert.Equal(3, x.GetValue(3));
+        Assert.Equal(4, x.GetValue(4));
+        Assert.Equal(5, x.GetValue(5));
+
+        var xs = (ListArray)s.Fields[1];
+        Assert.Equal(6, xs.Length);
+        Assert.Equal(2, xs.NullCount);
+        Assert.False(xs.IsNull(0));
+        Assert.False(xs.IsNull(1));
+        Assert.True(xs.IsNull(2));    // outer-null cascades to list
+        Assert.False(xs.IsNull(3));   // empty list, valid
+        Assert.True(xs.IsNull(4));    // genuine list-null
+        Assert.False(xs.IsNull(5));
+
+        // Offsets reflect visible-only items: 6 visible items spread across
+        // rows 0 (2 items), 1 (1 item), 5 (3 items); other rows skip slots.
+        Assert.Equal(0, xs.ValueOffsets[0]);
+        Assert.Equal(2, xs.ValueOffsets[1]);
+        Assert.Equal(3, xs.ValueOffsets[2]);
+        Assert.Equal(3, xs.ValueOffsets[3]);  // outer-null → no items
+        Assert.Equal(3, xs.ValueOffsets[4]);  // empty list → no items
+        Assert.Equal(3, xs.ValueOffsets[5]);  // null list → no items
+        Assert.Equal(6, xs.ValueOffsets[6]);
+
+        var values = (Int32Array)xs.Values;
+        Assert.Equal(new int?[] { 10, 11, 20, 50, 51, 52 }, values.ToArray());
+    }
+
+    [Fact]
     public async Task LargeList_NullAndEmpty()
     {
         // pa.large_list(int32). On disk Lance v2.1 encodes this exactly like
