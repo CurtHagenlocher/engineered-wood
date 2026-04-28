@@ -583,23 +583,33 @@ internal static class MiniBlockLayoutDecoder
 
     /// <summary>
     /// Decode a leaf column belonging to a v2.1 struct. The chunk's def
-    /// buffer carries layered nullability — the inner layer is the leaf's
-    /// own validity, the outer layer is the struct's. Returns:
+    /// buffer carries layered nullability — layer[0] is the leaf's own
+    /// validity, layer[1] is the struct's. Returns:
     /// <list type="bullet">
-    ///   <item>A fully-valid-or-leaf-validity-applied child Arrow array
-    ///   (validity bit set when <c>def == 0</c>).</item>
-    ///   <item>The raw u16 def buffer so the caller can compute outer-layer
-    ///   (struct-level) validity and verify cross-column coherence.</item>
-    ///   <item><c>null</c> def when both layers are <c>ALL_VALID_ITEM</c>
-    ///   (no def buffer is stored on disk).</item>
+    ///   <item>An Arrow array with leaf-level validity applied (a row
+    ///   counts as null when either the leaf or the parent struct is
+    ///   null at that position).</item>
+    ///   <item>The struct-level validity bitmap (Arrow convention: bit
+    ///   set means the struct is valid). <c>null</c> when the outer
+    ///   layer is <c>ALL_VALID_ITEM</c> — that is, the struct is
+    ///   structurally non-nullable in this column's view.</item>
+    ///   <item>The struct-level null count (always 0 when the bitmap is
+    ///   null).</item>
     /// </list>
     ///
-    /// <para>Phase 7b scope: layers must be either <c>[ALL_VALID_ITEM,
-    /// ALL_VALID_ITEM]</c> or <c>[NULLABLE_ITEM, NULLABLE_ITEM]</c>, value
-    /// compression must be <see cref="Flat"/>, and there must be exactly
-    /// one mini-block chunk.</para>
+    /// <para>Supported layer combinations (the only ones pylance emits):
+    /// <c>[ALL_VALID_ITEM, ALL_VALID_ITEM]</c> (no def buffer),
+    /// <c>[NULLABLE_ITEM, ALL_VALID_ITEM]</c> (def∈{0,1}, 1 = leaf null),
+    /// and <c>[NULLABLE_ITEM, NULLABLE_ITEM]</c> (def∈{0,1,2}, 2 =
+    /// struct null cascading to the leaf). <c>[ALL_VALID_ITEM,
+    /// NULLABLE_ITEM]</c> is rejected — pylance normalises this to
+    /// <c>[NULLABLE_ITEM, NULLABLE_ITEM]</c> rather than emitting it.</para>
+    ///
+    /// <para>Other limits: value compression must be <see cref="Flat"/>,
+    /// there must be exactly one mini-block chunk, no dictionary, and no
+    /// repetition index.</para>
     /// </summary>
-    public static (IArrowArray Array, ushort[]? DefLevels) DecodeForStructChild(
+    public static (IArrowArray Array, byte[]? StructValidity, int StructNullCount) DecodeForStructChild(
         MiniBlockLayout layout, IArrowType childType, in PageContext context)
     {
         if (layout.NumBuffers != 1)
@@ -617,21 +627,27 @@ internal static class MiniBlockLayoutDecoder
 
         RepDefLayer leafLayer = layout.Layers[0];
         RepDefLayer structLayer = layout.Layers[1];
-        bool allValid = leafLayer == RepDefLayer.RepdefAllValidItem
-                        && structLayer == RepDefLayer.RepdefAllValidItem;
-        bool nullable = leafLayer == RepDefLayer.RepdefNullableItem
-                        && structLayer == RepDefLayer.RepdefNullableItem;
-        if (!allValid && !nullable)
+        bool leafNullable = leafLayer == RepDefLayer.RepdefNullableItem;
+        bool leafAllValid = leafLayer == RepDefLayer.RepdefAllValidItem;
+        bool structNullable = structLayer == RepDefLayer.RepdefNullableItem;
+        bool structAllValid = structLayer == RepDefLayer.RepdefAllValidItem;
+        if (!(leafNullable || leafAllValid) || !(structNullable || structAllValid))
             throw new NotImplementedException(
-                $"Struct-child layers '{leafLayer}, {structLayer}' are not supported (only [AllValid, AllValid] or [Nullable, Nullable]).");
+                $"Struct-child layers '{leafLayer}, {structLayer}' are not supported.");
+        // pylance normalises [AllValid, Nullable] to [Nullable, Nullable]; reject
+        // until a real fixture appears so the def-decoding path stays exercised.
+        if (leafAllValid && structNullable)
+            throw new NotImplementedException(
+                "Struct-child layers [AllValid, Nullable] are not yet supported (no fixture available).");
 
         bool hasDef = layout.DefCompression is not null;
-        if (nullable && !hasDef)
+        bool needDef = leafNullable || structNullable;
+        if (needDef && !hasDef)
             throw new LanceFormatException(
-                "NULLABLE struct layers require def_compression.");
-        if (allValid && hasDef)
+                "Struct-child with a NULLABLE layer requires def_compression.");
+        if (!needDef && hasDef)
             throw new LanceFormatException(
-                "ALL_VALID struct layers must not have def_compression.");
+                "Struct-child with all-valid layers must not have def_compression.");
 
         long numItems = checked((long)layout.NumItems);
         int length = checked((int)numItems);
@@ -649,9 +665,10 @@ internal static class MiniBlockLayoutDecoder
         int valueBytesPerItem = ResolveFlatBytesPerValue(valueEnc, childType);
 
         byte[] valueBytes = new byte[checked(length * valueBytesPerItem)];
-        byte[]? validityBitmap = hasDef ? new byte[(length + 7) / 8] : null;
-        ushort[]? defLevels = hasDef ? new ushort[length] : null;
-        int nullCount = 0;
+        byte[]? leafValidity = leafNullable ? new byte[(length + 7) / 8] : null;
+        byte[]? structValidity = structNullable ? new byte[(length + 7) / 8] : null;
+        int leafNullCount = 0;
+        int structNullCount = 0;
 
         ReadOnlySpan<byte> chunkBytes = chunkData.Slice(0, (int)chunks[0].SizeBytes);
         int itemsInChunk = (int)chunks[0].NumValues;
@@ -678,14 +695,27 @@ internal static class MiniBlockLayoutDecoder
                 throw new NotImplementedException(
                     $"Struct-child def buffer size {defSize} != expected {expected} (non-Flat(16) def is not supported).");
 
+            // [N, AV]: def∈{0,1}, only the leaf layer can be null.
+            // [N, N]:  def∈{0,1,2}, def=2 is the cascading struct-null.
+            // In both cases leaf valid iff def == 0 (struct-null cascades to the leaf in Arrow).
+            const ushort StructNullDef = 2;
             for (int i = 0; i < itemsInChunk; i++)
             {
                 ushort def = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor + i * 2, 2));
-                defLevels![i] = def;
-                if (def == 0)
-                    validityBitmap![i >> 3] |= (byte)(1 << (i & 7));
-                else
-                    nullCount++;
+                if (leafNullable)
+                {
+                    if (def == 0)
+                        leafValidity![i >> 3] |= (byte)(1 << (i & 7));
+                    else
+                        leafNullCount++;
+                }
+                if (structNullable)
+                {
+                    if (def != StructNullDef)
+                        structValidity![i >> 3] |= (byte)(1 << (i & 7));
+                    else
+                        structNullCount++;
+                }
             }
             cursor += defSize;
             cursor = AlignUp(cursor, MiniBlockAlignment);
@@ -697,8 +727,8 @@ internal static class MiniBlockLayoutDecoder
                 $"Struct-child value buffer size {valueBufSize} < expected {valueBytesNeeded}.");
         chunkBytes.Slice(cursor, valueBytesNeeded).CopyTo(valueBytes);
 
-        var arr = BuildFixedWidthArray(childType, length, valueBytes, validityBitmap, nullCount);
-        return (arr, defLevels);
+        var arr = BuildFixedWidthArray(childType, length, valueBytes, leafValidity, leafNullCount);
+        return (arr, structValidity, structNullCount);
     }
 
     // --- v2.1 string-encoding gap (1/3): MiniBlockLayout-level dictionary ---

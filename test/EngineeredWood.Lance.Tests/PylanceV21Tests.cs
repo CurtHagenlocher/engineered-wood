@@ -323,6 +323,32 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task Struct_MixedLayerKinds_NonNullStructWithNullableChild()
+    {
+        // Schema: struct<a: int32 not null, b: int32 nullable> with the
+        // *struct* itself non-nullable. pylance picks different RepDefLayer
+        // combinations for the two children:
+        //   col[0] (a): [ALL_VALID_ITEM, ALL_VALID_ITEM]  — no def buffer
+        //   col[1] (b): [NULLABLE_ITEM,  ALL_VALID_ITEM]  — def∈{0,1}
+        // Cross-column coherence here is "neither column declares the struct
+        // nullable", so the assembler must accept null vs null struct-validity
+        // bitmaps even though one child has a def buffer and the other doesn't.
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_inner_nullable_v21.lance"));
+        var arr = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(3, arr.Length);
+        Assert.Equal(0, arr.NullCount);
+
+        var a = (Int32Array)arr.Fields[0];
+        var b = (Int32Array)arr.Fields[1];
+        Assert.Equal(new int?[] { 1, 2, 3 }, a.ToArray());
+        Assert.Equal(0, a.NullCount);
+        Assert.Equal(10, b.GetValue(0));
+        Assert.Null(b.GetValue(1));
+        Assert.Equal(30, b.GetValue(2));
+        Assert.Equal(1, b.NullCount);
+    }
+
+    [Fact]
     public async Task FullZip_BigFsl_Float32_x4096()
     {
         // 5 rows × 4096 float32 = 80 KiB total, 16 KiB per row → FullZipLayout.

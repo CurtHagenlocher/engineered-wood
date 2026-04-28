@@ -213,6 +213,24 @@ def main() -> None:
                   type=pa.struct([("a", pa.int32()), ("b", pa.int32())]))}),
               version="2.1")
 
+    # Inner-only nullable: outer struct non-nullable in the Arrow schema,
+    # one child non-nullable, the other nullable. Forces pylance to pick
+    # different RepDefLayer combinations for siblings sharing the same
+    # outer (struct) layer:
+    #   s.a: [ALL_VALID_ITEM, ALL_VALID_ITEM]  (the existing all-valid case)
+    #   s.b: [NULLABLE_ITEM,  ALL_VALID_ITEM]  (only leaf can be null)
+    inner_struct_type = pa.struct([
+        pa.field("a", pa.int32(), nullable=False),
+        pa.field("b", pa.int32(), nullable=True),
+    ])
+    write_one("struct_inner_nullable_v21",
+              pa.table({"s": pa.array(
+                  [{"a": 1, "b": 10}, {"a": 2, "b": None}, {"a": 3, "b": 30}],
+                  type=inner_struct_type)},
+                  schema=pa.schema([pa.field("s", inner_struct_type, nullable=False)])),
+              version="2.1")
+
+
     # Phase 14: multi-chunk Variable in MiniBlock. Even modest string columns
     # get sliced into multiple mini-block chunks (any column past ~64 rows
     # of varied 200B strings hits 6+ chunks for example). Use a deterministic

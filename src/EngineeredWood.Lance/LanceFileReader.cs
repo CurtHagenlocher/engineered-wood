@@ -432,16 +432,20 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 $"but Arrow type has {structType.Fields.Count} children.");
 
         // Read every child column, capturing both its Arrow array and the
-        // raw def levels. The outer layer's def (struct-level nullability)
-        // must be identical across siblings; we use the first child as the
-        // canonical def buffer.
+        // child's view of struct-level validity (the outer rep/def layer).
+        // Across siblings, the struct-level validity must agree: either no
+        // child reports a struct-validity bitmap (every column declares the
+        // outer layer ALL_VALID_ITEM), or every child reports the same
+        // bitmap byte-for-byte. Mixed presence indicates the writer disagreed
+        // with itself about whether the struct could be null.
         var childArrays = new IArrowArray[structType.Fields.Count];
-        ushort[]? canonicalDef = null;
+        byte[]? canonicalStructValidity = null;
+        int canonicalStructNullCount = 0;
         int length = -1;
         for (int i = 0; i < structType.Fields.Count; i++)
         {
             var child = structType.Fields[i];
-            var (arr, def) = await ReadV21StructChildAsync(
+            var (arr, structValidity, structNullCount) = await ReadV21StructChildAsync(
                 range.StartColumn + i, child.DataType, cancellationToken).ConfigureAwait(false);
             childArrays[i] = arr;
             if (length < 0) length = arr.Length;
@@ -451,43 +455,37 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
 
             if (i == 0)
             {
-                canonicalDef = def;
+                canonicalStructValidity = structValidity;
+                canonicalStructNullCount = structNullCount;
             }
-            else if (def is null != canonicalDef is null)
+            else if ((structValidity is null) != (canonicalStructValidity is null))
             {
                 throw new LanceFormatException(
-                    $"Struct child '{child.Name}' def-buffer presence disagrees with sibling.");
+                    $"Struct child '{child.Name}' outer-layer presence disagrees with sibling " +
+                    "(one column has a NULLABLE_ITEM outer layer, the other ALL_VALID_ITEM).");
             }
-            else if (def is not null && canonicalDef is not null)
+            else if (structValidity is not null && canonicalStructValidity is not null)
             {
-                for (int k = 0; k < def.Length; k++)
-                {
-                    if (def[k] != canonicalDef[k])
-                        throw new LanceFormatException(
-                            $"Struct child '{child.Name}' def[{k}]={def[k]} disagrees with sibling def[{k}]={canonicalDef[k]} (cross-column rep/def coherence violated).");
-                }
+                if (!structValidity.AsSpan().SequenceEqual(canonicalStructValidity)
+                    || structNullCount != canonicalStructNullCount)
+                    throw new LanceFormatException(
+                        $"Struct child '{child.Name}' struct-level validity disagrees with sibling " +
+                        "(cross-column rep/def coherence violated).");
             }
         }
 
-        // Compute outer (struct-level) validity bitmap. With 2 NULLABLE_ITEM
-        // layers, def == 2 means the struct itself is null. With ALL_VALID
-        // layers there is no def — struct is fully valid.
+        // Build the StructArray. When the outer layer is ALL_VALID_ITEM there
+        // is no validity bitmap (canonicalStructValidity == null). When it is
+        // NULLABLE_ITEM but no row turned out to be struct-null, Arrow lets us
+        // skip the bitmap too — we only attach it when there's at least one
+        // null to record.
         ArrowBuffer validity = ArrowBuffer.Empty;
         int nullCount = 0;
-        if (canonicalDef is not null)
+        if (canonicalStructValidity is not null)
         {
-            const ushort StructNullDef = 2;
-            int bitmapBytes = (length + 7) / 8;
-            var bitmap = new byte[bitmapBytes];
-            for (int k = 0; k < length; k++)
-            {
-                if (canonicalDef[k] == StructNullDef)
-                    nullCount++;
-                else
-                    bitmap[k >> 3] |= (byte)(1 << (k & 7));
-            }
+            nullCount = canonicalStructNullCount;
             if (nullCount > 0)
-                validity = new ArrowBuffer(bitmap);
+                validity = new ArrowBuffer(canonicalStructValidity);
         }
 
         var data = new ArrayData(
@@ -497,12 +495,12 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         return new StructArray(data);
     }
 
-    private async Task<(IArrowArray Array, ushort[]? DefLevels)> ReadV21StructChildAsync(
+    private async Task<(IArrowArray Array, byte[]? StructValidity, int StructNullCount)> ReadV21StructChildAsync(
         int columnIndex, IArrowType childType, CancellationToken cancellationToken)
     {
         ColumnMetadata cm = _columnMetadatas[columnIndex];
         if (cm.Pages.Count == 0)
-            return (BuildEmptyArray(childType), null);
+            return (BuildEmptyArray(childType), null, 0);
         if (cm.Pages.Count > 1)
             throw new NotImplementedException(
                 $"Multi-page struct-child reads are not yet supported (column {columnIndex}).");
