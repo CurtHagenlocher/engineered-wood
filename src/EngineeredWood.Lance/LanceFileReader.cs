@@ -440,28 +440,26 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             // single-column path.
             if (arrowField.DataType is StructType structType)
             {
-                // Single-compound-child specialisations stay because they
-                // also handle struct children (which the mixed-shape
-                // orchestrator doesn't yet); for everything else, route on
-                // child-shape homogeneity. All-primitive children → existing
-                // multi-leaf path; any compound (list) child mixed with
-                // primitive siblings → mixed-shape path.
-                if (structType.Fields.Count == 1
-                    && structType.Fields[0].DataType is StructType ssInner)
-                    return await ReadV21StructOfStructAsync(structType, ssInner, range, cancellationToken)
-                        .ConfigureAwait(false);
+                // Pure-struct trees (any depth, primitive descendants) go
+                // through the recursive walker — depth restriction is gone.
+                // Mixed-shape (list child mixed with primitive/struct
+                // siblings) and single-compound-child shapes still route
+                // through the handcrafted list paths. struct<list<…>> stays
+                // on its specialised path until the walker grows list
+                // support.
                 if (structType.Fields.Count == 1
                     && structType.Fields[0].DataType is Apache.Arrow.Types.ListType slInner)
                     return await ReadV21StructOfListAsync(structType, slInner, range, cancellationToken)
                         .ConfigureAwait(false);
-                bool anyCompound = structType.Fields.Any(f =>
+                bool anyListyChild = structType.Fields.Any(f =>
                     f.DataType is Apache.Arrow.Types.ListType
-                        or LargeListType or FixedSizeListType or StructType);
-                if (anyCompound)
+                        or LargeListType or FixedSizeListType);
+                if (anyListyChild)
                     return await ReadV21MixedShapeStructAsync(structType, range, cancellationToken)
                         .ConfigureAwait(false);
-                return await ReadV21StructAsync(structType, range, cancellationToken)
+                var (arr, _, _) = await ReadV21NestedAsync(structType, range.StartColumn, cancellationToken)
                     .ConfigureAwait(false);
+                return arr;
             }
             if (arrowField.DataType is Apache.Arrow.Types.ListType listType
                 && listType.ValueDataType is StructType lsInner)
@@ -482,106 +480,268 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         return array;
     }
 
-    private async Task<IArrowArray> ReadV21StructAsync(
-        StructType structType, FieldColumnRange range, CancellationToken cancellationToken)
+    /// <summary>
+    /// Per-level information captured by the recursive nested-tree walker.
+    /// One entry per ancestor layer above whatever Arrow array a recursive
+    /// call returns; <see cref="Validity"/> is null for ALL_VALID_ITEM
+    /// layers (no bits to track).
+    /// </summary>
+    private sealed class LevelInfo
     {
-        if (range.ColumnCount != structType.Fields.Count)
-            throw new LanceFormatException(
-                $"v2.1 struct field declared {range.ColumnCount} physical columns " +
-                $"but Arrow type has {structType.Fields.Count} children.");
-
-        // Read every child column, capturing both its Arrow array and the
-        // child's view of struct-level validity (the outer rep/def layer).
-        // Across siblings, the struct-level validity must agree: either no
-        // child reports a struct-validity bitmap (every column declares the
-        // outer layer ALL_VALID_ITEM), or every child reports the same
-        // bitmap byte-for-byte. Mixed presence indicates the writer disagreed
-        // with itself about whether the struct could be null.
-        var childArrays = new IArrowArray[structType.Fields.Count];
-        byte[]? canonicalStructValidity = null;
-        int canonicalStructNullCount = 0;
-        int length = -1;
-        for (int i = 0; i < structType.Fields.Count; i++)
-        {
-            var child = structType.Fields[i];
-            var (arr, structValidity, structNullCount) = await ReadV21StructChildAsync(
-                range.StartColumn + i, child.DataType, cancellationToken).ConfigureAwait(false);
-            childArrays[i] = arr;
-            if (length < 0) length = arr.Length;
-            else if (arr.Length != length)
-                throw new LanceFormatException(
-                    $"Struct child '{child.Name}' has length {arr.Length} but sibling has {length}.");
-
-            if (i == 0)
-            {
-                canonicalStructValidity = structValidity;
-                canonicalStructNullCount = structNullCount;
-            }
-            else if ((structValidity is null) != (canonicalStructValidity is null))
-            {
-                throw new LanceFormatException(
-                    $"Struct child '{child.Name}' outer-layer presence disagrees with sibling " +
-                    "(one column has a NULLABLE_ITEM outer layer, the other ALL_VALID_ITEM).");
-            }
-            else if (structValidity is not null && canonicalStructValidity is not null)
-            {
-                if (!structValidity.AsSpan().SequenceEqual(canonicalStructValidity)
-                    || structNullCount != canonicalStructNullCount)
-                    throw new LanceFormatException(
-                        $"Struct child '{child.Name}' struct-level validity disagrees with sibling " +
-                        "(cross-column rep/def coherence violated).");
-            }
-        }
-
-        // Build the StructArray. When the outer layer is ALL_VALID_ITEM there
-        // is no validity bitmap (canonicalStructValidity == null). When it is
-        // NULLABLE_ITEM but no row turned out to be struct-null, Arrow lets us
-        // skip the bitmap too — we only attach it when there's at least one
-        // null to record.
-        ArrowBuffer validity = ArrowBuffer.Empty;
-        int nullCount = 0;
-        if (canonicalStructValidity is not null)
-        {
-            nullCount = canonicalStructNullCount;
-            if (nullCount > 0)
-                validity = new ArrowBuffer(canonicalStructValidity);
-        }
-
-        var data = new ArrayData(
-            structType, length, nullCount, offset: 0,
-            new[] { validity },
-            children: childArrays.Select(a => a.Data).ToArray());
-        return new StructArray(data);
+        public byte[]? Validity { get; init; }
+        public int NullCount { get; init; }
+        public int Length { get; init; }
     }
 
-    private async Task<(IArrowArray Array, byte[]? StructValidity, int StructNullCount)> ReadV21StructChildAsync(
-        int columnIndex, IArrowType childType, CancellationToken cancellationToken)
+    /// <summary>
+    /// Recursive nested-tree walker. Decodes <paramref name="type"/> starting
+    /// at physical column <paramref name="startColumn"/> and returns the
+    /// Arrow array at this level plus per-level info for every ancestor
+    /// above it (closest ancestor first). Top-level callers can ignore the
+    /// ancestor array (it'll be empty); recursive callers pop its head to
+    /// drive their own assembly.
+    ///
+    /// <para>This slice handles primitive leaves and arbitrary-depth struct
+    /// trees with primitive descendants. List, LargeList, and FSL still go
+    /// through the existing handcrafted paths.</para>
+    /// </summary>
+    private async Task<(IArrowArray Array, LevelInfo[] AncestorLevels, int NumRows)>
+        ReadV21NestedAsync(IArrowType type, int startColumn, CancellationToken cancellationToken)
+    {
+        if (type is FixedWidthType)
+            return await ReadV21NestedLeafAsync(type, startColumn, cancellationToken).ConfigureAwait(false);
+        if (type is StructType st)
+            return await ReadV21NestedStructAsync(st, startColumn, cancellationToken).ConfigureAwait(false);
+        throw new NotImplementedException(
+            $"Recursive walker for type {type} is not yet supported (only primitive + struct in this slice).");
+    }
+
+    /// <summary>
+    /// Decode a single leaf column. Walks the def stream once and produces
+    /// per-level validity bitmaps for every ancestor (cascading: when a
+    /// layer goes null, every layer below it is also null in Arrow
+    /// convention). The leaf's own Arrow array uses the innermost cascade
+    /// (def == 0 means leaf valid; any non-zero def cascades to the leaf).
+    /// </summary>
+    private async Task<(IArrowArray Array, LevelInfo[] AncestorLevels, int NumRows)>
+        ReadV21NestedLeafAsync(IArrowType leafType, int columnIndex, CancellationToken cancellationToken)
     {
         ColumnMetadata cm = _columnMetadatas[columnIndex];
         if (cm.Pages.Count == 0)
-            return (BuildEmptyArray(childType), null, 0);
+            throw new LanceFormatException($"Leaf column {columnIndex} has no pages.");
         if (cm.Pages.Count > 1)
             throw new NotImplementedException(
-                $"Multi-page struct-child reads are not yet supported (column {columnIndex}).");
+                $"Multi-page leaf reads are not yet supported (column {columnIndex}).");
 
-        ColumnMetadata.Types.Page page = cm.Pages[0];
+        var page = cm.Pages[0];
+        byte[] valueBytes;
+        ushort[]? def;
+        Proto.Encodings.V21.RepDefLayer[] layers;
+        int visibleItems;
         var bufferOwners = await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
         try
         {
             var pageBuffers = new ReadOnlyMemory<byte>[bufferOwners.Count];
-            for (int i = 0; i < bufferOwners.Count; i++)
-                pageBuffers[i] = bufferOwners[i].Memory;
+            for (int k = 0; k < bufferOwners.Count; k++)
+                pageBuffers[k] = bufferOwners[k].Memory;
             var pageContext = new PageContext(pageBuffers);
             var pageLayout = EncodingUnpacker.UnpackPageLayout(page.Encoding);
             if (pageLayout.LayoutCase != Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout)
                 throw new NotImplementedException(
-                    $"Struct child column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
-            return Encodings.V21.MiniBlockLayoutDecoder.DecodeForStructChild(
-                pageLayout.MiniBlockLayout, childType, pageContext);
+                    $"Leaf column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
+
+            var mb = pageLayout.MiniBlockLayout;
+            var (vals, rep, d, _, visible) = Encodings.V21.MiniBlockLayoutDecoder
+                .DecodeNestedLeafChunk(mb, leafType, pageContext);
+            if (rep is not null)
+                throw new NotImplementedException(
+                    "Recursive nested walker doesn't yet handle list ancestors (rep buffer present); " +
+                    "this leaf is currently only reachable from struct-only paths.");
+            valueBytes = vals;
+            def = d;
+            visibleItems = visible;
+            layers = mb.Layers.ToArray();
         }
         finally
         {
             foreach (var owner in bufferOwners) owner.Dispose();
+        }
+
+        int n = layers.Length;
+        if (n == 0)
+            throw new LanceFormatException($"Leaf column {columnIndex} has zero layers.");
+
+        // For every NULLABLE_ITEM layer, allocate the next def slot. ALL_VALID
+        // layers contribute 0 slots. Layers with list-flavoured kinds aren't
+        // expected here (we threw on rep above).
+        int next = 1;
+        int[] layerNullDef = new int[n];
+        for (int k = 0; k < n; k++)
+        {
+            switch (layers[k])
+            {
+                case Proto.Encodings.V21.RepDefLayer.RepdefAllValidItem:
+                    layerNullDef[k] = -1;
+                    break;
+                case Proto.Encodings.V21.RepDefLayer.RepdefNullableItem:
+                    layerNullDef[k] = next++;
+                    break;
+                default:
+                    throw new NotImplementedException(
+                        $"Recursive walker encountered layer kind '{layers[k]}' at column {columnIndex} " +
+                        "(only ALL_VALID_ITEM/NULLABLE_ITEM are supported in the struct-only path).");
+            }
+        }
+
+        int numRows = visibleItems;
+        // Per-level validity bitmaps. Index k = layer k. Default all bits
+        // set (Arrow convention: bit set = valid); we clear them when def
+        // tells us this row is null at level k.
+        byte[]?[] levelBitmaps = new byte[n][];
+        int[] levelNullCounts = new int[n];
+        for (int k = 0; k < n; k++)
+        {
+            // Allocate bitmap only for nullable layers; ALL_VALID levels stay null
+            // (no bits to track) and produce a null LevelInfo.Validity.
+            if (layerNullDef[k] != -1)
+            {
+                levelBitmaps[k] = new byte[(numRows + 7) / 8];
+                System.Array.Fill(levelBitmaps[k]!, (byte)0xFF);
+                // Clear the trailing bits in the last byte (above numRows).
+                int trailing = numRows & 7;
+                if (trailing != 0)
+                    levelBitmaps[k]![^1] &= (byte)((1 << trailing) - 1);
+            }
+        }
+
+        if (def is not null)
+        {
+            for (int i = 0; i < numRows; i++)
+            {
+                int defValue = def[i];
+                if (defValue == 0) continue;
+
+                // Find the highest-level layer whose null slot matches this def.
+                int kNull = -1;
+                for (int k = 0; k < n; k++)
+                    if (layerNullDef[k] == defValue) { kNull = k; break; }
+                if (kNull < 0)
+                    throw new LanceFormatException(
+                        $"Unexpected def value {defValue} at row {i} in column {columnIndex} (no matching nullable layer).");
+
+                // Cascade: levels 0..kNull are null at this row.
+                for (int k = 0; k <= kNull; k++)
+                {
+                    if (levelBitmaps[k] is null) continue;
+                    levelBitmaps[k]![i >> 3] &= (byte)~(1 << (i & 7));
+                    levelNullCounts[k]++;
+                }
+            }
+        }
+
+        // Build the leaf array using level 0's bitmap.
+        var leafArr = Encodings.V21.MiniBlockLayoutDecoder.BuildFixedWidthArray(
+            leafType, numRows, valueBytes, levelBitmaps[0], levelNullCounts[0]);
+
+        // Build ancestor LevelInfos for layers 1..n-1.
+        var ancestors = new LevelInfo[n - 1];
+        for (int k = 1; k < n; k++)
+        {
+            // Drop the bitmap when we never observed any null — saves the buffer
+            // allocation downstream and matches Arrow's "validity buffer optional
+            // when null_count==0" convention.
+            byte[]? validity = (levelBitmaps[k] is not null && levelNullCounts[k] > 0)
+                ? levelBitmaps[k]
+                : null;
+            ancestors[k - 1] = new LevelInfo
+            {
+                Validity = validity,
+                NullCount = levelNullCounts[k],
+                Length = numRows,
+            };
+        }
+
+        return (leafArr, ancestors, numRows);
+    }
+
+    /// <summary>
+    /// Decode a struct of arbitrary depth. Recurses on each child, reconciles
+    /// the closest ancestor (this struct's own validity from each child's
+    /// view) byte-for-byte across siblings, builds the StructArray, and pops
+    /// the head of the ancestor list before returning to the parent.
+    /// </summary>
+    private async Task<(IArrowArray Array, LevelInfo[] AncestorLevels, int NumRows)>
+        ReadV21NestedStructAsync(StructType st, int startColumn, CancellationToken cancellationToken)
+    {
+        int childCount = st.Fields.Count;
+        var childArrays = new IArrowArray[childCount];
+        LevelInfo[]? canonicalAncestors = null;
+        int numRows = -1;
+
+        int columnCursor = startColumn;
+        for (int i = 0; i < childCount; i++)
+        {
+            var child = st.Fields[i];
+            var (childArr, childAncestors, childRows) = await ReadV21NestedAsync(
+                child.DataType, columnCursor, cancellationToken).ConfigureAwait(false);
+            childArrays[i] = childArr;
+            columnCursor += LeafColumnCount(child.DataType);
+
+            if (numRows < 0) numRows = childRows;
+            else if (childRows != numRows)
+                throw new LanceFormatException(
+                    $"Struct child '{child.Name}' has {childRows} rows but sibling has {numRows}.");
+            if (childAncestors.Length == 0)
+                throw new LanceFormatException(
+                    $"Struct child '{child.Name}' produced no ancestor levels; the leaf path " +
+                    "didn't include the parent struct as an outer layer.");
+
+            if (canonicalAncestors is null)
+            {
+                canonicalAncestors = childAncestors;
+            }
+            else
+            {
+                if (childAncestors.Length != canonicalAncestors.Length)
+                    throw new LanceFormatException(
+                        $"Struct child '{child.Name}' has {childAncestors.Length} ancestor levels " +
+                        $"but sibling has {canonicalAncestors.Length}.");
+                ReconcileLevels(canonicalAncestors[0], childAncestors[0], child.Name);
+            }
+        }
+
+        // ancestors[0] is THIS struct's level — use it for the StructArray's
+        // own validity, then pop it before returning to the parent.
+        var thisLevel = canonicalAncestors![0];
+        ArrowBuffer validity = (thisLevel.Validity is not null && thisLevel.NullCount > 0)
+            ? new ArrowBuffer(thisLevel.Validity)
+            : ArrowBuffer.Empty;
+        var structArr = new StructArray(new ArrayData(
+            st, numRows, thisLevel.NullCount, 0,
+            new[] { validity },
+            childArrays.Select(a => a.Data).ToArray()));
+
+        var newAncestors = new LevelInfo[canonicalAncestors.Length - 1];
+        System.Array.Copy(canonicalAncestors, 1, newAncestors, 0, newAncestors.Length);
+        return (structArr, newAncestors, numRows);
+    }
+
+    private static void ReconcileLevels(LevelInfo canonical, LevelInfo other, string childName)
+    {
+        if ((canonical.Validity is null) != (other.Validity is null))
+            throw new LanceFormatException(
+                $"Struct child '{childName}' outer-layer presence disagrees with sibling " +
+                "(one column has a NULLABLE_ITEM outer layer, the other ALL_VALID_ITEM).");
+        if (canonical.Length != other.Length)
+            throw new LanceFormatException(
+                $"Struct child '{childName}' outer-layer length {other.Length} disagrees with sibling {canonical.Length}.");
+        if (canonical.Validity is not null && other.Validity is not null)
+        {
+            if (!other.Validity.AsSpan().SequenceEqual(canonical.Validity)
+                || other.NullCount != canonical.NullCount)
+                throw new LanceFormatException(
+                    $"Struct child '{childName}' struct-level validity disagrees with sibling " +
+                    "(cross-column rep/def coherence violated).");
         }
     }
 
@@ -829,195 +989,6 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
     }
 
     /// <summary>
-    /// Decode <c>struct&lt;struct&lt;…primitive children…&gt;&gt;</c>. All inner
-    /// leaves share the same 3-layer rep/def shape (no rep buffer; def with
-    /// values 0..3 selecting all-valid / leaf-null / inner-null / outer-null).
-    /// Each row consumes exactly one value slot per leaf — even outer-null
-    /// rows (placeholder), unlike list-bearing shapes where outer-null
-    /// skips slots.
-    /// </summary>
-    private async Task<IArrowArray> ReadV21StructOfStructAsync(
-        StructType outer, StructType inner, FieldColumnRange range,
-        CancellationToken cancellationToken)
-    {
-        if (range.ColumnCount != inner.Fields.Count)
-            throw new LanceFormatException(
-                $"struct-of-struct field declared {range.ColumnCount} columns " +
-                $"but inner struct has {inner.Fields.Count} children.");
-
-        var (innerArr, outerValidity, outerNullCount, numRows) =
-            await ReadV21StructAsStructChildAsync(inner, range.StartColumn, cancellationToken)
-                .ConfigureAwait(false);
-
-        ArrowBuffer outerValidityBuf = (outerValidity is not null && outerNullCount > 0)
-            ? new ArrowBuffer(outerValidity)
-            : ArrowBuffer.Empty;
-        return new StructArray(new ArrayData(
-            outer, numRows, outerNullCount, 0,
-            new[] { outerValidityBuf },
-            new[] { innerArr.Data }));
-    }
-
-    /// <summary>
-    /// Read a single inner-struct child column-group embedded inside a v2.1
-    /// outer struct. The inner struct must have only primitive (FixedWidthType)
-    /// children; each leaf column carries 3 layers <c>[item, inner_struct,
-    /// outer_struct]</c> and all leaves share a single def buffer. Returns
-    /// the inner <see cref="StructArray"/> together with the outer struct's
-    /// per-row validity bitmap (Arrow convention: bit set = struct valid),
-    /// or <c>null</c> when the outer layer is <c>ALL_VALID_ITEM</c>, so the
-    /// caller can reconcile across siblings.
-    /// </summary>
-    private async Task<(Apache.Arrow.StructArray Array, byte[]? OuterValidity, int OuterNullCount, int NumRows)>
-        ReadV21StructAsStructChildAsync(
-            StructType inner, int startColumn, CancellationToken cancellationToken)
-    {
-        foreach (var child in inner.Fields)
-            if (child.DataType is not FixedWidthType)
-                throw new NotImplementedException(
-                    $"struct-as-struct-child grandchild '{child.Name}' has non-primitive type {child.DataType}; " +
-                    "only fixed-width primitive grandchildren are supported in this slice.");
-
-        int leafCount = inner.Fields.Count;
-        byte[][] childValues = new byte[leafCount][];
-        ushort[]? canonicalDef = null;
-        int numRows = -1;
-        Proto.Encodings.V21.RepDefLayer leafLayer = default;
-        Proto.Encodings.V21.RepDefLayer innerLayer = default;
-        Proto.Encodings.V21.RepDefLayer outerLayer = default;
-
-        for (int i = 0; i < leafCount; i++)
-        {
-            var child = inner.Fields[i];
-            int columnIndex = startColumn + i;
-            ColumnMetadata cm = _columnMetadatas[columnIndex];
-            if (cm.Pages.Count == 0)
-                throw new LanceFormatException($"struct-as-struct-child column {columnIndex} has no pages.");
-            if (cm.Pages.Count > 1)
-                throw new NotImplementedException(
-                    $"Multi-page struct-as-struct-child reads are not yet supported (column {columnIndex}).");
-
-            var page = cm.Pages[0];
-            var bufferOwners = await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
-            try
-            {
-                var pageBuffers = new ReadOnlyMemory<byte>[bufferOwners.Count];
-                for (int k = 0; k < bufferOwners.Count; k++)
-                    pageBuffers[k] = bufferOwners[k].Memory;
-                var pageContext = new PageContext(pageBuffers);
-                var pageLayout = EncodingUnpacker.UnpackPageLayout(page.Encoding);
-                if (pageLayout.LayoutCase != Proto.Encodings.V21.PageLayout.LayoutOneofCase.MiniBlockLayout)
-                    throw new NotImplementedException(
-                        $"struct-as-struct-child column {columnIndex} uses {pageLayout.LayoutCase}; only MiniBlockLayout is supported.");
-
-                var mb = pageLayout.MiniBlockLayout;
-                if (mb.Layers.Count != 3)
-                    throw new NotImplementedException(
-                        $"struct-as-struct-child column {columnIndex} expects 3 layers, got {mb.Layers.Count}.");
-                var iL = mb.Layers[0]; var nL = mb.Layers[1]; var oL = mb.Layers[2];
-                ValidateItemLayer(iL, "struct-as-struct-child item");
-                ValidateItemLayer(nL, "struct-as-struct-child inner-struct");
-                ValidateItemLayer(oL, "struct-as-struct-child outer-struct");
-
-                var (vals, rep, def, _, visible) = Encodings.V21.MiniBlockLayoutDecoder
-                    .DecodeNestedLeafChunk(mb, child.DataType, pageContext);
-                if (rep is not null)
-                    throw new LanceFormatException(
-                        "struct-as-struct-child must not have rep_compression (no list layer).");
-                childValues[i] = vals;
-
-                if (i == 0)
-                {
-                    canonicalDef = def;
-                    numRows = visible;
-                    leafLayer = iL; innerLayer = nL; outerLayer = oL;
-                }
-                else
-                {
-                    if (visible != numRows)
-                        throw new LanceFormatException(
-                            $"struct-as-struct-child '{child.Name}' has {visible} rows but sibling has {numRows}.");
-                    if ((def is null) != (canonicalDef is null))
-                        throw new LanceFormatException(
-                            $"struct-as-struct-child '{child.Name}' def-buffer presence disagrees with sibling.");
-                    if (def is not null && canonicalDef is not null
-                        && !def.AsSpan().SequenceEqual(canonicalDef))
-                        throw new LanceFormatException(
-                            $"struct-as-struct-child '{child.Name}' def buffer disagrees with sibling.");
-                }
-            }
-            finally
-            {
-                foreach (var owner in bufferOwners) owner.Dispose();
-            }
-        }
-
-        bool itemNullable = leafLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullableItem;
-        bool innerNullable = innerLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullableItem;
-        bool outerNullable = outerLayer == Proto.Encodings.V21.RepDefLayer.RepdefNullableItem;
-        int next = 1;
-        int leafNullDef = itemNullable ? next++ : -1;
-        int innerNullDef = innerNullable ? next++ : -1;
-        int outerNullDef = outerNullable ? next++ : -1;
-
-        bool needLeafBitmap = itemNullable || innerNullable || outerNullable;
-        bool needInnerBitmap = innerNullable || outerNullable;
-        byte[]? leafValidity = needLeafBitmap ? new byte[(numRows + 7) / 8] : null;
-        byte[]? innerValidity = needInnerBitmap ? new byte[(numRows + 7) / 8] : null;
-        byte[]? outerValidity = outerNullable ? new byte[(numRows + 7) / 8] : null;
-        int leafNullCount = 0, innerNullCount = 0, outerNullCount = 0;
-
-        for (int i = 0; i < numRows; i++)
-        {
-            int defValue = canonicalDef is null ? 0 : canonicalDef[i];
-            if (defValue != 0
-                && defValue != leafNullDef
-                && defValue != innerNullDef
-                && defValue != outerNullDef)
-                throw new LanceFormatException(
-                    $"Unexpected def value {defValue} at row {i} for struct-as-struct-child " +
-                    $"(layers=[{leafLayer},{innerLayer},{outerLayer}]).");
-
-            bool leafValid = defValue == 0;
-            bool innerValid = leafValid || defValue == leafNullDef;
-            bool outerValid = innerValid || defValue == innerNullDef;
-
-            if (leafValidity is not null)
-            {
-                if (leafValid) leafValidity[i >> 3] |= (byte)(1 << (i & 7));
-                else leafNullCount++;
-            }
-            if (innerValidity is not null)
-            {
-                if (innerValid) innerValidity[i >> 3] |= (byte)(1 << (i & 7));
-                else innerNullCount++;
-            }
-            if (outerValidity is not null)
-            {
-                if (outerValid) outerValidity[i >> 3] |= (byte)(1 << (i & 7));
-                else outerNullCount++;
-            }
-        }
-
-        var leafArrays = new IArrowArray[leafCount];
-        for (int c = 0; c < leafCount; c++)
-        {
-            leafArrays[c] = Encodings.V21.MiniBlockLayoutDecoder.BuildFixedWidthArray(
-                inner.Fields[c].DataType, numRows, childValues[c], leafValidity, leafNullCount);
-        }
-
-        ArrowBuffer innerValidityBuf = (innerValidity is not null && innerNullCount > 0)
-            ? new ArrowBuffer(innerValidity)
-            : ArrowBuffer.Empty;
-        var innerArr = new StructArray(new ArrayData(
-            inner, numRows, innerNullCount, 0,
-            new[] { innerValidityBuf },
-            leafArrays.Select(a => a.Data).ToArray()));
-
-        return (innerArr, outerValidity, outerNullCount, numRows);
-    }
-
-    /// <summary>
     /// Decode <c>struct&lt;list&lt;primitive&gt;&gt;</c>. Single child means
     /// the column count is 1; we delegate the actual list decode to
     /// <see cref="ReadV21ListAsStructChildAsync"/> and just wrap the result
@@ -1262,17 +1233,21 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     lt, columnCursor, cancellationToken).ConfigureAwait(false);
                 childArr = arr; outerValidity = v; outerNullCount = nc; childRows = r;
             }
-            else if (child.DataType is StructType innerStruct)
+            else if (child.DataType is FixedWidthType or StructType)
             {
-                var (arr, v, nc, r) = await ReadV21StructAsStructChildAsync(
-                    innerStruct, columnCursor, cancellationToken).ConfigureAwait(false);
-                childArr = arr; outerValidity = v; outerNullCount = nc; childRows = r;
-            }
-            else if (child.DataType is FixedWidthType)
-            {
-                var (arr, v, nc) = await ReadV21StructChildAsync(
-                    columnCursor, child.DataType, cancellationToken).ConfigureAwait(false);
-                childArr = arr; outerValidity = v; outerNullCount = nc; childRows = arr.Length;
+                // Recursive walker: returns (childArr, [outerStructLevel, ...], numRows).
+                // For an outer struct's direct child the ancestor list is exactly
+                // [outerStructLevel] (this struct), and we use that as the
+                // outer-validity for cross-sibling reconciliation.
+                var (arr, ancestors, r) = await ReadV21NestedAsync(
+                    child.DataType, columnCursor, cancellationToken).ConfigureAwait(false);
+                if (ancestors.Length != 1)
+                    throw new LanceFormatException(
+                        $"Mixed-shape struct child '{child.Name}' produced {ancestors.Length} ancestor levels; expected exactly 1 (the outer struct).");
+                childArr = arr;
+                outerValidity = ancestors[0].Validity;
+                outerNullCount = ancestors[0].NullCount;
+                childRows = r;
             }
             else
             {

@@ -523,6 +523,50 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task Struct_Depth3_RecursiveCascade()
+    {
+        // struct<l1: struct<l2: struct<a: int, b: int>>>. Each leaf has 4
+        // layers [item, l2, l1, top]. Tests the recursive walker's
+        // arbitrary-depth cascade: def 1=item null, 2=l2 null, 3=l1 null,
+        // 4=top null. 12 rows including a row at each compound layer's null
+        // state (l2 null at row 4, l1 null at row 7, top null at row 9).
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("struct_depth3_v21.lance"));
+        var top = (Apache.Arrow.StructArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(12, top.Length);
+        Assert.Equal(1, top.NullCount);
+        Assert.True(top.IsNull(9));
+        Assert.False(top.IsNull(7));   // l1 null but top valid
+        Assert.False(top.IsNull(4));   // l2 null but top valid
+
+        var l1 = (Apache.Arrow.StructArray)top.Fields[0];
+        Assert.Equal(12, l1.Length);
+        Assert.Equal(2, l1.NullCount);   // row 7 (own null) + row 9 (cascade)
+        Assert.True(l1.IsNull(7));
+        Assert.True(l1.IsNull(9));
+        Assert.False(l1.IsNull(4));      // l2 null doesn't cascade up to l1
+
+        var l2 = (Apache.Arrow.StructArray)l1.Fields[0];
+        Assert.Equal(12, l2.Length);
+        Assert.Equal(3, l2.NullCount);   // row 4 (own) + 7 (cascade) + 9 (cascade)
+        Assert.True(l2.IsNull(4));
+        Assert.True(l2.IsNull(7));
+        Assert.True(l2.IsNull(9));
+        Assert.False(l2.IsNull(0));
+
+        var a = (Int32Array)l2.Fields[0];
+        var b = (Int32Array)l2.Fields[1];
+        Assert.Equal(3, a.NullCount);
+        Assert.Equal(17, a.GetValue(0));
+        Assert.Equal(28, a.GetValue(1));   // 17 + 1*11
+        Assert.Null(a.GetValue(4));
+        Assert.Null(a.GetValue(7));
+        Assert.Null(a.GetValue(9));
+        Assert.Equal(17 + 11 * 11, a.GetValue(11));
+        Assert.Equal(113, b.GetValue(0));
+        Assert.Null(b.GetValue(9));
+    }
+
+    [Fact]
     public async Task Struct_MixedShape_WithStructGrandchild()
     {
         // Outer struct has a primitive child x and a struct grandchild ab.

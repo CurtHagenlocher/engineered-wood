@@ -239,6 +239,27 @@ def main() -> None:
                   type=list_struct_type)}),
               version="2.1")
 
+    # Three-deep struct nesting: struct<l1: struct<l2: struct<a, b>>>.
+    # Each leaf has 4 layers [item, l2, l1, top]. Nullability at every
+    # level — exercises the recursive walker's cascade.
+    deep_struct_type = pa.struct([
+        ("l1", pa.struct([
+            ("l2", pa.struct([("a", pa.int32()), ("b", pa.int32())])),
+        ])),
+    ])
+    # Use a longer row sequence with prime-spaced values so pylance picks
+    # Flat (not Rle) for the value compression.
+    deep_rows = []
+    for i in range(12):
+        if i == 4: deep_rows.append({"l1": {"l2": None}})            # l2 null
+        elif i == 7: deep_rows.append({"l1": None})                  # l1 null
+        elif i == 9: deep_rows.append(None)                          # top null
+        else:
+            deep_rows.append({"l1": {"l2": {"a": 17 + i * 11, "b": 113 + i * 19}}})
+    write_one("struct_depth3_v21",
+              pa.table({"s": pa.array(deep_rows, type=deep_struct_type)}),
+              version="2.1")
+
     # Mixed-shape outer struct with a struct grandchild. Layer shapes per
     # leaf:
     #   x:       [item, outer_struct]                 (2 layers, no rep)
