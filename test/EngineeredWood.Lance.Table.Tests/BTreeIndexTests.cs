@@ -113,4 +113,78 @@ public class BTreeIndexTests
         var indices = await table.GetIndicesAsync();
         Assert.Empty(indices);
     }
+
+    [Fact]
+    public async Task ReadAsync_WithFilter_PrunesFragmentsViaIndex()
+    {
+        // The fixture's three fragments hold disjoint ranges: 0=[1..5],
+        // 1=[10..50], 2=[100..500]. Filter `x > 100` matches only
+        // fragment 2 (x=200,300,400,500). The index pruner must
+        // recognise this and skip fragments 0 and 1.
+        await using var table = await LanceTable.OpenAsync(TestDataPath.Resolve("btree_index_v21"));
+        var filter = EngineeredWood.Expressions.Expressions.GreaterThan(
+            "x", EngineeredWood.Expressions.LiteralValue.Of(100));
+
+        int batches = 0;
+        var values = new List<int>();
+        await foreach (var batch in table.ReadAsync(columns: null, filter: filter))
+        {
+            batches++;
+            var col = (Apache.Arrow.Int32Array)batch.Column(0);
+            for (int i = 0; i < col.Length; i++)
+                values.Add(col.GetValue(i)!.Value);
+        }
+        // Without pruning we'd get 3 batches (one per fragment) with
+        // post-decode filtering. With pruning, only fragment 2 gets read.
+        Assert.Equal(1, batches);
+        Assert.Equal(new[] { 200, 300, 400, 500 }, values);
+    }
+
+    [Fact]
+    public async Task ReadAsync_WithFilter_StraddlesFragments()
+    {
+        // Filter `x BETWEEN 3 AND 30` matches fragment 0 (3,4,5) and
+        // fragment 1 (10,20,30). Pruner should yield candidate set
+        // {0, 1} and skip fragment 2.
+        await using var table = await LanceTable.OpenAsync(TestDataPath.Resolve("btree_index_v21"));
+        var filter = new EngineeredWood.Expressions.AndPredicate(new EngineeredWood.Expressions.Predicate[] {
+            EngineeredWood.Expressions.Expressions.GreaterThanOrEqual(
+                "x", EngineeredWood.Expressions.LiteralValue.Of(3)),
+            EngineeredWood.Expressions.Expressions.LessThanOrEqual(
+                "x", EngineeredWood.Expressions.LiteralValue.Of(30)),
+        });
+
+        int batches = 0;
+        var values = new List<int>();
+        await foreach (var batch in table.ReadAsync(columns: null, filter: filter))
+        {
+            batches++;
+            var col = (Apache.Arrow.Int32Array)batch.Column(0);
+            for (int i = 0; i < col.Length; i++)
+                values.Add(col.GetValue(i)!.Value);
+        }
+        Assert.Equal(2, batches);
+        Assert.Equal(new[] { 3, 4, 5, 10, 20, 30 }, values);
+    }
+
+    [Fact]
+    public async Task ReadAsync_WithEqualFilter_HitsOneFragment()
+    {
+        // Single point equality — only fragment 1 contains x=20.
+        await using var table = await LanceTable.OpenAsync(TestDataPath.Resolve("btree_index_v21"));
+        var filter = EngineeredWood.Expressions.Expressions.Equal(
+            "x", EngineeredWood.Expressions.LiteralValue.Of(20));
+
+        int batches = 0;
+        var values = new List<int>();
+        await foreach (var batch in table.ReadAsync(columns: null, filter: filter))
+        {
+            batches++;
+            var col = (Apache.Arrow.Int32Array)batch.Column(0);
+            for (int i = 0; i < col.Length; i++)
+                values.Add(col.GetValue(i)!.Value);
+        }
+        Assert.Equal(1, batches);
+        Assert.Equal(new[] { 20 }, values);
+    }
 }

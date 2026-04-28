@@ -314,8 +314,26 @@ public sealed class LanceTable : IAsyncDisposable
                 ExtendProjectionForFilter(outSchema, outFieldIndices, filter);
         }
 
+        // Index-driven fragment pruning. When the filter has predicates
+        // over indexed columns, skip fragments whose index proves they
+        // contain no matches. A null result means "no useful pruning"
+        // and we scan every fragment as before.
+        IReadOnlySet<uint>? candidateFragments = null;
+        if (filter is not null)
+        {
+            var indices = await GetIndicesAsync(cancellationToken).ConfigureAwait(false);
+            if (indices.Count > 0)
+                candidateFragments = await Indices.IndexPruner
+                    .ComputeCandidatesAsync(filter, indices, _fs, cancellationToken)
+                    .ConfigureAwait(false);
+        }
+
         foreach (DataFragment fragment in _manifest.Fragments)
         {
+            if (candidateFragments is not null
+                && !candidateFragments.Contains(checked((uint)fragment.Id)))
+                continue;
+
             DataFile file = fragment.Files[0];
             string relPath = "data/" + file.Path;
             await using IRandomAccessFile raf = await _fs.OpenReadAsync(relPath, cancellationToken)
