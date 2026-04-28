@@ -96,22 +96,34 @@ public sealed class LanceTable : IAsyncDisposable
     public async ValueTask<Indices.BTreeIndex> OpenBTreeIndexAsync(
         string indexName, CancellationToken cancellationToken = default)
     {
-        var infos = await GetIndicesAsync(cancellationToken).ConfigureAwait(false);
-        Indices.IndexInfo? match = null;
-        foreach (var info in infos)
-        {
-            if (string.Equals(info.Name, indexName, StringComparison.Ordinal))
-            {
-                match = info;
-                break;
-            }
-        }
-        if (match is null)
-            throw new ArgumentException(
-                $"Index '{indexName}' was not found on this dataset. " +
-                $"Available: [{string.Join(", ", infos.Select(i => i.Name))}].");
+        var match = await ResolveIndexAsync(indexName, cancellationToken).ConfigureAwait(false);
         return await Indices.BTreeIndex.OpenAsync(_fs, match.DirectoryPath, cancellationToken)
             .ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Open a BITMAP scalar index by name. Convenience wrapper that calls
+    /// <see cref="GetIndicesAsync"/>, finds the matching <see cref="Indices.IndexInfo"/>,
+    /// and opens it via <see cref="Indices.BitmapIndex.OpenAsync"/>.
+    /// </summary>
+    public async ValueTask<Indices.BitmapIndex> OpenBitmapIndexAsync(
+        string indexName, CancellationToken cancellationToken = default)
+    {
+        var match = await ResolveIndexAsync(indexName, cancellationToken).ConfigureAwait(false);
+        return await Indices.BitmapIndex.OpenAsync(_fs, match.DirectoryPath, cancellationToken)
+            .ConfigureAwait(false);
+    }
+
+    private async ValueTask<Indices.IndexInfo> ResolveIndexAsync(
+        string indexName, CancellationToken cancellationToken)
+    {
+        var infos = await GetIndicesAsync(cancellationToken).ConfigureAwait(false);
+        foreach (var info in infos)
+            if (string.Equals(info.Name, indexName, StringComparison.Ordinal))
+                return info;
+        throw new ArgumentException(
+            $"Index '{indexName}' was not found on this dataset. " +
+            $"Available: [{string.Join(", ", infos.Select(i => i.Name))}].");
     }
 
     /// <summary>Optional version tag attached at write time.</summary>

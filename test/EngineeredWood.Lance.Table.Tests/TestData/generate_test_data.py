@@ -85,6 +85,22 @@ def main() -> None:
         indexed_field="x",
         index_type="BTREE")
 
+    # BITMAP scalar index on a low-cardinality int32 column. Across 3
+    # fragments, the unique values 1/2/3 are distributed so each value
+    # appears in some-but-not-all fragments — letting a query like
+    # `x = 3` skip fragments that don't contain it. Wire format
+    # decoded: bitmap_page_lookup.lance has schema (keys, bitmaps); the
+    # bitmaps blob is [u32 count][per entry: u32 frag_id, u32 size,
+    # CRoaring portable Roaring32Map of row offsets].
+    _write_with_index("bitmap_index_v21",
+        mode_seq=[
+            (pa.table({"x": pa.array([1, 2, 3], type=pa.int32())}), "create"),
+            (pa.table({"x": pa.array([1, 2, 1], type=pa.int32())}), "append"),
+            (pa.table({"x": pa.array([3, 1, 2], type=pa.int32())}), "append"),
+        ],
+        indexed_field="x",
+        index_type="BITMAP")
+
 
 def _write_with_index(name, mode_seq, indexed_field, index_type, version="2.1"):
     """Create a dataset and add a scalar index to a field."""
