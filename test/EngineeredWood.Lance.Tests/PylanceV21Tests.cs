@@ -565,6 +565,84 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task ListOfStructOfList()
+    {
+        // list<struct<list<int32>>> — struct *between* two list layers.
+        // Tests that struct-between-lists has different cascade behaviour
+        // from list-cascade: an outer-list null/empty skips inner-list
+        // counting (cascading via outer-list), but a struct null
+        // (between lists) doesn't skip inner-list counting (struct's child
+        // shares struct's length).
+        // Input: [[{m:[1,2]},{m:[3]}], [{m:[]},{m:[4,5]}], None, [{m:[6]}]]
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("list_struct_list_int_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(4, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(2, outer.ValueOffsets[1]);
+        Assert.Equal(4, outer.ValueOffsets[2]);
+        Assert.Equal(4, outer.ValueOffsets[3]);   // null outer spans nothing
+        Assert.Equal(5, outer.ValueOffsets[4]);
+
+        var s = (Apache.Arrow.StructArray)outer.Values;
+        Assert.Equal(5, s.Length);
+        Assert.Equal(0, s.NullCount);
+
+        var m = (ListArray)s.Fields[0];
+        Assert.Equal(5, m.Length);
+        Assert.Equal(0, m.ValueOffsets[0]);    // [1,2]
+        Assert.Equal(2, m.ValueOffsets[1]);    // [3]
+        Assert.Equal(3, m.ValueOffsets[2]);    // []
+        Assert.Equal(3, m.ValueOffsets[3]);    // [4,5]
+        Assert.Equal(5, m.ValueOffsets[4]);    // [6]
+        Assert.Equal(6, m.ValueOffsets[5]);
+
+        var items = (Int32Array)m.Values;
+        Assert.Equal(new int?[] { 1, 2, 3, 4, 5, 6 }, items.ToArray());
+    }
+
+    [Fact]
+    public async Task ListOfList_NullAndEmpty()
+    {
+        // list<list<int32>>. Two list layers, so rep ∈ {0, 1, 2}. 5 outer
+        // rows: [[1,2],[3]], [], None, [[4],[],[5,6,7]], [[8,9]]. Tests that
+        // the multi-list walker handles outer-null/empty cascade
+        // (skipping inner-row counting), inner-empty (counted with empty
+        // span), and ordinary nested values together.
+        await using var reader = await LanceFileReader.OpenAsync(TestDataPath.Resolve("list_list_int_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(5, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+        Assert.False(outer.IsNull(1));   // empty outer is valid
+
+        // Outer offsets: row 0 has 2 inner-lists, row 1 empty, row 2 null,
+        // row 3 has 3 inner-lists, row 4 has 1 inner-list. Total inner = 6.
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(2, outer.ValueOffsets[1]);
+        Assert.Equal(2, outer.ValueOffsets[2]);
+        Assert.Equal(2, outer.ValueOffsets[3]);
+        Assert.Equal(5, outer.ValueOffsets[4]);
+        Assert.Equal(6, outer.ValueOffsets[5]);
+
+        var inner = (ListArray)outer.Values;
+        Assert.Equal(6, inner.Length);
+        // Inner offsets: each inner list's items.
+        Assert.Equal(0, inner.ValueOffsets[0]);   // [1,2]
+        Assert.Equal(2, inner.ValueOffsets[1]);   // [3]
+        Assert.Equal(3, inner.ValueOffsets[2]);   // [4]
+        Assert.Equal(4, inner.ValueOffsets[3]);   // [] empty
+        Assert.Equal(4, inner.ValueOffsets[4]);   // [5,6,7]
+        Assert.Equal(7, inner.ValueOffsets[5]);   // [8,9]
+        Assert.Equal(9, inner.ValueOffsets[6]);
+
+        var values = (Int32Array)inner.Values;
+        Assert.Equal(9, values.Length);
+        Assert.Equal(new int?[] { 1, 2, 3, 4, 5, 6, 7, 8, 9 }, values.ToArray());
+    }
+
+    [Fact]
     public async Task Struct_Depth3_RecursiveCascade()
     {
         // struct<l1: struct<l2: struct<a: int, b: int>>>. Each leaf has 4

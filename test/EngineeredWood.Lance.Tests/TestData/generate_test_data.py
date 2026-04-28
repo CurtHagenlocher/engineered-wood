@@ -260,6 +260,30 @@ def main() -> None:
               pa.table({"s": pa.array(deep_lis_rows, type=deep_lis_type)}),
               version="2.1")
 
+    # list<struct<list<int32>>>. Layers [item, inner_list, struct, outer_list]:
+    # struct *between* two list layers. Tests that struct-between-lists
+    # cascade behaves differently from list-cascade.
+    write_one("list_struct_list_int_v21",
+              pa.table({"xs": pa.array(
+                  [[{"m": [1, 2]}, {"m": [3]}],
+                   [{"m": []}, {"m": [4, 5]}],
+                   None,
+                   [{"m": [6]}]],
+                  type=pa.list_(pa.struct([("m", pa.list_(pa.int32()))])))}),
+              version="2.1")
+
+    # list<list<int32>>. Two list layers, so rep ∈ {0, 1, 2}.
+    # 5 outer rows: [[1,2],[3]], [], None, [[4],[],[5,6,7]], [[8,9]].
+    write_one("list_list_int_v21",
+              pa.table({"xs": pa.array(
+                  [[[1, 2], [3]],
+                   [],
+                   None,
+                   [[4], [], [5, 6, 7]],
+                   [[8, 9]]],
+                  type=pa.list_(pa.list_(pa.int32())))}),
+              version="2.1")
+
     # Three-deep struct nesting: struct<l1: struct<l2: struct<a, b>>>.
     # Each leaf has 4 layers [item, l2, l1, top]. Nullability at every
     # level — exercises the recursive walker's cascade.

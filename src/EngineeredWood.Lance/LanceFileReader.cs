@@ -264,18 +264,14 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                     return total;
                 }
             case Apache.Arrow.Types.ListType lt:
-                // We support list<primitive>, list<struct<primitive children>>,
-                // and list<struct<… recursively …>>, but for now reject lists
-                // whose values are themselves lists / FSLs — those need
-                // additional rep-level handling we haven't implemented.
-                if (lt.ValueDataType is Apache.Arrow.Types.ListType or LargeListType or FixedSizeListType)
+                if (lt.ValueDataType is FixedSizeListType)
                     throw new NotImplementedException(
-                        $"Field '{fieldPath}': list of {lt.ValueDataType.GetType().Name} is not yet supported for v2.1.");
+                        $"Field '{fieldPath}': list of FixedSizeList is not yet supported for v2.1.");
                 return ValidateAndCountLeavesV21(lt.ValueDataType, $"{fieldPath}[]");
             case LargeListType llt:
-                if (llt.ValueDataType is Apache.Arrow.Types.ListType or LargeListType or FixedSizeListType)
+                if (llt.ValueDataType is FixedSizeListType)
                     throw new NotImplementedException(
-                        $"Field '{fieldPath}': LargeList of {llt.ValueDataType.GetType().Name} is not yet supported for v2.1.");
+                        $"Field '{fieldPath}': LargeList of FixedSizeList is not yet supported for v2.1.");
                 return ValidateAndCountLeavesV21(llt.ValueDataType, $"{fieldPath}[]");
             case FixedSizeListType fsl:
                 if (fsl.ValueDataType is not FixedWidthType)
@@ -559,21 +555,18 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         if (n == 0)
             throw new LanceFormatException($"Leaf column {columnIndex} has zero layers.");
 
-        // Find the (single) list layer if any.
-        int listLayerIdx = -1;
+        // Find every list layer; we now support arbitrary nesting depth.
+        // listIndices is sorted ascending = innermost first (since layers
+        // are ordered leaf-out, lower index = deeper).
+        var listIndicesList = new List<int>();
         for (int k = 0; k < n; k++)
-        {
             if (IsListLayerKind(layers[k]))
-            {
-                if (listLayerIdx >= 0)
-                    throw new NotImplementedException(
-                        $"Column {columnIndex} has multiple list layers in path; only single-list is supported.");
-                listLayerIdx = k;
-            }
-        }
-        if (listLayerIdx >= 0 && rep is null)
+                listIndicesList.Add(k);
+        int[] listIndices = listIndicesList.ToArray();
+        int numListLayers = listIndices.Length;
+        if (numListLayers > 0 && rep is null)
             throw new LanceFormatException($"Column {columnIndex}: list layer present but no rep buffer.");
-        if (listLayerIdx < 0 && rep is not null)
+        if (numListLayers == 0 && rep is not null)
             throw new LanceFormatException($"Column {columnIndex}: rep buffer present but no list layer.");
 
         // Compute def slot mapping. Some layers contribute 2 slots
@@ -609,40 +602,98 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             }
         }
 
-        // Determine each level's row count and allocate validity bitmaps.
-        // Below-list (k < L) levels live at visibleItems length; the list
-        // level and above-list levels live at numRows length. Pure-struct
-        // (L == -1) means everything's at visibleItems == numRows.
-        int L = listLayerIdx;
-        int numRows;
-        if (L < 0) numRows = visibleItems;
-        else
+        // Pre-pass to count rows per list layer (respecting cascade), so we
+        // can size offset arrays + per-level bitmaps exactly. For pure-struct
+        // (no list) every level is at visibleItems = numItems.
+        //
+        // Cascade rule for *counting*: skip a list-j row when the def value
+        // marks a layer at or above the next list above j (= a list cascade
+        // wipes out everything below it). A non-list (struct) cascade
+        // BETWEEN lists doesn't skip — Arrow's struct-with-list-child has
+        // child.length = struct.length, so the deeper list still has a row
+        // at that position with cascaded validity. Same logic applies in
+        // the walk loop below.
+        int[] listRowCounts = new int[numListLayers];
+        if (numListLayers > 0)
         {
-            numRows = 0;
-            for (int i = 0; i < rep!.Length; i++) if (rep[i] == 1) numRows++;
+            for (int i = 0; i < rep!.Length; i++)
+            {
+                int r = rep[i];
+                if (r == 0) continue;
+                int defValue = def is null ? 0 : def[i];
+                int kNullLayerIdx = -1;
+                if (defValue != 0)
+                {
+                    for (int k = 0; k < n; k++)
+                    {
+                        if (layerNullDef[k] == defValue || layerEmptyDef[k] == defValue) { kNullLayerIdx = k; break; }
+                    }
+                    if (kNullLayerIdx < 0)
+                        throw new LanceFormatException(
+                            $"Unexpected def value {defValue} at level {i} in column {columnIndex}.");
+                }
+                for (int j = numListLayers - 1; j >= 0; j--)
+                {
+                    int listIdx = listIndices[j];
+                    int repForThis = j + 1;
+                    if (r < repForThis) continue;
+                    int nextListAbove = (j + 1 < numListLayers) ? listIndices[j + 1] : int.MaxValue;
+                    if (kNullLayerIdx >= nextListAbove) continue;
+                    listRowCounts[j]++;
+                }
+            }
         }
 
+        // Each layer's array length: list layers use their own row count;
+        // non-list layers inherit from the closest deeper list, falling
+        // back to visibleItems when no list sits below them.
         int[] levelLengths = new int[n];
         for (int k = 0; k < n; k++)
-            levelLengths[k] = (L < 0 || k >= L) ? numRows : visibleItems;
+        {
+            if (IsListLayerKind(layers[k]))
+            {
+                int j = System.Array.IndexOf(listIndices, k);
+                levelLengths[k] = listRowCounts[j];
+            }
+            else
+            {
+                int closestDeeperList = -1;
+                for (int d = k - 1; d >= 0; d--)
+                    if (IsListLayerKind(layers[d])) { closestDeeperList = d; break; }
+                if (closestDeeperList < 0)
+                    levelLengths[k] = visibleItems;
+                else
+                {
+                    int j = System.Array.IndexOf(listIndices, closestDeeperList);
+                    levelLengths[k] = listRowCounts[j];
+                }
+            }
+        }
+        int numRows = levelLengths[n - 1];
 
         byte[]?[] levelBitmaps = new byte[n][];
         int[] levelNullCounts = new int[n];
         for (int k = 0; k < n; k++)
         {
-            bool nullable = layerNullDef[k] != -1 || layerEmptyDef[k] != -1;
+            // Allocate a validity bitmap only when the layer can be null.
+            // Empty-only list layers (EmptyableList) don't need one — empty
+            // lists are still Arrow-valid; the offsets carry the empty span.
+            bool nullable = layerNullDef[k] != -1;
             if (!nullable) continue;
-            // Allocate; default all-bits-set (1 = valid).
             levelBitmaps[k] = new byte[(levelLengths[k] + 7) / 8];
+            if (levelBitmaps[k]!.Length == 0) continue;
             System.Array.Fill(levelBitmaps[k]!, (byte)0xFF);
             int trailing = levelLengths[k] & 7;
-            if (trailing != 0 && levelBitmaps[k]!.Length > 0)
+            if (trailing != 0)
                 levelBitmaps[k]![^1] &= (byte)((1 << trailing) - 1);
         }
 
-        int[]? listOffsets = (L >= 0) ? new int[numRows + 1] : null;
+        // Per-list-layer offset arrays (length+1 entries each).
+        int[]?[] listOffsets = new int[numListLayers][];
+        for (int j = 0; j < numListLayers; j++)
+            listOffsets[j] = new int[listRowCounts[j] + 1];
 
-        if (L < 0)
+        if (numListLayers == 0)
         {
             // Pure struct path. def[i] applies to row i directly.
             if (def is not null)
@@ -663,26 +714,27 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         }
         else
         {
-            // Path includes one list. Walk rep+def. rep[i]==1 starts a new
-            // outer-row; rep[i]==0 is a continuation of the current list.
-            // def values fall into:
-            //   - 0: fully valid item (visible).
-            //   - layerNullDef[k] for k < L: below-list null at this item slot.
-            //   - layerNullDef[L] / layerEmptyDef[L]: list null / empty (no slot).
-            //   - layerNullDef[k] for k > L: above-list cascade (no slot).
-            int rowIdx = -1;
+            // Multi-list walk. rep[i] == r means: open a new boundary at the
+            // r-th-deepest list layer. Lower (deeper) levels open implicitly
+            // unless a cascade from above blocks them. rep == 0 is just an
+            // item continuation. See project memory for full convention.
+            int innerListIdx = listIndices[0];
+            int[] currentListRowIdx = new int[numListLayers];
+            for (int j = 0; j < numListLayers; j++) currentListRowIdx[j] = -1;
             int visibleIdx = 0;
+
             for (int i = 0; i < rep!.Length; i++)
             {
+                int r = rep[i];
                 int defValue = def is null ? 0 : def[i];
                 int kNull = -1;
-                bool isListEmpty = false;
+                bool isEmpty = false;
                 if (defValue != 0)
                 {
                     for (int k = 0; k < n; k++)
                     {
                         if (layerNullDef[k] == defValue) { kNull = k; break; }
-                        if (layerEmptyDef[k] == defValue) { kNull = k; isListEmpty = true; break; }
+                        if (layerEmptyDef[k] == defValue) { kNull = k; isEmpty = true; break; }
                     }
                     if (kNull < 0)
                         throw new LanceFormatException(
@@ -690,55 +742,82 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 }
 
                 bool consumesSlot;
-                if (rep[i] == 1)
+
+                if (r == 0)
                 {
-                    rowIdx++;
-                    listOffsets![rowIdx] = visibleIdx;
-
-                    // Above-list layers (k > L): cascade from kNull.
-                    for (int k = L + 1; k < n; k++)
-                    {
-                        if (levelBitmaps[k] is null) continue;
-                        bool valid = (kNull == -1) || (kNull < k);
-                        if (!valid)
-                        {
-                            levelBitmaps[k]![rowIdx >> 3] &= (byte)~(1 << (rowIdx & 7));
-                            levelNullCounts[k]++;
-                        }
-                    }
-
-                    // List layer (k == L): validity depends on which kind of
-                    // null/empty/cascade applies.
-                    bool listValid;
-                    if (kNull == -1) listValid = true;
-                    else if (kNull > L) listValid = false;             // cascade from outer null
-                    else if (kNull == L) listValid = isListEmpty;       // null = invalid, empty = valid
-                    else listValid = true;                              // below-list null; list itself non-empty
-                    if (levelBitmaps[L] is not null && !listValid)
-                    {
-                        levelBitmaps[L]![rowIdx >> 3] &= (byte)~(1 << (rowIdx & 7));
-                        levelNullCounts[L]++;
-                    }
-
-                    // A value slot is consumed unless the list is null/empty
-                    // or an above-list cascade clears the row entirely.
-                    consumesSlot = (kNull == -1) || (kNull < L);
+                    // Continuation of the innermost list. def must be 0 or a
+                    // below-innermost-list null (item null).
+                    if (kNull >= innerListIdx)
+                        throw new LanceFormatException(
+                            $"Column {columnIndex}: rep=0 at level {i} but def value {defValue} marks a non-item level ({kNull}).");
+                    consumesSlot = true;
                 }
                 else
                 {
-                    // rep=0: continuation of the current list — always a visible
-                    // item at the leaf level. def is at most a below-list null.
-                    if (kNull >= L)
-                        throw new LanceFormatException(
-                            $"Column {columnIndex}: rep=0 at level {i} but def value {defValue} marks a level >= list ({kNull}).");
-                    consumesSlot = true;
+                    // rep >= 1: open boundaries at list levels j where
+                    // rep_for_this <= r AND no LIST cascade above blocks
+                    // (struct cascade between lists doesn't block — see
+                    // pre-pass comment). Process outermost → innermost.
+                    for (int j = numListLayers - 1; j >= 0; j--)
+                    {
+                        int listIdx = listIndices[j];
+                        int repForThis = j + 1;
+                        if (r < repForThis) continue;
+                        int nextListAbove = (j + 1 < numListLayers) ? listIndices[j + 1] : int.MaxValue;
+                        if (kNull >= nextListAbove) continue;
+
+                        currentListRowIdx[j]++;
+                        int rowIdx = currentListRowIdx[j];
+                        // Offset target is the next-deeper level's current row
+                        // count, or visibleIdx for the innermost list.
+                        listOffsets[j]![rowIdx] = (j == 0) ? visibleIdx : currentListRowIdx[j - 1] + 1;
+
+                        // Validity at this list layer. listIsNull when our own
+                        // def is null (not empty), or any cascade from a layer
+                        // strictly above this list (struct cascade through to
+                        // here — list cascade was already filtered above).
+                        bool listIsNull = ((kNull == listIdx) && !isEmpty) || (kNull > listIdx);
+                        if (listIsNull && levelBitmaps[listIdx] is not null)
+                        {
+                            levelBitmaps[listIdx]![rowIdx >> 3] &= (byte)~(1 << (rowIdx & 7));
+                            levelNullCounts[listIdx]++;
+                        }
+
+                        // Non-list layers strictly above THIS list (and below
+                        // the next-shallower list, or up to the top if this
+                        // is the outermost) also fire a row event here —
+                        // their length tracks this list's row count via the
+                        // closest-deeper-list rule.
+                        int aboveStart = listIdx + 1;
+                        int aboveEnd = (j + 1 < numListLayers) ? listIndices[j + 1] - 1 : n - 1;
+                        for (int k = aboveStart; k <= aboveEnd; k++)
+                        {
+                            if (IsListLayerKind(layers[k])) continue;
+                            if (levelBitmaps[k] is null) continue;
+                            bool valid = (kNull == -1) || (kNull < k);
+                            if (!valid)
+                            {
+                                levelBitmaps[k]![rowIdx >> 3] &= (byte)~(1 << (rowIdx & 7));
+                                levelNullCounts[k]++;
+                            }
+                        }
+                    }
+                    // The position consumes a value slot iff (a) no list
+                    // cascade above the innermost list blocked the innermost
+                    // list from opening AND (b) the innermost list itself
+                    // isn't null/empty. (a) means kNull < listIndices[0]
+                    // (cascade from below the innermost list, ie item null —
+                    // valid item slot) OR kNull == -1.
+                    consumesSlot = (kNull == -1) || (kNull < innerListIdx);
                 }
 
                 if (!consumesSlot) continue;
 
-                // Per-item processing: below-list layers (0..L-1) cascade for
-                // this visible item.
-                for (int k = 0; k < L; k++)
+                // Per-item processing for layers below the innermost list
+                // (item leaf and any non-list layers between leaf and
+                // innermost list).
+                int belowEnd = numListLayers > 0 ? innerListIdx : n;
+                for (int k = 0; k < belowEnd; k++)
                 {
                     if (levelBitmaps[k] is null) continue;
                     bool valid = (kNull == -1) || (kNull < k);
@@ -750,7 +829,14 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
                 }
                 visibleIdx++;
             }
-            listOffsets![numRows] = visibleIdx;
+
+            // Finalise offsets: write the ending sentinel for each list layer.
+            for (int j = 0; j < numListLayers; j++)
+            {
+                int finalEnd = (j == 0) ? visibleIdx : currentListRowIdx[j - 1] + 1;
+                listOffsets[j]![listRowCounts[j]] = finalEnd;
+            }
+
             if (visibleIdx != visibleItems)
                 throw new LanceFormatException(
                     $"Column {columnIndex} visible-item walk produced {visibleIdx} but the page declared {visibleItems}.");
@@ -770,7 +856,12 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             byte[]? validity = (levelBitmaps[k] is not null && levelNullCounts[k] > 0)
                 ? levelBitmaps[k]
                 : null;
-            int[]? offsets = (k == L) ? listOffsets : null;
+            int[]? offsets = null;
+            if (IsListLayerKind(layers[k]))
+            {
+                int j = System.Array.IndexOf(listIndices, k);
+                offsets = listOffsets[j];
+            }
             ancestors[k - 1] = new LevelInfo
             {
                 Validity = validity,
