@@ -73,6 +73,31 @@ def main() -> None:
         pa.table({"id": pa.array(list(range(10000)), type=pa.int32())}),
         delete_predicate="id % 2 = 0")
 
+    # BTREE scalar index on a 3-fragment dataset. Each fragment has 5
+    # int32 values in disjoint, increasing ranges so a predicate like
+    # `x > 100` cleanly cuts to a subset of fragments via the index.
+    _write_with_index("btree_index_v21",
+        mode_seq=[
+            (pa.table({"x": pa.array([1, 2, 3, 4, 5], type=pa.int32())}), "create"),
+            (pa.table({"x": pa.array([10, 20, 30, 40, 50], type=pa.int32())}), "append"),
+            (pa.table({"x": pa.array([100, 200, 300, 400, 500], type=pa.int32())}), "append"),
+        ],
+        indexed_field="x",
+        index_type="BTREE")
+
+
+def _write_with_index(name, mode_seq, indexed_field, index_type, version="2.1"):
+    """Create a dataset and add a scalar index to a field."""
+    target = os.path.join(THIS_DIR, name)
+    if os.path.exists(target):
+        shutil.rmtree(target)
+    for table, mode in mode_seq:
+        lance.write_dataset(table, target, data_storage_version=version, mode=mode)
+    lance.LanceDataset(target).create_scalar_index(indexed_field, index_type)
+    sz = sum(os.path.getsize(os.path.join(r, f))
+             for r, _, fs in os.walk(target) for f in fs)
+    print(f"  {name}: {sz} bytes")
+
 
 def _write_with_delete(name, table, *, delete_predicate, version="2.1"):
     """Create a dataset, then delete rows matching the predicate."""
