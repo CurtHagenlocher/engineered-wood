@@ -126,6 +126,99 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task NullableInt32_RoundTrip_ViaOurReader()
+    {
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-writer-{Guid.NewGuid():N}.lance");
+        try
+        {
+            // Build [10, null, 30, null, 50] as an Apache.Arrow Int32Array.
+            var b = new Int32Array.Builder();
+            b.Append(10);
+            b.AppendNull();
+            b.Append(30);
+            b.AppendNull();
+            b.Append(50);
+            var arr = b.Build();
+
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("x", arr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(5, reader.NumberOfRows);
+            var read = (Int32Array)await reader.ReadColumnAsync(0);
+            Assert.Equal(2, read.NullCount);
+            Assert.Equal(new int?[] { 10, null, 30, null, 50 }, read.ToArray());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task NullableInt32_CrossValidatedAgainstPylance()
+    {
+        if (!IsPythonAvailable())
+        {
+            return;
+        }
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-pylance-null-{Guid.NewGuid():N}.lance");
+        try
+        {
+            var b = new Int32Array.Builder();
+            b.Append(7);
+            b.AppendNull();
+            b.Append(11);
+            b.AppendNull();
+            b.AppendNull();
+            b.Append(13);
+            var arr = b.Build();
+
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("x", arr);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "out = { 'rows': len(t), 'values': t['x'].to_pylist() }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            var root = json.RootElement;
+            Assert.Equal(6, root.GetProperty("rows").GetInt32());
+            var values = new List<int?>();
+            foreach (var v in root.GetProperty("values").EnumerateArray())
+                values.Add(v.ValueKind == System.Text.Json.JsonValueKind.Null ? null : v.GetInt32());
+            Assert.Equal(new int?[] { 7, null, 11, null, null, 13 }, values);
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task SingleColumn_CrossValidatedAgainstPylance()
     {
         if (!IsPythonAvailable())
