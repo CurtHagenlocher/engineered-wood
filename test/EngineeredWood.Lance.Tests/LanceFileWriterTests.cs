@@ -410,6 +410,76 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task MultiPageInt32_RoundTrip_ViaOurReader()
+    {
+        // Three pages of unequal size: 7 + 3 + 100 = 110 rows, all in one
+        // column. Exercises the new multi-page concatenation path.
+        var page0 = Enumerable.Range(1000, 7).ToArray();
+        var page1 = Enumerable.Range(2000, 3).ToArray();
+        var page2 = Enumerable.Range(5000, 100).ToArray();
+        var pages = new[] { page0, page1, page2 };
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mp-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteInt32ColumnPagedAsync("v", pages);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(110, reader.NumberOfRows);
+            var arr = (Int32Array)await reader.ReadColumnAsync(0);
+            var expected = pages.SelectMany(p => p).ToArray();
+            Assert.Equal(expected.Length, arr.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], arr.GetValue(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task MultiPageStrings_RoundTrip_ViaOurReader()
+    {
+        // Three string pages totaling 12 rows. Each page has its own
+        // chunked offsets+data; the reader needs to concat correctly.
+        var p0 = new StringArray.Builder();
+        p0.Append("alpha"); p0.Append("beta"); p0.Append("gamma");
+        var p1 = new StringArray.Builder();
+        p1.Append(""); p1.Append("delta");
+        var p2 = new StringArray.Builder();
+        for (int i = 0; i < 7; i++) p2.Append($"item-{i}");
+        var pages = new[] { p0.Build(), p1.Build(), p2.Build() };
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mp-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteStringColumnPagedAsync("s", pages);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.Equal(12, reader.NumberOfRows);
+            var arr = (StringArray)await reader.ReadColumnAsync(0);
+            var expected = pages.SelectMany(p =>
+                Enumerable.Range(0, p.Length).Select(i => p.GetString(i))).ToArray();
+            Assert.Equal(expected.Length, arr.Length);
+            for (int i = 0; i < expected.Length; i++)
+                Assert.Equal(expected[i], arr.GetString(i));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task NullableInt32_RoundTrip_ViaOurReader()
     {
         string path = Path.Combine(Path.GetTempPath(), $"ew-lance-writer-{Guid.NewGuid():N}.lance");

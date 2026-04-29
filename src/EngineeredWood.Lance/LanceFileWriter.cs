@@ -132,6 +132,93 @@ public sealed class LanceFileWriter : IAsyncDisposable
     private static CompressiveEncoding FlatEncoding(int bitsPerValue) =>
         new() { Flat = new Proto.Encodings.V21.Flat { BitsPerValue = (ulong)bitsPerValue } };
 
+    /// <summary>
+    /// Test-only: write a non-nullable <see cref="int"/> column whose values
+    /// are split across multiple pages. Each entry of
+    /// <paramref name="valuesPerPage"/> becomes one page; the column ends up
+    /// with <c>valuesPerPage.Count</c> pages and a row count equal to the
+    /// total. Lets tests deterministically exercise the multi-page reader
+    /// path the public typed Write methods don't currently expose.
+    /// </summary>
+    internal Task WriteInt32ColumnPagedAsync(
+        string name, IReadOnlyList<int[]> valuesPerPage,
+        CancellationToken cancellationToken = default)
+    {
+        var pageBytes = new byte[valuesPerPage.Count][];
+        for (int i = 0; i < valuesPerPage.Count; i++)
+            pageBytes[i] = MemoryMarshal.AsBytes(valuesPerPage[i].AsSpan()).ToArray();
+        return WriteFlatPagedColumnAsync(name, "int32", bytesPerValue: 4, pageBytes, cancellationToken);
+    }
+
+    /// <summary>
+    /// Test-only: write a non-nullable string column whose values are split
+    /// across multiple pages. Each <see cref="StringArray"/> in
+    /// <paramref name="pagesValues"/> becomes one page.
+    /// </summary>
+    internal async Task WriteStringColumnPagedAsync(
+        string name, IReadOnlyList<StringArray> pagesValues,
+        CancellationToken cancellationToken = default)
+    {
+        ThrowIfFinalized();
+        int totalItems = 0;
+        foreach (var p in pagesValues) totalItems += p.Length;
+        if (_totalRows < 0) _totalRows = totalItems;
+        else if (_totalRows != totalItems)
+            throw new ArgumentException(
+                $"Column '{name}' has {totalItems} rows but earlier columns have {_totalRows}.",
+                nameof(pagesValues));
+
+        var valueEncoding = new CompressiveEncoding
+        {
+            Variable = new Proto.Encodings.V21.Variable
+            {
+                Offsets = new CompressiveEncoding
+                {
+                    Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 32 },
+                },
+            },
+        };
+
+        var pageProtos = new List<ColumnMetadata.Types.Page>(pagesValues.Count);
+        foreach (var arr in pagesValues)
+        {
+            int pageRows = arr.Length;
+            // Re-use the same Variable chunking algorithm via a helper.
+            var chunks = new List<(int, int, byte[])>();
+            int idx = 0;
+            while (idx < pageRows)
+            {
+                int items = 0;
+                int dataBytes = 0;
+                while (idx + items < pageRows)
+                {
+                    int newCount = items + 1;
+                    int newDataBytes = dataBytes + arr.GetBytes(idx + items).Length;
+                    int valueBufLen = (newCount + 1) * sizeof(uint) + newDataBytes;
+                    int total = ChunkTotalBytes(newCount, valueBufLen, hasDef: false);
+                    if (total > MaxChunkBytes) break;
+                    items = newCount;
+                    dataBytes = newDataBytes;
+                }
+                if (items == 0)
+                    throw new InvalidOperationException(
+                        $"Variable item at index {idx} alone exceeds chunk budget.");
+                bool isLast = idx + items == pageRows;
+                int finalItems = isLast ? items : Pow2Floor(items);
+                byte[] valueBuf = BuildVariableChunkValueBuffer(arr, idx, finalItems);
+                chunks.Add((idx, finalItems, valueBuf));
+                idx += finalItems;
+            }
+
+            var page = await BuildAndWritePageAsync(
+                valueEncoding, pageRows, chunks, validityBitmap: null, nullCount: 0,
+                cancellationToken).ConfigureAwait(false);
+            pageProtos.Add(page);
+        }
+
+        RegisterColumn(name, "string", valueEncoding, pageProtos);
+    }
+
     /// <summary>Append a non-nullable <see cref="sbyte"/> column.</summary>
     public Task WriteInt8ColumnAsync(string name, ReadOnlySpan<sbyte> values, CancellationToken cancellationToken = default)
         => WriteFlatPageAsync(name, "int8", 1, values.Length, MemoryMarshal.AsBytes(values).ToArray(), null, 0, cancellationToken);
@@ -366,16 +453,9 @@ public sealed class LanceFileWriter : IAsyncDisposable
     }
 
     /// <summary>
-    /// Emits a multi-chunk MiniBlockLayout page for any value encoding with
-    /// <c>num_buffers = 1</c>. Each entry in <paramref name="chunks"/>
-    /// supplies that chunk's items range and its post-def value buffer
-    /// (Flat: raw little-endian values; Variable: per-chunk
-    /// <c>(items+1)</c> absolute u32 offsets followed by data bytes). The
-    /// helper assembles each chunk's header + def bytes (if any) + value
-    /// buffer, packs all chunks into buffer 1, and writes a u16-per-chunk
-    /// metadata word into buffer 0. Non-last chunks must have power-of-2
-    /// item counts (encoded as <c>log_num_values</c>); the last chunk's
-    /// item count is recovered as <c>numItems - sum(prior chunks)</c>.
+    /// Single-page wrapper around <see cref="BuildAndWritePageAsync"/> +
+    /// <see cref="RegisterColumn"/> — the common path for the typed Write
+    /// methods when each column is one page.
     /// </summary>
     private async Task WriteMultiChunkPageAsync(
         string name,
@@ -394,6 +474,37 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 $"Column '{name}' has {numItems} rows but earlier columns have {_totalRows}.",
                 nameof(numItems));
 
+        var page = await BuildAndWritePageAsync(
+            valueEncoding, numItems, chunks, validityBitmap, nullCount, cancellationToken)
+            .ConfigureAwait(false);
+        RegisterColumn(name, logicalType, valueEncoding, new[] { page });
+    }
+
+    /// <summary>
+    /// Emits a multi-chunk MiniBlockLayout page for any value encoding with
+    /// <c>num_buffers = 1</c>. Each entry in <paramref name="chunks"/>
+    /// supplies that chunk's items range and its post-def value buffer
+    /// (Flat: raw little-endian values; Variable: per-chunk
+    /// <c>(items+1)</c> absolute u32 offsets followed by data bytes). The
+    /// helper assembles each chunk's header + def bytes (if any) + value
+    /// buffer, packs all chunks into buffer 1, and writes a u16-per-chunk
+    /// metadata word into buffer 0. Non-last chunks must have power-of-2
+    /// item counts (encoded as <c>log_num_values</c>); the last chunk's
+    /// item count is recovered as <c>numItems - sum(prior chunks)</c>.
+    ///
+    /// <para>Returns a fully-populated <see cref="ColumnMetadata.Types.Page"/>
+    /// the caller can attach to a column proto. Does NOT touch
+    /// <see cref="_columns"/> / <see cref="_fields"/>; multi-page columns
+    /// call this once per page and register the column at the end.</para>
+    /// </summary>
+    private async Task<ColumnMetadata.Types.Page> BuildAndWritePageAsync(
+        CompressiveEncoding valueEncoding,
+        int numItems,
+        IReadOnlyList<(int itemStart, int itemCount, byte[] valueBuf)> chunks,
+        byte[]? validityBitmap,
+        int nullCount,
+        CancellationToken cancellationToken)
+    {
         bool hasDef = nullCount > 0 && validityBitmap is not null;
         int N = chunks.Count;
         int headerLen = hasDef ? 6 : 4;
@@ -548,7 +659,13 @@ public sealed class LanceFileWriter : IAsyncDisposable
         page.BufferOffsets.Add((ulong)buf1Offset);
         page.BufferSizes.Add((ulong)buf0Size);
         page.BufferSizes.Add((ulong)buf1Size);
+        return page;
+    }
 
+    private void RegisterColumn(
+        string name, string logicalType, CompressiveEncoding valueEncoding,
+        IEnumerable<ColumnMetadata.Types.Page> pages)
+    {
         // --- Column-level encoding (lance-rs's reader unwraps this) ---
         // For non-blob columns the official writer emits ColumnEncoding {
         // column_encoding = Values(Empty) }, then wraps it in Any and
@@ -567,7 +684,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
         // --- Build the ColumnMetadata + accumulate the schema field ---
         var columnMeta = new ColumnMetadata { Encoding = columnEncoding };
-        columnMeta.Pages.Add(page);
+        foreach (var page in pages) columnMeta.Pages.Add(page);
         _columns.Add(columnMeta);
 
         int fieldId = _fields.Count;
@@ -587,22 +704,59 @@ public sealed class LanceFileWriter : IAsyncDisposable
             // logical_type string is the real type discriminator.
             Name = name,
             Id = fieldId,
-            // pylance marks top-level fields with parent_id = -1 (the
-            // "no parent" sentinel). Setting parent_id = 0 would make the
-            // second top-level field look like a child of the first
-            // because the IsRoot check in our reader treats any
-            // existing-field-id as a real reference.
             ParentId = -1,
             LogicalType = logicalType,
-            // pylance writes nullable=true in the schema even when the
-            // Arrow column is non-nullable; the actual presence of nulls is
-            // encoded by the page's RepDefLayer (ALL_VALID_ITEM vs
-            // NULLABLE_ITEM). Setting nullable=false here makes lance-rs
-            // interpret the schema in a way that doesn't match the layer
-            // shape we emit, so it panics on read.
             Nullable = true,
             Encoding = fieldEncoding,
         });
+    }
+
+    /// <summary>
+    /// Multi-page Flat-encoded column. Each entry of
+    /// <paramref name="valueChunksPerPage"/> is the raw little-endian byte
+    /// buffer for one page's items. Pages are stitched into a single
+    /// <see cref="ColumnMetadata"/> entry; the column's row count is the sum.
+    /// </summary>
+    private async Task WriteFlatPagedColumnAsync(
+        string name, string logicalType, int bytesPerValue,
+        IReadOnlyList<byte[]> valueChunksPerPage,
+        CancellationToken cancellationToken)
+    {
+        ThrowIfFinalized();
+        int totalItems = 0;
+        foreach (var b in valueChunksPerPage) totalItems += b.Length / bytesPerValue;
+        if (_totalRows < 0) _totalRows = totalItems;
+        else if (_totalRows != totalItems)
+            throw new ArgumentException(
+                $"Column '{name}' has {totalItems} rows but earlier columns have {_totalRows}.",
+                nameof(valueChunksPerPage));
+
+        var encoding = FlatEncoding(bytesPerValue * 8);
+        var pageProtos = new List<ColumnMetadata.Types.Page>(valueChunksPerPage.Count);
+
+        foreach (byte[] valueBytes in valueChunksPerPage)
+        {
+            int numItems = valueBytes.Length / bytesPerValue;
+            int chunkSize = LargestPow2FlatChunkSize(bytesPerValue, hasDef: false);
+            var chunks = new List<(int, int, byte[])>();
+            int idx = 0;
+            while (idx < numItems)
+            {
+                int items = Math.Min(numItems - idx, chunkSize);
+                byte[] chunkValBytes = new byte[items * bytesPerValue];
+                new ReadOnlySpan<byte>(valueBytes, idx * bytesPerValue, items * bytesPerValue)
+                    .CopyTo(chunkValBytes);
+                chunks.Add((idx, items, chunkValBytes));
+                idx += items;
+            }
+
+            var page = await BuildAndWritePageAsync(
+                encoding, numItems, chunks, validityBitmap: null, nullCount: 0, cancellationToken)
+                .ConfigureAwait(false);
+            pageProtos.Add(page);
+        }
+
+        RegisterColumn(name, logicalType, encoding, pageProtos);
     }
 
     /// <summary>

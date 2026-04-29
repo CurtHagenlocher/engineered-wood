@@ -1050,13 +1050,22 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         ColumnMetadata cm = _columnMetadatas[columnIndex];
         if (cm.Pages.Count == 0)
             return BuildEmptyArray(targetType);
-        if (cm.Pages.Count > 1)
-            throw new NotImplementedException(
-                $"Column {columnIndex} has {cm.Pages.Count} pages. Multi-page column reading is planned for Phase 10.");
+        if (cm.Pages.Count == 1)
+            return await DecodeV21PageAsync(cm.Pages[0], targetType, cancellationToken)
+                .ConfigureAwait(false);
 
-        ColumnMetadata.Types.Page page = cm.Pages[0];
+        var perPage = new IArrowArray[cm.Pages.Count];
+        for (int p = 0; p < cm.Pages.Count; p++)
+            perPage[p] = await DecodeV21PageAsync(cm.Pages[p], targetType, cancellationToken)
+                .ConfigureAwait(false);
+        return ArrowArrayConcatenator.Concatenate(perPage);
+    }
+
+    private async Task<IArrowArray> DecodeV21PageAsync(
+        ColumnMetadata.Types.Page page, IArrowType targetType,
+        CancellationToken cancellationToken)
+    {
         long numRows = checked((long)page.Length);
-
         IReadOnlyList<IMemoryOwner<byte>> pageBufferOwners =
             await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
         try
@@ -1185,71 +1194,79 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         ColumnMetadata cm = _columnMetadatas[columnIndex];
         if (cm.Pages.Count == 0)
             return (new byte[arrowOffsetWidth], null, 0, 0);
-        if (cm.Pages.Count > 1)
-            throw new NotImplementedException(
-                $"List column {columnIndex} has {cm.Pages.Count} pages; multi-page list reads land later.");
 
-        ColumnMetadata.Types.Page page = cm.Pages[0];
-        int numListRows = checked((int)page.Length);
+        // Pre-pass: total list rows = sum of every page's row count, so we
+        // can size the merged Arrow offsets / validity bitmap up front.
+        int totalRows = 0;
+        foreach (var pg in cm.Pages)
+            totalRows = checked(totalRows + (int)pg.Length);
 
-        var encoding = EncodingUnpacker.UnpackArrayEncoding(page.Encoding);
-        if (encoding.ArrayEncodingCase !=
-            Proto.Encodings.V20.ArrayEncoding.ArrayEncodingOneofCase.List)
-            throw new LanceFormatException(
-                $"List column {columnIndex} has unexpected encoding " +
-                $"'{encoding.ArrayEncodingCase}', expected 'List'.");
-
-        var list = encoding.List;
-        ulong nullAdjustment = list.NullOffsetAdjustment;
-
-        IReadOnlyList<IMemoryOwner<byte>> bufferOwners =
-            await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
-        try
-        {
-            var pageBuffers = new ReadOnlyMemory<byte>[bufferOwners.Count];
-            for (int i = 0; i < bufferOwners.Count; i++)
-                pageBuffers[i] = bufferOwners[i].Memory;
-
-            var context = new PageContext(pageBuffers);
-            ReadOnlyMemory<byte> offsetBytes = FlatDecoder.ResolveFlatBuffer(
-                list.Offsets, context, out ulong bitsPerOffset);
-            if (bitsPerOffset != 64)
-                throw new NotImplementedException(
-                    $"List offsets with bits_per_value={bitsPerOffset} are not supported (only 64).");
-
-            int required = 8 * numListRows;
-            if (offsetBytes.Length < required)
-                throw new LanceFormatException(
-                    $"List offsets buffer too small: need {required} bytes, have {offsetBytes.Length}.");
-
-            return BuildArrowOffsetsFromListDisk(
-                offsetBytes.Span, numListRows, nullAdjustment, arrowOffsetWidth);
-        }
-        finally
-        {
-            foreach (var owner in bufferOwners) owner.Dispose();
-        }
-    }
-
-    private static (byte[] ArrowOffsets, byte[]? Bitmap, int NullCount, int NumListRows)
-        BuildArrowOffsetsFromListDisk(
-            ReadOnlySpan<byte> offsetBytes,
-            int numListRows,
-            ulong nullAdjustment,
-            int arrowOffsetWidth)
-    {
-        // Lance stores cumulative end-offsets (no leading zero). A row is null
-        // iff its disk offset is >= null_offset_adjustment; the "real" end
-        // modulo null_adjustment gives the base for the next row.
-        // Null lists contribute zero items to the child column.
-        var arrowOffsets = new byte[arrowOffsetWidth * (numListRows + 1)];
-        var bitmap = new byte[(numListRows + 7) / 8];
-        int nullCount = 0;
-
-        ulong diskBase = 0;
-        ulong arrowCumulative = 0;
+        var arrowOffsets = new byte[arrowOffsetWidth * (totalRows + 1)];
+        var bitmap = new byte[(totalRows + 7) / 8];
         WriteArrowOffset(arrowOffsets, 0, arrowOffsetWidth, 0);
 
+        int totalNullCount = 0;
+        ulong arrowCumulative = 0;
+        int rowCursor = 0;
+
+        foreach (var page in cm.Pages)
+        {
+            int numListRows = checked((int)page.Length);
+            var encoding = EncodingUnpacker.UnpackArrayEncoding(page.Encoding);
+            if (encoding.ArrayEncodingCase !=
+                Proto.Encodings.V20.ArrayEncoding.ArrayEncodingOneofCase.List)
+                throw new LanceFormatException(
+                    $"List column {columnIndex} has unexpected encoding " +
+                    $"'{encoding.ArrayEncodingCase}', expected 'List'.");
+            var list = encoding.List;
+            ulong nullAdjustment = list.NullOffsetAdjustment;
+
+            IReadOnlyList<IMemoryOwner<byte>> bufferOwners =
+                await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
+            try
+            {
+                var pageBuffers = new ReadOnlyMemory<byte>[bufferOwners.Count];
+                for (int i = 0; i < bufferOwners.Count; i++)
+                    pageBuffers[i] = bufferOwners[i].Memory;
+
+                var context = new PageContext(pageBuffers);
+                ReadOnlyMemory<byte> offsetBytes = FlatDecoder.ResolveFlatBuffer(
+                    list.Offsets, context, out ulong bitsPerOffset);
+                if (bitsPerOffset != 64)
+                    throw new NotImplementedException(
+                        $"List offsets with bits_per_value={bitsPerOffset} are not supported (only 64).");
+
+                int required = 8 * numListRows;
+                if (offsetBytes.Length < required)
+                    throw new LanceFormatException(
+                        $"List offsets buffer too small: need {required} bytes, have {offsetBytes.Length}.");
+
+                AppendListPageOffsets(
+                    offsetBytes.Span, numListRows, nullAdjustment,
+                    arrowOffsets, bitmap, arrowOffsetWidth, rowCursor,
+                    ref arrowCumulative, ref totalNullCount);
+            }
+            finally
+            {
+                foreach (var owner in bufferOwners) owner.Dispose();
+            }
+            rowCursor += numListRows;
+        }
+
+        return (arrowOffsets, totalNullCount == 0 ? null : bitmap, totalNullCount, totalRows);
+    }
+
+    private static void AppendListPageOffsets(
+        ReadOnlySpan<byte> offsetBytes, int numListRows, ulong nullAdjustment,
+        byte[] arrowOffsets, byte[] bitmap, int arrowOffsetWidth, int globalRowStart,
+        ref ulong arrowCumulative, ref int totalNullCount)
+    {
+        // Within a single page, Lance stores cumulative end-offsets relative
+        // to that page's diskBase=0; null sentinel uses the page's
+        // null_offset_adjustment. Across pages, child rows stitch together
+        // contiguously in Arrow, so arrowCumulative carries across — we
+        // only reset diskBase per page.
+        ulong diskBase = 0;
         for (int i = 0; i < numListRows; i++)
         {
             ulong diskOffset = System.Buffers.Binary.BinaryPrimitives
@@ -1258,21 +1275,19 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
             ulong endModulo = isNull ? diskOffset - nullAdjustment : diskOffset;
             ulong len = endModulo - diskBase;
 
+            int globalRow = globalRowStart + i;
             if (isNull)
             {
-                nullCount++;
+                totalNullCount++;
             }
             else
             {
                 arrowCumulative += len;
-                bitmap[i >> 3] |= (byte)(1 << (i & 7));
+                bitmap[globalRow >> 3] |= (byte)(1 << (globalRow & 7));
             }
-
-            WriteArrowOffset(arrowOffsets, i + 1, arrowOffsetWidth, arrowCumulative);
+            WriteArrowOffset(arrowOffsets, globalRow + 1, arrowOffsetWidth, arrowCumulative);
             diskBase = endModulo;
         }
-
-        return (arrowOffsets, nullCount == 0 ? null : bitmap, nullCount, numListRows);
     }
 
     private static void WriteArrowOffset(byte[] buffer, int index, int width, ulong value)
@@ -1297,16 +1312,17 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         Proto.Encodings.V20.ArrayEncoding.ArrayEncodingOneofCase requireEncoding)
     {
         if (cm.Pages.Count == 0) return 0;
-        if (cm.Pages.Count > 1)
-            throw new NotImplementedException(
-                $"Column {columnIndex} has {cm.Pages.Count} pages; multi-page reads land later.");
-        var page = cm.Pages[0];
-        var encoding = EncodingUnpacker.UnpackArrayEncoding(page.Encoding);
-        if (encoding.ArrayEncodingCase != requireEncoding)
-            throw new LanceFormatException(
-                $"Column {columnIndex} has unexpected encoding " +
-                $"'{encoding.ArrayEncodingCase}', expected '{requireEncoding}'.");
-        return checked((int)page.Length);
+        long total = 0;
+        foreach (var page in cm.Pages)
+        {
+            var encoding = EncodingUnpacker.UnpackArrayEncoding(page.Encoding);
+            if (encoding.ArrayEncodingCase != requireEncoding)
+                throw new LanceFormatException(
+                    $"Column {columnIndex} has unexpected encoding " +
+                    $"'{encoding.ArrayEncodingCase}', expected '{requireEncoding}'.");
+            total = checked(total + (long)page.Length);
+        }
+        return checked((int)total);
     }
 
     /// <summary>
@@ -1320,13 +1336,22 @@ public sealed class LanceFileReader : IAsyncDisposable, IDisposable
         if (cm.Pages.Count == 0)
             return BuildEmptyArray(targetType);
 
-        if (cm.Pages.Count > 1)
-            throw new NotImplementedException(
-                $"Column {columnIndex} has {cm.Pages.Count} pages. Multi-page column reading is planned for Phase 10.");
+        if (cm.Pages.Count == 1)
+            return await DecodeV20PageAsync(cm.Pages[0], targetType, cancellationToken)
+                .ConfigureAwait(false);
 
-        ColumnMetadata.Types.Page page = cm.Pages[0];
+        var perPage = new IArrowArray[cm.Pages.Count];
+        for (int p = 0; p < cm.Pages.Count; p++)
+            perPage[p] = await DecodeV20PageAsync(cm.Pages[p], targetType, cancellationToken)
+                .ConfigureAwait(false);
+        return ArrowArrayConcatenator.Concatenate(perPage);
+    }
+
+    private async Task<IArrowArray> DecodeV20PageAsync(
+        ColumnMetadata.Types.Page page, IArrowType targetType,
+        CancellationToken cancellationToken)
+    {
         long numRows = checked((long)page.Length);
-
         IReadOnlyList<IMemoryOwner<byte>> pageBufferOwners =
             await LoadPageBuffersAsync(page, cancellationToken).ConfigureAwait(false);
         try
