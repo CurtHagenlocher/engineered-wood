@@ -1197,6 +1197,94 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task Struct_Primitives_RoundTrip_ViaOurReader()
+    {
+        // struct<a: int32, b: float, s: string> with both struct-row nulls
+        // and child-element nulls. Layers per child are
+        // [item_layer, struct_layer]; def values cascade struct-null over
+        // child-null.
+        const int rows = 4;
+        var aBytes = new byte[rows * 4];
+        for (int i = 0; i < rows; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                aBytes.AsSpan(i * 4, 4), 100 + i);
+        var aValidity = new byte[1] { 0b1101 };  // a[1] is null
+        var a = new Int32Array(new ArrayData(
+            Int32Type.Default, rows, 1, 0,
+            new[] { new ArrowBuffer(aValidity), new ArrowBuffer(aBytes) }));
+
+        var bBytes = new byte[rows * 4];
+        for (int i = 0; i < rows; i++)
+            MemoryMarshal.AsBytes(new[] { (float)(i * 1.5f) }.AsSpan())
+                .CopyTo(bBytes.AsSpan(i * 4, 4));
+        var b = new FloatArray(new ArrayData(
+            FloatType.Default, rows, 0, 0,
+            new[] { ArrowBuffer.Empty, new ArrowBuffer(bBytes) }));
+
+        var sBuilder = new StringArray.Builder();
+        sBuilder.Append("alpha").Append("beta").Append("gamma").Append("delta");
+        var s = sBuilder.Build();
+
+        // Struct null for row 2.
+        var structValidity = new byte[1] { 0b1011 };
+        var structType = new StructType(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: true),
+            new Field("b", FloatType.Default, nullable: true),
+            new Field("s", StringType.Default, nullable: true),
+        });
+        var structArr = new StructArray(new ArrayData(
+            structType, rows, nullCount: 1, offset: 0,
+            new[] { new ArrowBuffer(structValidity) },
+            new[] { a.Data, b.Data, s.Data }));
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-struct-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("rec", structArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            Assert.IsType<StructType>(reader.Schema.FieldsList[0].DataType);
+            var read = (StructArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(rows, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(2));
+
+            // The reader's cascade walker propagates parent-layer nulls down
+            // into child bitmaps that are themselves nullable, so a child
+            // with own nulls also reflects struct-row nulls in its bitmap.
+            // Children that have no intrinsic nulls (no bitmap) carry only
+            // the struct-level cascade through StructArray.NullBitmapBuffer.
+            var ra = (Int32Array)read.Fields[0];
+            Assert.Equal(2, ra.NullCount);  // own null at 1 + struct null at 2
+            Assert.False(ra.IsNull(0));
+            Assert.True(ra.IsNull(1));
+            Assert.True(ra.IsNull(2));
+            Assert.Equal(100, ra.GetValue(0));
+            Assert.Equal(103, ra.GetValue(3));
+
+            var rb = (FloatArray)read.Fields[1];
+            Assert.Equal(0, rb.NullCount);  // no own bitmap → cascade lives on struct only
+            Assert.Equal(0f, rb.GetValue(0));
+            Assert.Equal(4.5f, rb.GetValue(3));
+
+            var rs = (StringArray)read.Fields[2];
+            Assert.Equal(0, rs.NullCount);
+            Assert.Equal("alpha", rs.GetString(0));
+            Assert.Equal("beta", rs.GetString(1));
+            Assert.Equal("delta", rs.GetString(3));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task Decimal128_RoundTrip_ViaOurReader()
     {
         // Decimal128(precision=18, scale=3): three values + one null. Apache

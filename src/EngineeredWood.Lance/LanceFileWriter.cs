@@ -283,6 +283,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
             return WriteVariableColumnAsync(name, "string", sa, cancellationToken);
         if (array is BinaryArray ba)
             return WriteVariableColumnAsync(name, "binary", ba, cancellationToken);
+        if (array is StructArray sarr)
+            return WriteStructColumnAsync(name, sarr, cancellationToken);
         if (array is FixedSizeListArray fsl)
             return WriteFixedSizeListColumnAsync(name, fsl, cancellationToken);
         // Decimal128 and Decimal256 derive from FixedSizeBinaryType, so they
@@ -569,6 +571,245 @@ public sealed class LanceFileWriter : IAsyncDisposable
             name, logicalType, bytesPerRow, valueEncoding,
             numItems, valueBytes,
             ExtractValidityBitmap(array), array.NullCount, cancellationToken);
+    }
+
+    /// <summary>
+    /// Writes a non-nested <see cref="StructArray"/>. Each child becomes its
+    /// own column with two-layer cascade <c>[itemLayer, structLayer]</c>;
+    /// <c>structLayer</c> propagates the struct row's own null bitmap into
+    /// every child via def values. Children must be one of the supported
+    /// leaf types (fixed-width primitives, string, binary, FSB,
+    /// Decimal128/256). Lists, FSL, and nested struct children inside a
+    /// struct are not yet supported by the writer.
+    /// </summary>
+    private async Task WriteStructColumnAsync(
+        string name, StructArray array, CancellationToken cancellationToken)
+    {
+        ThrowIfFinalized();
+        var structType = (StructType)array.Data.DataType;
+        int rows = array.Length;
+        if (_totalRows < 0) _totalRows = rows;
+        else if (_totalRows != rows)
+            throw new ArgumentException(
+                $"Column '{name}' has {rows} rows but earlier columns have {_totalRows}.",
+                nameof(name));
+
+        bool structNullable = array.NullCount > 0;
+        byte[]? structValidity = structNullable ? ExtractValidityBitmap(array) : null;
+
+        // Register the parent struct field BEFORE child fields so IDs flow
+        // parent → children, matching pylance's id assignment.
+        int parentId = _fields.Count;
+        _fields.Add(new Proto.Field
+        {
+            Name = name,
+            Id = parentId,
+            ParentId = -1,
+            LogicalType = "struct",
+            Nullable = true,
+            Encoding = Proto.Encoding.Plain,
+        });
+
+        for (int i = 0; i < structType.Fields.Count; i++)
+        {
+            var childField = structType.Fields[i];
+            var childArray = array.Fields[i];
+            await WriteStructChildColumnAsync(
+                childField.Name, parentId, childArray,
+                structNullable, structValidity, rows, cancellationToken)
+                .ConfigureAwait(false);
+        }
+    }
+
+    /// <summary>
+    /// Emits one column-metadata entry for a struct child. Builds a
+    /// page-level def stream that encodes both struct-row nulls and
+    /// child-element nulls, dispatches on the child's Arrow type to build
+    /// the value buffer (Flat / Variable / FSB-shaped flat), and registers
+    /// the child as a Lance Field whose parent_id points back to the struct.
+    /// </summary>
+    private async Task WriteStructChildColumnAsync(
+        string childName, int parentId,
+        IArrowArray childArray,
+        bool structNullable, byte[]? structValidity, int rows,
+        CancellationToken cancellationToken)
+    {
+        bool childNullable = childArray.NullCount > 0;
+        byte[]? childValidity = childNullable ? ExtractValidityBitmap(childArray) : null;
+
+        var itemLayer = childNullable
+            ? RepDefLayer.RepdefNullableItem
+            : RepDefLayer.RepdefAllValidItem;
+        var structLayer = structNullable
+            ? RepDefLayer.RepdefNullableItem
+            : RepDefLayer.RepdefAllValidItem;
+
+        int next = 1;
+        int itemNullDef = childNullable ? next++ : 0;
+        int structNullDef = structNullable ? next++ : 0;
+        bool hasDef = childNullable || structNullable;
+
+        ushort[]? def = null;
+        if (hasDef)
+        {
+            def = new ushort[rows];
+            for (int i = 0; i < rows; i++)
+            {
+                bool sNull = structNullable
+                    && (structValidity![i >> 3] & (1 << (i & 7))) == 0;
+                bool cNull = childNullable
+                    && (childValidity![i >> 3] & (1 << (i & 7))) == 0;
+                if (sNull) def[i] = (ushort)structNullDef;
+                else if (cNull) def[i] = (ushort)itemNullDef;
+                else def[i] = 0;
+            }
+        }
+
+        // Resolve child encoding + bytes. Strings/binary use Variable;
+        // fixed-width primitives, FSB, and Decimal use Flat.
+        byte[] valueBytes;
+        CompressiveEncoding valueEncoding;
+        string innerLogical;
+        if (childArray is StringArray childStr)
+        {
+            (valueBytes, valueEncoding, innerLogical) = BuildVariableLeafSingleChunk(childStr, "string");
+        }
+        else if (childArray is BinaryArray childBin)
+        {
+            (valueBytes, valueEncoding, innerLogical) = BuildVariableLeafSingleChunk(childBin, "binary");
+        }
+        else if (childArray is Decimal128Array dec128)
+        {
+            var dt = (Decimal128Type)dec128.Data.DataType;
+            (valueBytes, valueEncoding, innerLogical) = BuildFixedLeaf(
+                dec128, dt.ByteWidth, $"decimal:128:{dt.Precision}:{dt.Scale}");
+        }
+        else if (childArray is Decimal256Array dec256)
+        {
+            var dt = (Decimal256Type)dec256.Data.DataType;
+            (valueBytes, valueEncoding, innerLogical) = BuildFixedLeaf(
+                dec256, dt.ByteWidth, $"decimal:256:{dt.Precision}:{dt.Scale}");
+        }
+        else if (childArray is Apache.Arrow.Arrays.FixedSizeBinaryArray childFsb)
+        {
+            int width = ((FixedSizeBinaryType)childFsb.Data.DataType).ByteWidth;
+            (valueBytes, valueEncoding, innerLogical) = BuildFixedLeaf(
+                childFsb, width, $"fixed_size_binary:{width}");
+        }
+        else
+        {
+            // Fixed-width primitive (Int*, UInt*, Float, Double, Date/Time/...).
+            (valueBytes, valueEncoding, innerLogical) = BuildPrimitiveFlatLeaf(childArray);
+        }
+
+        // Single chunk only — same constraint as the list writer; multi-chunk
+        // for struct children is a follow-up.
+        var chunk = new PageChunk(0, rows, valueBytes, RepLevels: null, DefLevels: def);
+        var layers = new List<RepDefLayer> { itemLayer, structLayer };
+
+        var page = await BuildAndWritePageAsync(
+            valueEncoding, rows, new[] { chunk }, layers, cancellationToken)
+            .ConfigureAwait(false);
+
+        // Register a single column for this child (the parent already has its
+        // schema field; we only add the child field + its column metadata).
+        var columnEncodingProto = new ColumnEncoding { Values = new Empty() };
+        var columnAny = new Any
+        {
+            TypeUrl = "/lance.encodings.ColumnEncoding",
+            Value = columnEncodingProto.ToByteString(),
+        };
+        var columnEncoding = new Proto.V2.Encoding
+        {
+            Direct = new DirectEncoding { Encoding = columnAny.ToByteString() },
+        };
+        var columnMeta = new ColumnMetadata { Encoding = columnEncoding };
+        columnMeta.Pages.Add(page);
+        _columns.Add(columnMeta);
+
+        var fieldEncoding = valueEncoding.CompressionCase
+                == CompressiveEncoding.CompressionOneofCase.Variable
+            ? Proto.Encoding.VarBinary
+            : Proto.Encoding.Plain;
+        _fields.Add(new Proto.Field
+        {
+            Name = childName,
+            Id = _fields.Count,
+            ParentId = parentId,
+            LogicalType = innerLogical,
+            Nullable = true,
+            Encoding = fieldEncoding,
+        });
+    }
+
+    private static (byte[] ValueBytes, CompressiveEncoding Encoding, string LogicalType)
+        BuildPrimitiveFlatLeaf(IArrowArray array)
+    {
+        var (logicalType, bytesPerValue, valueBytes) = array switch
+        {
+            Int8Array a => ("int8", 1, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt8Array a => ("uint8", 1, a.Values.ToArray()),
+            Int16Array a => ("int16", 2, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt16Array a => ("uint16", 2, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Int32Array a => ("int32", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt32Array a => ("uint32", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Int64Array a => ("int64", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            UInt64Array a => ("uint64", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            FloatArray a => ("float", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            DoubleArray a => ("double", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Date32Array a => ("date32:day", 4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Date64Array a => ("date64:ms", 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Time32Array a => ($"time:{TimeUnitToString(((Time32Type)a.Data.DataType).Unit)}",
+                              4, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            Time64Array a => ($"time:{TimeUnitToString(((Time64Type)a.Data.DataType).Unit)}",
+                              8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            TimestampArray a => (TimestampLogicalType((TimestampType)a.Data.DataType),
+                                 8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            DurationArray a => ($"duration:{TimeUnitToString(((DurationType)a.Data.DataType).Unit)}",
+                                8, MemoryMarshal.AsBytes(a.Values).ToArray()),
+            _ => throw new NotSupportedException(
+                $"LanceFileWriter doesn't yet support struct child of type '{array.GetType().Name}'."),
+        };
+        return (valueBytes, FlatEncoding(bytesPerValue * 8), logicalType);
+    }
+
+    private static (byte[] ValueBytes, CompressiveEncoding Encoding, string LogicalType)
+        BuildFixedLeaf(IArrowArray array, int bytesPerValue, string logicalType)
+    {
+        byte[] bytes = new byte[array.Length * bytesPerValue];
+        array.Data.Buffers[1].Span.Slice(0, array.Length * bytesPerValue).CopyTo(bytes);
+        return (bytes, FlatEncoding(bytesPerValue * 8), logicalType);
+    }
+
+    private static (byte[] ValueBytes, CompressiveEncoding Encoding, string LogicalType)
+        BuildVariableLeafSingleChunk(BinaryArray array, string logicalType)
+    {
+        int rows = array.Length;
+        int totalDataLen = 0;
+        for (int i = 0; i < rows; i++) totalDataLen += array.GetBytes(i).Length;
+        int offsetsBytes = checked((rows + 1) * sizeof(uint));
+        byte[] buf = new byte[offsetsBytes + totalDataLen];
+        uint cursor = (uint)offsetsBytes;
+        BinaryPrimitives.WriteUInt32LittleEndian(buf.AsSpan(0, sizeof(uint)), cursor);
+        for (int i = 0; i < rows; i++)
+        {
+            var rowBytes = array.GetBytes(i);
+            rowBytes.CopyTo(buf.AsSpan((int)cursor));
+            cursor += (uint)rowBytes.Length;
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                buf.AsSpan((i + 1) * sizeof(uint), sizeof(uint)), cursor);
+        }
+        var enc = new CompressiveEncoding
+        {
+            Variable = new Proto.Encodings.V21.Variable
+            {
+                Offsets = new CompressiveEncoding
+                {
+                    Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 32 },
+                },
+            },
+        };
+        return (buf, enc, logicalType);
     }
 
     private async Task WriteListColumnCommonAsync(
