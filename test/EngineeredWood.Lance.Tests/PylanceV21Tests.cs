@@ -208,6 +208,35 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task ConstantLayout_AllNull_Int32()
+    {
+        // Pylance emits ConstantLayout for all-null columns: layers=
+        // [NULLABLE_ITEM], inline_value absent, no rep/def. Every row at
+        // this page is null; no value bytes are stored on disk.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("all_null_int32_v21.lance"));
+        Assert.IsType<Int32Type>(reader.Schema.FieldsList[0].DataType);
+        var arr = (Int32Array)await reader.ReadColumnAsync(0);
+        Assert.Equal(10, arr.Length);
+        Assert.Equal(10, arr.NullCount);
+        for (int i = 0; i < arr.Length; i++)
+            Assert.True(arr.IsNull(i));
+    }
+
+    [Fact]
+    public async Task ConstantLayout_AllNull_String()
+    {
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("all_null_string_v21.lance"));
+        Assert.IsType<StringType>(reader.Schema.FieldsList[0].DataType);
+        var arr = (StringArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(8, arr.Length);
+        Assert.Equal(8, arr.NullCount);
+        for (int i = 0; i < arr.Length; i++)
+            Assert.Null(arr.GetString(i));
+    }
+
+    [Fact]
     public async Task List_Of_String_OolBitpackedRepDef()
     {
         // list<string> 50×30 random 100-char text — pylance picks

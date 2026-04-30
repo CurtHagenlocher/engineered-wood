@@ -136,6 +136,14 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # ConstantLayout — pylance emits this for all-null columns.
+    write_one("all_null_int32_v21",
+              pa.table({"x": pa.array([None] * 10, type=pa.int32())}),
+              version="2.1")
+    write_one("all_null_string_v21",
+              pa.table({"x": pa.array([None] * 8, type=pa.string())}),
+              version="2.1")
+
     # list<string> shape that pushes rep/def from InlineBitpacking onto
     # OutOfLineBitpacking — 50×30 random 100-char strings. Each chunk
     # has fewer than 1024 items, so pylance writes a short packed buffer

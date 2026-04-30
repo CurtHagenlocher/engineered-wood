@@ -26,8 +26,8 @@ internal static class PageLayoutDispatcher
                     layout.MiniBlockLayout, targetType, context);
 
             case PageLayout.LayoutOneofCase.ConstantLayout:
-                throw new NotImplementedException(
-                    "ConstantLayout decoding is not yet supported (Phase 6 carryover; implement when pylance emits it).");
+                return ConstantLayoutDecoder.Decode(
+                    layout.ConstantLayout, numRowsFromPage, targetType);
 
             case PageLayout.LayoutOneofCase.FullZipLayout:
                 return FullZipLayoutDecoder.Decode(
