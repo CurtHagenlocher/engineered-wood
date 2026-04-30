@@ -43,14 +43,20 @@ internal static class FullZipLayoutDecoder
         if (layout.DetailsCase == FullZipLayout.DetailsOneofCase.BitsPerOffset)
             return DecodeVariableWidth(layout, targetType, context);
 
-        if (layout.BitsDef != 0)
+        // Fixed-width path. Nullable rows prepend a 1-byte def marker per
+        // row (0 = valid, 1 = null) when bits_def == 1; per-row total size
+        // is then 1 + bits_per_value/8 bytes. Other bits_def values aren't
+        // emitted by pylance and aren't yet supported.
+        bool hasDef = layout.BitsDef != 0;
+        if (hasDef && layout.BitsDef != 1)
             throw new NotImplementedException(
-                $"FullZipLayout(fixed-width) with bits_def={layout.BitsDef} is not yet supported.");
+                $"FullZipLayout(fixed-width) bits_def={layout.BitsDef} is not yet supported (only 0 or 1).");
 
-        if (layout.Layers.Count != 1 || layout.Layers[0] != RepDefLayer.RepdefAllValidItem)
+        var expectedLayer = hasDef ? RepDefLayer.RepdefNullableItem : RepDefLayer.RepdefAllValidItem;
+        if (layout.Layers.Count != 1 || layout.Layers[0] != expectedLayer)
             throw new NotImplementedException(
-                $"FullZipLayout(fixed-width) with layers other than [ALL_VALID_ITEM] is not yet supported " +
-                $"(got {layout.Layers.Count} layers).");
+                $"FullZipLayout(fixed-width, bits_def={layout.BitsDef}) with layers other than " +
+                $"[{expectedLayer}] is not yet supported (got {layout.Layers.Count} layers).");
 
         if (layout.DetailsCase != FullZipLayout.DetailsOneofCase.BitsPerValue)
             throw new LanceFormatException(
@@ -68,7 +74,9 @@ internal static class FullZipLayoutDecoder
             throw new NotImplementedException(
                 $"FullZipLayout num_items != num_visible_items ({numItems} vs {numVisible}) is not yet supported.");
 
-        long totalBytes = checked(numItems * bytesPerValue);
+        // Per-row size on disk = (1 def byte if hasDef) + bytesPerValue.
+        long bytesPerRow = (hasDef ? 1L : 0L) + bytesPerValue;
+        long totalBytes = checked(numItems * bytesPerRow);
         ReadOnlySpan<byte> payload = context.PageBuffers[0].Span;
         if (payload.Length < totalBytes)
             throw new LanceFormatException(
@@ -77,25 +85,50 @@ internal static class FullZipLayoutDecoder
         CompressiveEncoding valueEnc = layout.ValueCompression
             ?? throw new LanceFormatException("FullZipLayout has no value_compression.");
 
-        // Extract the raw values as a byte array (one-copy). In the future we
-        // could slice directly from the pooled buffer.
-        var valueBytes = payload.Slice(0, (int)totalBytes).ToArray();
+        // Strip per-row def bytes (when present) into a row-validity bitmap
+        // and concatenate the value payloads into one byte array.
+        byte[] valueBytes;
+        byte[]? rowValidity = null;
+        int rowNullCount = 0;
+        if (!hasDef)
+        {
+            valueBytes = payload.Slice(0, (int)totalBytes).ToArray();
+        }
+        else
+        {
+            valueBytes = new byte[checked(numItems * bytesPerValue)];
+            rowValidity = new byte[(numItems + 7) / 8];
+            for (int i = 0; i < numItems; i++)
+            {
+                byte def = payload[(int)(i * bytesPerRow)];
+                if (def == 0)
+                    rowValidity[i >> 3] |= (byte)(1 << (i & 7));
+                else
+                    rowNullCount++;
+                payload.Slice((int)(i * bytesPerRow + 1), (int)bytesPerValue)
+                    .CopyTo(valueBytes.AsSpan((int)(i * bytesPerValue)));
+            }
+        }
 
-        return BuildArray(valueBytes, numItems, bytesPerValue, valueEnc, targetType);
+        return BuildArray(valueBytes, numItems, bytesPerValue, valueEnc, targetType,
+            rowValidity, rowNullCount);
     }
 
     private static IArrowArray BuildArray(
         byte[] valueBytes, int numItems, long bytesPerValue,
-        CompressiveEncoding valueEnc, IArrowType targetType)
+        CompressiveEncoding valueEnc, IArrowType targetType,
+        byte[]? rowValidity, int rowNullCount)
     {
         switch (valueEnc.CompressionCase)
         {
             case CompressiveEncoding.CompressionOneofCase.Flat:
-                return BuildFromFlat(valueBytes, numItems, bytesPerValue, valueEnc.Flat, targetType);
+                return BuildFromFlat(valueBytes, numItems, bytesPerValue, valueEnc.Flat, targetType,
+                    rowValidity, rowNullCount);
 
             case CompressiveEncoding.CompressionOneofCase.FixedSizeList:
                 return BuildFromFixedSizeList(
-                    valueBytes, numItems, bytesPerValue, valueEnc.FixedSizeList, targetType);
+                    valueBytes, numItems, bytesPerValue, valueEnc.FixedSizeList, targetType,
+                    rowValidity, rowNullCount);
 
             default:
                 throw new NotImplementedException(
@@ -105,7 +138,8 @@ internal static class FullZipLayoutDecoder
 
     private static IArrowArray BuildFromFlat(
         byte[] valueBytes, int numItems, long bytesPerValue,
-        Flat flat, IArrowType targetType)
+        Flat flat, IArrowType targetType,
+        byte[]? rowValidity, int rowNullCount)
     {
         if (flat.Data is not null)
             throw new NotImplementedException(
@@ -118,15 +152,17 @@ internal static class FullZipLayoutDecoder
             throw new LanceFormatException(
                 $"FullZipLayout(Flat) cannot target non-fixed-width type {targetType}.");
 
+        ArrowBuffer validity = rowValidity is null ? ArrowBuffer.Empty : new ArrowBuffer(rowValidity);
         var data = new ArrayData(
-            targetType, numItems, nullCount: 0, offset: 0,
-            new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBytes) });
+            targetType, numItems, rowNullCount, offset: 0,
+            new[] { validity, new ArrowBuffer(valueBytes) });
         return ArrowArrayFactory.BuildArray(data);
     }
 
     private static IArrowArray BuildFromFixedSizeList(
         byte[] valueBytes, int numItems, long bytesPerValue,
-        FixedSizeList fsl, IArrowType targetType)
+        FixedSizeList fsl, IArrowType targetType,
+        byte[]? rowValidity, int rowNullCount)
     {
         if (targetType is not FixedSizeListType fslType)
             throw new LanceFormatException(
@@ -136,34 +172,80 @@ internal static class FullZipLayoutDecoder
             throw new LanceFormatException(
                 $"FSL dimension mismatch: schema={fslType.ListSize} vs encoding={fsl.ItemsPerValue}.");
 
-        if (fsl.HasValidity)
-            throw new NotImplementedException(
-                "FullZipLayout(FixedSizeList) with has_validity is not yet supported.");
-
         if (fsl.Values is null
             || fsl.Values.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat)
             throw new NotImplementedException(
                 "FullZipLayout(FixedSizeList) with non-Flat inner values is not yet supported.");
 
         ulong innerBits = fsl.Values.Flat.BitsPerValue;
-        ulong expectedInnerBits = (ulong)bytesPerValue * 8UL / fsl.ItemsPerValue;
-        if (innerBits != expectedInnerBits)
-            throw new LanceFormatException(
-                $"FSL inner bits_per_value={innerBits} != expected {expectedInnerBits} based on outer bits_per_value.");
-
         if (fslType.ValueDataType is not FixedWidthType innerFw || (ulong)innerFw.BitWidth != innerBits)
             throw new LanceFormatException(
                 $"FSL inner Arrow type {fslType.ValueDataType} does not match encoding bits={innerBits}.");
 
-        int totalItems = checked(numItems * (int)fsl.ItemsPerValue);
+        int dim = checked((int)fsl.ItemsPerValue);
+        int innerByteSize = checked((int)(innerBits / 8));
+        int totalItems = checked(numItems * dim);
+        int valueOnlyBytes = totalItems * innerByteSize;
+
+        // Per-row payload layout when has_validity = true:
+        //   [ceil(dim/8) inner-validity bits][dim * innerByteSize value bytes]
+        // When has_validity = false, the row payload is just the value bytes.
+        int innerValidityRowBytes = fsl.HasValidity ? (dim + 7) / 8 : 0;
+        long expectedRowBytes = (long)innerValidityRowBytes + (long)dim * innerByteSize;
+        if (expectedRowBytes != bytesPerValue)
+            throw new LanceFormatException(
+                $"FullZip FSL row size {bytesPerValue} != expected {expectedRowBytes} " +
+                $"({innerValidityRowBytes} inner-validity + {dim * innerByteSize} values).");
+
+        byte[] flatValueBytes;
+        byte[]? innerValidity = null;
+        int innerNullCount = 0;
+        if (!fsl.HasValidity)
+        {
+            flatValueBytes = valueBytes;
+        }
+        else
+        {
+            // Walk each row: split out the inner-validity bits and append
+            // them to a global LSB-first bitmap; copy the value bytes
+            // into a contiguous flat buffer.
+            flatValueBytes = new byte[valueOnlyBytes];
+            innerValidity = new byte[(totalItems + 7) / 8];
+            int valueWritePos = 0;
+            int bitWritePos = 0;
+            for (int row = 0; row < numItems; row++)
+            {
+                int rowStart = row * (int)bytesPerValue;
+                ReadOnlySpan<byte> rowInnerValidity = valueBytes.AsSpan(rowStart, innerValidityRowBytes);
+                ReadOnlySpan<byte> rowValues = valueBytes.AsSpan(
+                    rowStart + innerValidityRowBytes, dim * innerByteSize);
+                for (int j = 0; j < dim; j++)
+                {
+                    bool valid = (rowInnerValidity[j >> 3] & (1 << (j & 7))) != 0;
+                    int outIdx = bitWritePos + j;
+                    if (valid)
+                        innerValidity[outIdx >> 3] |= (byte)(1 << (outIdx & 7));
+                    else
+                        innerNullCount++;
+                }
+                rowValues.CopyTo(flatValueBytes.AsSpan(valueWritePos));
+                valueWritePos += rowValues.Length;
+                bitWritePos += dim;
+            }
+        }
+
+        ArrowBuffer innerValidityBuf = (innerValidity is not null && innerNullCount > 0)
+            ? new ArrowBuffer(innerValidity)
+            : ArrowBuffer.Empty;
         var childData = new ArrayData(
-            fslType.ValueDataType, totalItems, nullCount: 0, offset: 0,
-            new[] { ArrowBuffer.Empty, new ArrowBuffer(valueBytes) });
+            fslType.ValueDataType, totalItems, innerNullCount, offset: 0,
+            new[] { innerValidityBuf, new ArrowBuffer(flatValueBytes) });
         IArrowArray childArray = ArrowArrayFactory.BuildArray(childData);
 
+        ArrowBuffer rowValidityBuf = rowValidity is null ? ArrowBuffer.Empty : new ArrowBuffer(rowValidity);
         var fslData = new ArrayData(
-            fslType, numItems, nullCount: 0, offset: 0,
-            new[] { ArrowBuffer.Empty },
+            fslType, numItems, rowNullCount, offset: 0,
+            new[] { rowValidityBuf },
             children: new[] { childArray.Data });
         return new FixedSizeListArray(fslData);
     }

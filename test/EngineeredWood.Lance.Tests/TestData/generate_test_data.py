@@ -136,6 +136,16 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # FixedSizeList<float32, 1024> nullable — large embeddings with row
+    # nulls trigger pylance's FullZipLayout with bits_def=1 + has_validity.
+    _embed_dim = 1024
+    write_one("nullable_embeddings_v21",
+              pa.table({"emb": pa.array(
+                  [[float(j) for j in range(_embed_dim)] if i % 2 == 0 else None
+                   for i in range(5)],
+                  type=pa.list_(pa.float32(), list_size=_embed_dim))}),
+              version="2.1")
+
     # list<FixedSizeList<float32, 3>> with inner nulls — exercises the
     # has_validity=true + num_buffers=2 path on the FSL nested-leaf
     # decoder. Inner None positions become per-item validity bits.

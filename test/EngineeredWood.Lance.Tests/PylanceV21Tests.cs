@@ -281,6 +281,38 @@ public class PylanceV21Tests
         Assert.Equal(10f * 1024 - 1, values.GetValue(10 * 1024 - 1));
     }
 
+    [Fact]
+    public async Task FullZip_NullableEmbeddings_Float32_x1024()
+    {
+        // 5 rows × 1024 float32, alternating valid/null: pylance encodes
+        // this as FullZipLayout with bits_def=1 (1 def-byte per row) and
+        // FSL has_validity=true (per-row inner-validity bitmap, all-1s
+        // for valid rows). Exercises the row-validity stripping path
+        // plus the FSL inner-validity bitmap concat.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("nullable_embeddings_v21.lance"));
+        var fslType = Assert.IsType<FixedSizeListType>(reader.Schema.FieldsList[0].DataType);
+        Assert.Equal(1024, fslType.ListSize);
+
+        var fsl = (FixedSizeListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(5, fsl.Length);
+        Assert.Equal(2, fsl.NullCount);
+        Assert.False(fsl.IsNull(0));
+        Assert.True(fsl.IsNull(1));
+        Assert.False(fsl.IsNull(2));
+        Assert.True(fsl.IsNull(3));
+        Assert.False(fsl.IsNull(4));
+
+        var values = (FloatArray)fsl.Values;
+        Assert.Equal(5 * 1024, values.Length);
+        // Row 0: floats 0..1023, row 2: floats 0..1023, row 4: floats 0..1023.
+        Assert.Equal(0f, values.GetValue(0));
+        Assert.Equal(1023f, values.GetValue(1023));
+        Assert.Equal(0f, values.GetValue(2 * 1024));
+        Assert.Equal(1023f, values.GetValue(2 * 1024 + 1023));
+        Assert.Equal(0f, values.GetValue(4 * 1024));
+    }
+
     // --- Phase 9: Fastlanes InlineBitpacking ---
 
     [Fact]
