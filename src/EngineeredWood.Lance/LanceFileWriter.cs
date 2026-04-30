@@ -544,29 +544,37 @@ public sealed class LanceFileWriter : IAsyncDisposable
             _ => throw new InvalidOperationException(
                 $"Unexpected list type {listType.GetType().Name}."),
         };
-        if (innerType is not Apache.Arrow.Types.FixedWidthType innerFw)
-            throw new NotSupportedException(
-                $"LanceFileWriter only supports List<fixed-width primitive> initially " +
-                $"(got inner {innerType}).");
 
-        string innerLogical = innerFw switch
-        {
-            Apache.Arrow.Types.Int8Type => "int8",
-            Apache.Arrow.Types.UInt8Type => "uint8",
-            Apache.Arrow.Types.Int16Type => "int16",
-            Apache.Arrow.Types.UInt16Type => "uint16",
-            Apache.Arrow.Types.Int32Type => "int32",
-            Apache.Arrow.Types.UInt32Type => "uint32",
-            Apache.Arrow.Types.Int64Type => "int64",
-            Apache.Arrow.Types.UInt64Type => "uint64",
-            Apache.Arrow.Types.FloatType => "float",
-            Apache.Arrow.Types.DoubleType => "double",
-            _ => throw new NotSupportedException(
-                $"List inner type {innerFw} is not yet supported by the writer."),
-        };
+        // Decide value encoding from inner type. Fixed-width primitive →
+        // Flat(N); string/binary → Variable with Flat(u32) offsets.
+        bool isVariableInner = innerType is StringType or BinaryType;
+        Apache.Arrow.Types.FixedWidthType? innerFw =
+            innerType as Apache.Arrow.Types.FixedWidthType;
+        if (!isVariableInner && innerFw is null)
+            throw new NotSupportedException(
+                $"LanceFileWriter doesn't yet support List<{innerType}> " +
+                "(only fixed-width primitives, strings, and binary).");
+
+        string innerLogical = isVariableInner
+            ? (innerType is StringType ? "string" : "binary")
+            : innerFw! switch
+            {
+                Apache.Arrow.Types.Int8Type => "int8",
+                Apache.Arrow.Types.UInt8Type => "uint8",
+                Apache.Arrow.Types.Int16Type => "int16",
+                Apache.Arrow.Types.UInt16Type => "uint16",
+                Apache.Arrow.Types.Int32Type => "int32",
+                Apache.Arrow.Types.UInt32Type => "uint32",
+                Apache.Arrow.Types.Int64Type => "int64",
+                Apache.Arrow.Types.UInt64Type => "uint64",
+                Apache.Arrow.Types.FloatType => "float",
+                Apache.Arrow.Types.DoubleType => "double",
+                _ => throw new NotSupportedException(
+                    $"List inner type {innerFw} is not yet supported by the writer."),
+            };
 
         int outerRows = outerLength;
-        int innerBytesPerItem = innerFw.BitWidth / 8;
+        int innerBytesPerItem = isVariableInner ? 0 : innerFw!.BitWidth / 8;
 
         // Detect null/empty content so we pick the minimal layer combination.
         // pylance and lance-rs's reader both happily accept e.g.
@@ -674,28 +682,82 @@ public sealed class LanceFileWriter : IAsyncDisposable
             }
         }
 
-        // Concatenate the inner value bytes for the visible items only.
-        // The inner array is the full inner slice; visible bytes start at
-        // outerOffsets[i] for each non-null/non-empty row.
-        int valueBytesLen = checked(visibleItems * innerBytesPerItem);
-        var valueBytes = new byte[valueBytesLen];
-        if (visibleItems > 0)
+        // Build the chunk's value buffer. For fixed-width inner: pack bytes
+        // contiguously. For string/binary inner: build a Variable-encoded
+        // buffer = (visibleItems+1) × u32 absolute offsets, then concatenated
+        // string bytes; offsets[0] = (visibleItems+1)*4 (start of data).
+        byte[] valueBytes;
+        CompressiveEncoding valueEncoding;
+        if (isVariableInner)
         {
-            var innerValuesBuf = innerValues.Data.Buffers[1];
-            int outBytes = 0;
+            var binArr = (BinaryArray)innerValues;
+            int totalDataLen = 0;
             for (int i = 0; i < outerRows; i++)
             {
                 bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
                 if (isNull) continue;
                 int start = outerOffsets[i];
                 int end = outerOffsets[i + 1];
-                int rowLen = end - start;
-                if (rowLen == 0) continue;
-                int byteCount = rowLen * innerBytesPerItem;
-                innerValuesBuf.Span.Slice(start * innerBytesPerItem, byteCount)
-                    .CopyTo(valueBytes.AsSpan(outBytes, byteCount));
-                outBytes += byteCount;
+                for (int k = start; k < end; k++)
+                    totalDataLen += binArr.GetBytes(k).Length;
             }
+            int offsetsBytesLen = checked((visibleItems + 1) * sizeof(uint));
+            valueBytes = new byte[offsetsBytesLen + totalDataLen];
+            uint dataCursor = (uint)offsetsBytesLen;
+            BinaryPrimitives.WriteUInt32LittleEndian(
+                valueBytes.AsSpan(0, sizeof(uint)), dataCursor);
+            int visIdx = 0;
+            for (int i = 0; i < outerRows; i++)
+            {
+                bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+                if (isNull) continue;
+                int start = outerOffsets[i];
+                int end = outerOffsets[i + 1];
+                for (int k = start; k < end; k++)
+                {
+                    var rowBytes = binArr.GetBytes(k);
+                    rowBytes.CopyTo(valueBytes.AsSpan((int)dataCursor));
+                    dataCursor += (uint)rowBytes.Length;
+                    visIdx++;
+                    BinaryPrimitives.WriteUInt32LittleEndian(
+                        valueBytes.AsSpan(visIdx * sizeof(uint), sizeof(uint)),
+                        dataCursor);
+                }
+            }
+            valueEncoding = new CompressiveEncoding
+            {
+                Variable = new Proto.Encodings.V21.Variable
+                {
+                    Offsets = new CompressiveEncoding
+                    {
+                        Flat = new Proto.Encodings.V21.Flat { BitsPerValue = 32 },
+                    },
+                },
+            };
+        }
+        else
+        {
+            int valueBytesLen = checked(visibleItems * innerBytesPerItem);
+            valueBytes = new byte[valueBytesLen];
+            if (visibleItems > 0)
+            {
+                var innerValuesBuf = innerValues.Data.Buffers[1];
+                int outBytes = 0;
+                for (int i = 0; i < outerRows; i++)
+                {
+                    bool isNull = anyNull && (outerValidity![i >> 3] & (1 << (i & 7))) == 0;
+                    if (isNull) continue;
+                    int start = outerOffsets[i];
+                    int end = outerOffsets[i + 1];
+                    int rowLen = end - start;
+                    if (rowLen == 0) continue;
+                    int byteCount = rowLen * innerBytesPerItem;
+                    innerValuesBuf.Span.Slice(start * innerBytesPerItem, byteCount)
+                        .CopyTo(valueBytes.AsSpan(outBytes, byteCount));
+                    outBytes += byteCount;
+                }
+            }
+            valueEncoding = FlatEncoding(innerBytesPerItem * 8);
         }
 
         // Single-chunk only for now. Multi-chunk lists need to split the
@@ -707,7 +769,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         int chunkTotalBytes = AlignUp(
             AlignUp(2 + 2 + (hasDef ? 2 : 0) + 2, MiniBlockAlignment)
                 + repPadded + defPadded
-                + AlignUp(valueBytesLen, MiniBlockAlignment),
+                + AlignUp(valueBytes.Length, MiniBlockAlignment),
             MiniBlockAlignment);
         if (chunkTotalBytes > MaxChunkBytes)
             throw new NotSupportedException(
@@ -716,7 +778,6 @@ public sealed class LanceFileWriter : IAsyncDisposable
 
         var chunk = new PageChunk(0, visibleItems, valueBytes,
             RepLevels: rep, DefLevels: def);
-        var valueEncoding = FlatEncoding(innerBytesPerItem * 8);
         var layers = new List<RepDefLayer> { itemLayer, listLayer };
 
         ThrowIfFinalized();

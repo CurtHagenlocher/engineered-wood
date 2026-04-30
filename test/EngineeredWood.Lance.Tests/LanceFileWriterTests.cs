@@ -1197,6 +1197,102 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task ListString_RoundTrip_ViaOurReader()
+    {
+        // List<string> with a mix of valid, null, and empty list rows; one
+        // inner element is null too (NULLABLE_ITEM cascade combined with
+        // NULL_AND_EMPTY_LIST). Variable encoding for the leaf carries
+        // (visibleItems+1) u32 offsets + concatenated UTF-8 bytes.
+        string?[][] rows = {
+            new string?[] { "alpha", "beta" },
+            System.Array.Empty<string?>(),       // empty
+            new string?[] { "gamma", null, "delta" },
+            null!,                               // null list
+            new string?[] { "epsilon" },
+        };
+        bool[] outerNullMask = { true, true, true, false, true };
+
+        var inner = new StringArray.Builder();
+        var offsets = new List<int> { 0 };
+        int innerCount = 0;
+        for (int i = 0; i < rows.Length; i++)
+        {
+            if (!outerNullMask[i])
+            {
+                offsets.Add(innerCount);
+                continue;
+            }
+            for (int j = 0; j < rows[i].Length; j++)
+            {
+                if (rows[i][j] is null) inner.AppendNull();
+                else inner.Append(rows[i][j]!);
+                innerCount++;
+            }
+            offsets.Add(innerCount);
+        }
+        var innerArr = inner.Build();
+
+        var offsetsBytes = new byte[offsets.Count * sizeof(int)];
+        for (int i = 0; i < offsets.Count; i++)
+            System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(
+                offsetsBytes.AsSpan(i * 4, 4), offsets[i]);
+        var outerValidity = new byte[(outerNullMask.Length + 7) / 8];
+        int outerNullCount = 0;
+        for (int i = 0; i < outerNullMask.Length; i++)
+        {
+            if (outerNullMask[i]) outerValidity[i >> 3] |= (byte)(1 << (i & 7));
+            else outerNullCount++;
+        }
+
+        var listType = new ListType(new Field("item", StringType.Default, nullable: true));
+        var listData = new ArrayData(
+            listType, outerNullMask.Length, outerNullCount, 0,
+            new[] { new ArrowBuffer(outerValidity), new ArrowBuffer(offsetsBytes) },
+            children: new[] { innerArr.Data });
+        var listArr = new ListArray(listData);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-listsstr-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("words", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(5, read.Length);
+            Assert.Equal(1, read.NullCount);
+            Assert.True(read.IsNull(3));
+            Assert.False(read.IsNull(0));
+            Assert.False(read.IsNull(1));
+            Assert.False(read.IsNull(2));
+            Assert.False(read.IsNull(4));
+            Assert.Equal(0, read.ValueOffsets[0]);
+            Assert.Equal(2, read.ValueOffsets[1]);  // alpha, beta
+            Assert.Equal(2, read.ValueOffsets[2]);  // empty
+            Assert.Equal(5, read.ValueOffsets[3]);  // gamma, null, delta
+            Assert.Equal(5, read.ValueOffsets[4]);  // null list (no items)
+            Assert.Equal(6, read.ValueOffsets[5]);  // epsilon
+
+            var readInner = (StringArray)read.Values;
+            Assert.Equal(6, readInner.Length);
+            Assert.Equal(1, readInner.NullCount);
+            Assert.Equal("alpha", readInner.GetString(0));
+            Assert.Equal("beta", readInner.GetString(1));
+            Assert.Equal("gamma", readInner.GetString(2));
+            Assert.Null(readInner.GetString(3));
+            Assert.Equal("delta", readInner.GetString(4));
+            Assert.Equal("epsilon", readInner.GetString(5));
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task LargeListInt64_AllValid_RoundTrip_ViaOurReader()
     {
         // LargeList<int64> with 3 non-null/non-empty rows. Schema's parent
