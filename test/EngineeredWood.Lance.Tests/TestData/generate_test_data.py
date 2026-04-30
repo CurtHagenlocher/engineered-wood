@@ -136,6 +136,32 @@ def main() -> None:
               pa.table({"xs": pa.array([[1, 2], None, [3, 4]],
                                         type=pa.list_(pa.int32()))}),
               version="2.1")
+    # list<string> with FSST in MiniBlock — pylance picks FSST when there
+    # is enough text to build a useful symbol table. 20×30 random
+    # 100-char strings hits this while keeping rep/def encoded as
+    # InlineBitpacking (a 50×30 shape would push them to
+    # OutOfLineBitpacking with shorter-than-128-byte packed buffers,
+    # which is a separate reader gap).
+    import random as _r3
+    _r3.seed(5)
+    _fsst_mb_data = [
+        [''.join(chr(_r3.randint(97, 122)) for _ in range(100)) for _ in range(30)]
+        for _ in range(20)
+    ]
+    write_one("list_string_fsst_v21",
+              pa.table({"x": pa.array(_fsst_mb_data, type=pa.list_(pa.string()))}),
+              version="2.1")
+
+    # list<long-string> with FSST in FullZip — repeats in 5000-char strings
+    # are dense enough for pylance to pick FSST as the inner encoding.
+    _r4 = _r3
+    _fsst_fz_long = [''.join(chr(_r4.randint(97, 122)) for _ in range(5000)) for _ in range(10)]
+    write_one("list_long_string_fsst_v21",
+              pa.table({"x": pa.array(
+                  [_fsst_fz_long[0:5], [], None, _fsst_fz_long[5:10]],
+                  type=pa.list_(pa.string()))}),
+              version="2.1")
+
     # list<medium-string> — strings long enough that pylance picks
     # FullZipLayout with bits_per_offset=32 and plain Variable value
     # compression (not FSST). Each visible item = 4-byte length prefix +

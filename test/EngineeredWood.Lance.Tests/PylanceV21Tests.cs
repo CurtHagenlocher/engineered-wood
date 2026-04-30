@@ -208,6 +208,66 @@ public class PylanceV21Tests
     }
 
     [Fact]
+    public async Task List_Of_String_FsstMiniBlock()
+    {
+        // list<string> with FSST in MiniBlock cascade — 20 outer rows ×
+        // 30 strings × 100 chars random text. FSST symbol table covers
+        // all rows; the cascade walker accumulates per-row FSST-
+        // compressed slices across chunks and bulk-decompresses at the
+        // end. Rep/def stay on InlineBitpacking (vs OutOfLineBitpacking,
+        // which is a separate gap).
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_string_fsst_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(20, outer.Length);
+        Assert.Equal(0, outer.NullCount);
+
+        // Each outer row is 30 inner items; total = 600 leaf strings.
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(30, outer.ValueOffsets[1]);
+        Assert.Equal(600, outer.ValueOffsets[20]);
+
+        var leaf = (StringArray)outer.Values;
+        Assert.Equal(600, leaf.Length);
+        for (int i = 0; i < leaf.Length; i += 50)
+            Assert.Equal(100, leaf.GetString(i)!.Length);
+        Assert.NotEqual(leaf.GetString(0), leaf.GetString(1));
+        Assert.NotEqual(leaf.GetString(0), leaf.GetString(599));
+    }
+
+    [Fact]
+    public async Task FullZip_ListOfLongString_Fsst()
+    {
+        // list<long-string> with FSST in FullZip — 10 strings × 5000 chars
+        // random text. pylance picks FullZip + Fsst inner; the cascade
+        // walker FSST-decompresses each visible row's payload after
+        // walking the ctrl words.
+        await using var reader = await LanceFileReader.OpenAsync(
+            TestDataPath.Resolve("list_long_string_fsst_v21.lance"));
+        var outer = (ListArray)await reader.ReadColumnAsync(0);
+        Assert.Equal(4, outer.Length);
+        Assert.Equal(1, outer.NullCount);
+        Assert.True(outer.IsNull(2));
+        Assert.False(outer.IsNull(1));
+
+        Assert.Equal(0, outer.ValueOffsets[0]);
+        Assert.Equal(5, outer.ValueOffsets[1]);
+        Assert.Equal(5, outer.ValueOffsets[2]);
+        Assert.Equal(5, outer.ValueOffsets[3]);
+        Assert.Equal(10, outer.ValueOffsets[4]);
+
+        var leaf = (StringArray)outer.Values;
+        Assert.Equal(10, leaf.Length);
+        for (int i = 0; i < 10; i++)
+            Assert.Equal(5000, leaf.GetString(i)!.Length);
+        // Random data → distinct first chars across most rows.
+        var firsts = new HashSet<char>();
+        for (int i = 0; i < 10; i++) firsts.Add(leaf.GetString(i)![0]);
+        Assert.True(firsts.Count >= 4,
+            $"Expected diverse first chars across 10 rows, got: {firsts.Count} distinct");
+    }
+
+    [Fact]
     public async Task FullZip_ListOfMediumString_Variable()
     {
         // list<medium-string> — pylance picks FullZipLayout with

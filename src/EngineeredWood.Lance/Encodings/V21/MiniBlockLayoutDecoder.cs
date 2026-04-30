@@ -626,16 +626,19 @@ internal static class MiniBlockLayoutDecoder
 
         // Variable-width path (string/binary leaf inside a list/struct).
         // Each chunk's value buffer is (chunkVisible+1) u32 offsets +
-        // concatenated data bytes; we accumulate into page-level offsets[]
-        // and a flat data byte buffer, then return them alongside the
-        // rep/def streams for the cascade walker. valueBytes is unused on
-        // this path.
+        // concatenated data bytes (raw for Variable, FSST-compressed for
+        // Fsst); we accumulate into page-level offsets[] + data buffer,
+        // then return alongside rep/def for the cascade walker. valueBytes
+        // is unused on this path.
         bool isVariable = valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.Variable;
-        if (isVariable && childType is not (StringType or BinaryType))
+        bool isFsst = valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.Fsst;
+        if ((isVariable || isFsst) && childType is not (StringType or BinaryType))
             throw new NotImplementedException(
-                $"Nested-leaf Variable encoding is only supported for String/Binary leaves (got {childType}).");
+                $"Nested-leaf {valueEnc.CompressionCase} encoding is only supported for String/Binary leaves (got {childType}).");
         if (isVariable)
             return DecodeNestedLeafChunkVariable(layout, valueEnc, context);
+        if (isFsst)
+            return DecodeNestedLeafChunkFsst(layout, valueEnc, context);
 
         // FSL with has_validity=true adds an extra inner-validity bitmap
         // buffer per chunk and bumps num_buffers from 1 to 2. The chunk
@@ -949,6 +952,175 @@ internal static class MiniBlockLayoutDecoder
 
         return (System.Array.Empty<byte>(), rep, def, /*innerValidity*/ null, /*innerNullCount*/ 0,
             /*ValueBytesPerItem*/ 0, visibleItems, globalOffsets, data);
+    }
+
+    /// <summary>
+    /// FSST branch of <see cref="DecodeNestedLeafChunk"/>: the value
+    /// buffer in each chunk is FSST-compressed via an inner
+    /// <see cref="Variable"/>(Flat u32 offsets) layout. Walks every chunk
+    /// to extract per-row compressed slices into a single accumulator,
+    /// then bulk FSST-decompresses to produce the page-level
+    /// (offsets, data) pair the cascade walker expects.
+    /// </summary>
+    private static (byte[] ValueBytes, ushort[]? Rep, ushort[]? Def, byte[]? InnerValidity, int InnerNullCount, int ValueBytesPerItem, int VisibleItems, int[]? VarOffsets, byte[]? VarData)
+        DecodeNestedLeafChunkFsst(MiniBlockLayout layout, CompressiveEncoding valueEnc, in PageContext context)
+    {
+        Fsst fsst = valueEnc.Fsst;
+        if (fsst.SymbolTable is null || fsst.SymbolTable.Length == 0)
+            throw new LanceFormatException("Fsst encoding has no symbol_table.");
+        if (fsst.Values is null
+            || fsst.Values.CompressionCase != CompressiveEncoding.CompressionOneofCase.Variable)
+            throw new NotImplementedException(
+                $"Fsst inner encoding '{fsst.Values?.CompressionCase}' is not yet supported (only Variable).");
+        Variable variable = fsst.Values.Variable;
+        if (variable.Values is not null)
+            throw new NotImplementedException(
+                "Fsst Variable.values BufferCompression is not yet supported.");
+        if (variable.Offsets is null
+            || variable.Offsets.CompressionCase != CompressiveEncoding.CompressionOneofCase.Flat
+            || variable.Offsets.Flat.BitsPerValue != 32)
+            throw new NotImplementedException(
+                "Fsst Variable currently requires Flat(u32) offsets.");
+
+        if (layout.NumBuffers != 1)
+            throw new NotImplementedException(
+                $"Nested-leaf Fsst MiniBlockLayout num_buffers={layout.NumBuffers} is not supported.");
+
+        bool hasRep = layout.RepCompression is not null;
+        bool hasDef = layout.DefCompression is not null;
+        long numItems = checked((long)layout.NumItems);
+        bool hasLargeChunk = layout.HasLargeChunk;
+
+        ReadOnlySpan<byte> chunkMeta = context.PageBuffers[0].Span;
+        ReadOnlySpan<byte> chunkData = context.PageBuffers[1].Span;
+        var chunks = ParseChunkMetadata(chunkMeta, hasLargeChunk, numItems);
+
+        int visibleItems = checked((int)numItems);
+
+        int totalLevels = 0;
+        if (hasRep || hasDef)
+        {
+            long byteCursor = 0;
+            foreach (MiniChunk c in chunks)
+            {
+                int n = BinaryPrimitives.ReadUInt16LittleEndian(
+                    chunkData.Slice((int)byteCursor, 2));
+                totalLevels = checked(totalLevels + n);
+                byteCursor += (long)c.SizeBytes;
+            }
+        }
+        ushort[]? rep = hasRep ? new ushort[totalLevels] : null;
+        ushort[]? def = hasDef ? new ushort[totalLevels] : null;
+
+        Clast.Fsst.FsstDecoder fsstDecoder = BuildLanceFsstDecoder(fsst.SymbolTable.Span);
+        var compressedAccum = new EngineeredWood.Buffers.GrowableBuffer(64 * 1024);
+        var compressedLengths = new int[visibleItems];
+        long globalChunkByteOffset = 0;
+        int rowCursor = 0;
+        int levelWritePos = 0;
+
+        foreach (MiniChunk chunk in chunks)
+        {
+            int chunkVisible = checked((int)chunk.NumValues);
+            ReadOnlySpan<byte> chunkBytes = chunkData.Slice(
+                (int)globalChunkByteOffset, (int)chunk.SizeBytes);
+
+            int cursor = 0;
+            int numLevels = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += 2;
+            int repSize = 0;
+            if (hasRep)
+            {
+                repSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += 2;
+            }
+            int defSize = 0;
+            if (hasDef)
+            {
+                defSize = BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+                cursor += 2;
+            }
+            int valueBufSize = hasLargeChunk
+                ? (int)BinaryPrimitives.ReadUInt32LittleEndian(chunkBytes.Slice(cursor, 4))
+                : BinaryPrimitives.ReadUInt16LittleEndian(chunkBytes.Slice(cursor, 2));
+            cursor += hasLargeChunk ? 4 : 2;
+            cursor = AlignUp(cursor, MiniBlockAlignment);
+
+            if (hasRep)
+            {
+                ushort[] chunkRep = ReadDefChunkBuffer(
+                    chunkBytes.Slice(cursor, repSize), numLevels, layout.RepCompression!);
+                chunkRep.AsSpan().CopyTo(rep.AsSpan(levelWritePos, numLevels));
+                cursor += repSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+            if (hasDef)
+            {
+                ushort[] chunkDef = ReadDefChunkBuffer(
+                    chunkBytes.Slice(cursor, defSize), numLevels, layout.DefCompression!);
+                chunkDef.AsSpan().CopyTo(def.AsSpan(levelWritePos, numLevels));
+                cursor += defSize;
+                cursor = AlignUp(cursor, MiniBlockAlignment);
+            }
+
+            // Value buffer = (chunkVisible+1) × u32 offsets + FSST-compressed data.
+            ReadOnlySpan<byte> valueBuf = chunkBytes.Slice(cursor, valueBufSize);
+            int offsetsBytes = checked((chunkVisible + 1) * 4);
+            if (valueBuf.Length < offsetsBytes)
+                throw new LanceFormatException(
+                    $"Fsst nested-leaf chunk value buffer too small: need {offsetsBytes} offset bytes, have {valueBuf.Length}.");
+
+            uint baseOffset = BinaryPrimitives.ReadUInt32LittleEndian(valueBuf.Slice(0, 4));
+            uint prevAbs = baseOffset;
+            for (int i = 0; i < chunkVisible; i++)
+            {
+                uint nextAbs = BinaryPrimitives.ReadUInt32LittleEndian(valueBuf.Slice((i + 1) * 4, 4));
+                if (nextAbs < prevAbs)
+                    throw new LanceFormatException(
+                        $"Fsst Variable offsets not monotonic at chunk index {i} ({nextAbs} < {prevAbs}).");
+                int rowLen = checked((int)(nextAbs - prevAbs));
+                int rowStart = checked((int)(prevAbs - baseOffset)) + offsetsBytes;
+                if (rowStart + rowLen > valueBuf.Length)
+                    throw new LanceFormatException(
+                        $"Fsst Variable row {i} extends past chunk data section.");
+                compressedAccum.Write(valueBuf.Slice(rowStart, rowLen));
+                compressedLengths[rowCursor + i] = rowLen;
+                prevAbs = nextAbs;
+            }
+
+            rowCursor += chunkVisible;
+            levelWritePos += numLevels;
+            globalChunkByteOffset += (long)chunk.SizeBytes;
+        }
+
+        // Bulk FSST decompress to produce the Arrow data + offsets.
+        ReadOnlySpan<byte> compressedAll = compressedAccum.WrittenSpan;
+        int destCap = Clast.Fsst.FsstDecoder.MaxDecompressedLength(compressedAll.Length);
+        byte[] destination = new byte[destCap];
+        int[] destinationOffsets = new int[visibleItems + 1];
+        if (!fsstDecoder.TryDecompressBatch(
+                compressedAll, compressedLengths,
+                destination, destinationOffsets,
+                out int totalWritten))
+        {
+            throw new LanceFormatException(
+                $"FSST cascade batch decompress failed (compressedBytes={compressedAll.Length}, " +
+                $"destCap={destCap}, rows={visibleItems}).");
+        }
+
+        byte[] arrowData;
+        if (totalWritten == destination.Length)
+        {
+            arrowData = destination;
+        }
+        else
+        {
+            arrowData = new byte[totalWritten];
+            destination.AsSpan(0, totalWritten).CopyTo(arrowData);
+        }
+
+        return (System.Array.Empty<byte>(), rep, def, /*innerValidity*/ null, /*innerNullCount*/ 0,
+            /*ValueBytesPerItem*/ 0, visibleItems, destinationOffsets, arrowData);
     }
 
     /// <summary>
@@ -1645,7 +1817,7 @@ internal static class MiniBlockLayoutDecoder
     /// in row 5's compressed bytes ahead of literal characters that aren't
     /// in any symbol).</para>
     /// </summary>
-    private static Clast.Fsst.FsstDecoder BuildLanceFsstDecoder(ReadOnlySpan<byte> symbolTable)
+    internal static Clast.Fsst.FsstDecoder BuildLanceFsstDecoder(ReadOnlySpan<byte> symbolTable)
     {
         const int LanceHeaderBytes = 8;
         const int BytesPerSymbolSlot = 8;

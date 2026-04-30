@@ -228,12 +228,15 @@ internal static class FullZipLayoutDecoder
         if (leafType is not (StringType or BinaryType))
             throw new NotImplementedException(
                 $"FullZipLayout(variable-width) cascade is only supported for String/Binary leaves (got {leafType}).");
-        if (valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.Fsst)
-            throw new NotImplementedException(
-                "FullZipLayout(variable-width, FSST-compressed) inside a cascade is not yet supported.");
-        if (valueEnc.CompressionCase != CompressiveEncoding.CompressionOneofCase.Variable)
+
+        bool isFsst = valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.Fsst;
+        bool isVariable = valueEnc.CompressionCase == CompressiveEncoding.CompressionOneofCase.Variable;
+        if (!isVariable && !isFsst)
             throw new NotImplementedException(
                 $"FullZipLayout(variable-width) value_compression '{valueEnc.CompressionCase}' is not supported.");
+        Fsst? fsstEnc = isFsst ? valueEnc.Fsst : null;
+        if (isFsst && (fsstEnc!.SymbolTable is null || fsstEnc.SymbolTable.Length == 0))
+            throw new LanceFormatException("FullZip Fsst encoding has no symbol_table.");
 
         ulong bitsPerOffset = layout.BitsPerOffset;
         if (bitsPerOffset != 32)
@@ -317,30 +320,68 @@ internal static class FullZipLayoutDecoder
             throw new LanceFormatException(
                 $"FullZipLayout(variable-width) walked {visibleSeen} visible items but layout declared {numVisible}.");
 
-        // Second pass: copy payloads into a contiguous data buffer.
-        byte[] data = new byte[checked((int)totalDataLen)];
+        // Second pass: copy payloads into a contiguous data buffer. For
+        // plain Variable that buffer IS the Arrow data. For FSST we
+        // accumulate compressed bytes here and bulk-decompress below.
+        byte[] dataOrCompressed = new byte[checked((int)totalDataLen)];
+        var compressedLengths = isFsst ? new int[numVisible] : null;
         byteCursor = 0;
         int writePos = 0;
+        int visibleIdx = 0;
         for (int i = 0; i < numItems; i++)
         {
             byteCursor += ctrlBytes;
-            ushort defVal = (ushort)(rep is null
-                ? (def![i])
-                : (def![i]));
+            ushort defVal = def![i];
             bool visible = defVal <= maxVisibleDef;
             if (visible)
             {
                 uint length = BinaryPrimitives.ReadUInt32LittleEndian(page.Slice(byteCursor, 4));
                 byteCursor += bytesPerLength;
-                page.Slice(byteCursor, (int)length).CopyTo(data.AsSpan(writePos));
+                page.Slice(byteCursor, (int)length).CopyTo(dataOrCompressed.AsSpan(writePos));
                 byteCursor += (int)length;
                 writePos += (int)length;
+                if (isFsst) compressedLengths![visibleIdx] = (int)length;
+                visibleIdx++;
             }
         }
 
+        if (!isFsst)
+        {
+            return (System.Array.Empty<byte>(), rep, def, /*innerValidity*/ null,
+                /*innerNullCount*/ 0, /*ValueBytesPerItem*/ 0, numVisible, offsets, dataOrCompressed);
+        }
+
+        // FSST batch decompress (shared symbol-table parser with the
+        // MiniBlock cascade FSST path).
+        Clast.Fsst.FsstDecoder fsstDecoder = MiniBlockLayoutDecoder.BuildLanceFsstDecoder(fsstEnc!.SymbolTable.Span);
+        int destCap = Clast.Fsst.FsstDecoder.MaxDecompressedLength(dataOrCompressed.Length);
+        byte[] destination = new byte[destCap];
+        int[] destinationOffsets = new int[numVisible + 1];
+        if (!fsstDecoder.TryDecompressBatch(
+                dataOrCompressed, compressedLengths!,
+                destination, destinationOffsets,
+                out int totalWritten))
+        {
+            throw new LanceFormatException(
+                $"FullZip FSST cascade batch decompress failed " +
+                $"(compressedBytes={dataOrCompressed.Length}, destCap={destCap}, rows={numVisible}).");
+        }
+
+        byte[] arrowData;
+        if (totalWritten == destination.Length)
+        {
+            arrowData = destination;
+        }
+        else
+        {
+            arrowData = new byte[totalWritten];
+            destination.AsSpan(0, totalWritten).CopyTo(arrowData);
+        }
+
         return (System.Array.Empty<byte>(), rep, def, /*innerValidity*/ null,
-            /*innerNullCount*/ 0, /*ValueBytesPerItem*/ 0, numVisible, offsets, data);
+            /*innerNullCount*/ 0, /*ValueBytesPerItem*/ 0, numVisible, destinationOffsets, arrowData);
     }
+
 
     private static int ResolveFslInnerByteSize(FixedSizeList fslEnc, FixedSizeListType fslType)
     {
