@@ -478,6 +478,138 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         await _currentFileWriter.DisposeAsync().ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Removes data files, manifest files, and transaction files no longer
+    /// referenced by any retained version of the dataset at
+    /// <paramref name="datasetPath"/>. Use to free disk space after
+    /// overwrite operations or once historical versions are no longer
+    /// needed.
+    ///
+    /// <para><b>Retention</b>: <see cref="LanceVacuumOptions.RetainVersions"/>
+    /// (default 1) keeps the N most recent manifest versions and every
+    /// data / transaction file they reference. Older versions and any
+    /// files referenced only by them become candidates for deletion.
+    /// Setting <see cref="LanceVacuumOptions.DryRun"/> = true reports
+    /// what would be deleted without actually deleting anything.</para>
+    ///
+    /// <para>This is a one-shot maintenance operation; it does not
+    /// coordinate with concurrent writers and assumes exclusive access
+    /// to the dataset directory while it runs.</para>
+    /// </summary>
+    public static async ValueTask<LanceVacuumResult> VacuumAsync(
+        string datasetPath, LanceVacuumOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (datasetPath is null) throw new ArgumentNullException(nameof(datasetPath));
+        options ??= new LanceVacuumOptions();
+        if (options.RetainVersions < 1)
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                "RetainVersions must be at least 1; vacuum always keeps the latest version.");
+
+        string versionsDir = Path.Combine(datasetPath, "_versions");
+        string dataDir = Path.Combine(datasetPath, "data");
+        string txnDir = Path.Combine(datasetPath, "_transactions");
+
+        if (!Directory.Exists(datasetPath) || !Directory.Exists(versionsDir))
+            throw new InvalidOperationException(
+                $"Path '{datasetPath}' does not contain a Lance dataset; nothing to vacuum.");
+
+        // List manifests newest-first via the resolver. Anything beyond the
+        // first RetainVersions entries is a candidate for deletion.
+        var fs = new EngineeredWood.IO.Local.LocalTableFileSystem(datasetPath);
+        var allEntries = await ManifestPathResolver.ListAllAsync(fs, cancellationToken)
+            .ConfigureAwait(false);
+        if (allEntries.Count == 0)
+            return new LanceVacuumResult();
+
+        int retainCount = Math.Min(options.RetainVersions, allEntries.Count);
+        var retainedEntries = allEntries.Take(retainCount).ToArray();
+        var droppedEntries = allEntries.Skip(retainCount).ToArray();
+
+        // Read each retained manifest and collect the live data file
+        // names + the transaction filenames it references.
+        var liveDataFiles = new HashSet<string>(StringComparer.Ordinal);
+        var liveTxnFiles = new HashSet<string>(StringComparer.Ordinal);
+        foreach (var entry in retainedEntries)
+        {
+            var manifest = await ManifestReader.ReadAsync(fs, entry.Path, cancellationToken)
+                .ConfigureAwait(false);
+            foreach (var fragment in manifest.Fragments)
+            {
+                foreach (var file in fragment.Files)
+                {
+                    // DataFile.Path is relative to the dataset root, e.g.
+                    // "data/abc.lance" — but our writer just uses the bare
+                    // filename. Normalise to the basename.
+                    string baseName = Path.GetFileName(file.Path);
+                    liveDataFiles.Add(baseName);
+                }
+            }
+            if (!string.IsNullOrEmpty(manifest.TransactionFile))
+                liveTxnFiles.Add(Path.GetFileName(manifest.TransactionFile));
+        }
+
+        var deletedDataFiles = new List<string>();
+        var deletedManifests = new List<string>();
+        var deletedTxnFiles = new List<string>();
+        long bytesDeleted = 0;
+
+        // Walk data/ — anything not referenced by a retained manifest is
+        // orphaned. Skip non-.lance files (the dir might also hold deletion
+        // files in a future version of this writer).
+        if (Directory.Exists(dataDir))
+        {
+            foreach (string file in Directory.EnumerateFiles(dataDir, "*.lance"))
+            {
+                string baseName = Path.GetFileName(file);
+                if (liveDataFiles.Contains(baseName)) continue;
+                long size = new FileInfo(file).Length;
+                if (!options.DryRun) File.Delete(file);
+                deletedDataFiles.Add(baseName);
+                bytesDeleted += size;
+            }
+        }
+
+        // Walk _versions/ — drop manifests not in retainedEntries.
+        var retainedManifestPaths = new HashSet<string>(
+            retainedEntries.Select(e => Path.GetFileName(e.Path)),
+            StringComparer.Ordinal);
+        foreach (string file in Directory.EnumerateFiles(versionsDir, "*.manifest"))
+        {
+            string baseName = Path.GetFileName(file);
+            if (retainedManifestPaths.Contains(baseName)) continue;
+            long size = new FileInfo(file).Length;
+            if (!options.DryRun) File.Delete(file);
+            deletedManifests.Add(baseName);
+            bytesDeleted += size;
+        }
+
+        // Walk _transactions/ — drop transactions not referenced by any
+        // retained manifest.
+        if (Directory.Exists(txnDir))
+        {
+            foreach (string file in Directory.EnumerateFiles(txnDir, "*.txn"))
+            {
+                string baseName = Path.GetFileName(file);
+                if (liveTxnFiles.Contains(baseName)) continue;
+                long size = new FileInfo(file).Length;
+                if (!options.DryRun) File.Delete(file);
+                deletedTxnFiles.Add(baseName);
+                bytesDeleted += size;
+            }
+        }
+
+        return new LanceVacuumResult
+        {
+            DataFilesDeleted = deletedDataFiles,
+            ManifestsDeleted = deletedManifests,
+            TransactionsDeleted = deletedTxnFiles,
+            BytesDeleted = bytesDeleted,
+            DryRun = options.DryRun,
+        };
+    }
+
     private sealed record CompletedFragment(
         string FileName,
         long FileSizeBytes,
@@ -500,4 +632,58 @@ public enum LanceWriteMode
     /// <summary>Replace the dataset's contents with a fresh manifest;
     /// schema can change.</summary>
     Overwrite,
+}
+
+/// <summary>
+/// Options for <see cref="LanceDatasetWriter.VacuumAsync"/>.
+/// </summary>
+public sealed record LanceVacuumOptions
+{
+    /// <summary>
+    /// Number of most-recent manifest versions to retain. Older versions
+    /// (and any data / transaction files only referenced by them) become
+    /// candidates for deletion. Default 1 = keep only the latest version.
+    /// Must be at least 1.
+    /// </summary>
+    public int RetainVersions { get; init; } = 1;
+
+    /// <summary>
+    /// When true, identify what would be deleted but don't actually delete
+    /// anything. Useful for previewing the effect.
+    /// </summary>
+    public bool DryRun { get; init; } = false;
+}
+
+/// <summary>
+/// Outcome of <see cref="LanceDatasetWriter.VacuumAsync"/> — lists the
+/// files removed (or that would be removed in dry-run mode) and the
+/// total bytes reclaimed.
+/// </summary>
+public sealed record LanceVacuumResult
+{
+    /// <summary>
+    /// Filenames in <c>data/</c> that were deleted, relative to the
+    /// dataset root. Each entry corresponds to one fragment data file
+    /// from a vacuumed version that's no longer referenced by any
+    /// retained manifest.
+    /// </summary>
+    public IReadOnlyList<string> DataFilesDeleted { get; init; }
+        = System.Array.Empty<string>();
+    /// <summary>
+    /// Manifest filenames in <c>_versions/</c> that were deleted.
+    /// </summary>
+    public IReadOnlyList<string> ManifestsDeleted { get; init; }
+        = System.Array.Empty<string>();
+    /// <summary>
+    /// Transaction filenames in <c>_transactions/</c> that were deleted.
+    /// </summary>
+    public IReadOnlyList<string> TransactionsDeleted { get; init; }
+        = System.Array.Empty<string>();
+    /// <summary>Total bytes reclaimed across all three buckets.</summary>
+    public long BytesDeleted { get; init; }
+    /// <summary>
+    /// True if vacuum ran in dry-run mode — the file lists describe what
+    /// would have been deleted; nothing was actually removed.
+    /// </summary>
+    public bool DryRun { get; init; }
 }

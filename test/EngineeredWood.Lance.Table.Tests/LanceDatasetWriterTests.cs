@@ -383,6 +383,251 @@ public class LanceDatasetWriterTests
     }
 
     [Fact]
+    public async Task Vacuum_NoOlderVersions_DeletesNothing()
+    {
+        // Single-version dataset → vacuum can't free anything (we always
+        // retain at least the latest). Result has empty lists.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+
+            var result = await LanceDatasetWriter.VacuumAsync(path);
+            Assert.Empty(result.DataFilesDeleted);
+            Assert.Empty(result.ManifestsDeleted);
+            Assert.Empty(result.TransactionsDeleted);
+            Assert.Equal(0, result.BytesDeleted);
+
+            // Reading still works.
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(3L, table.NumberOfRows);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Vacuum_AfterOverwrite_ReclaimsOldFragment()
+    {
+        // Overwrite leaves the v1 data file orphaned. Default vacuum
+        // (RetainVersions = 1) should delete it along with v1's manifest
+        // and transaction.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3, 4, 5 });
+                await ds.FinishAsync();
+            }
+            await using (var ds = await LanceDatasetWriter.OverwriteAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 100 });
+                await ds.FinishAsync();
+            }
+
+            // Pre-vacuum: 2 manifests, 2 data files, 2 transactions.
+            string versions = Path.Combine(path, "_versions");
+            string data = Path.Combine(path, "data");
+            string txns = Path.Combine(path, "_transactions");
+            Assert.Equal(2, Directory.GetFiles(versions, "*.manifest").Length);
+            Assert.Equal(2, Directory.GetFiles(data, "*.lance").Length);
+            Assert.Equal(2, Directory.GetFiles(txns, "*.txn").Length);
+
+            var result = await LanceDatasetWriter.VacuumAsync(path);
+            Assert.Single(result.DataFilesDeleted);
+            Assert.Single(result.ManifestsDeleted);
+            Assert.Single(result.TransactionsDeleted);
+            Assert.True(result.BytesDeleted > 0);
+
+            // Post-vacuum: only the v2 files remain.
+            Assert.Single(Directory.GetFiles(versions, "*.manifest"));
+            Assert.Single(Directory.GetFiles(data, "*.lance"));
+            Assert.Single(Directory.GetFiles(txns, "*.txn"));
+
+            // Reading still returns the latest data.
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(1L, table.NumberOfRows);
+            await foreach (var batch in table.ReadAsync())
+            {
+                var arr = (Int32Array)batch.Column(0);
+                Assert.Equal(100, arr.GetValue(0));
+            }
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Vacuum_AfterAppend_KeepsAllReferencedFiles()
+    {
+        // Append PRESERVES old fragments — they're still referenced by the
+        // latest manifest. Vacuum should leave them alone (only the v1
+        // manifest + transaction get pruned, since v2's manifest also lists
+        // the v1 data file).
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2, 3 });
+                await ds.FinishAsync();
+            }
+            await using (var ds = await LanceDatasetWriter.AppendAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 4, 5 });
+                await ds.FinishAsync();
+            }
+
+            var result = await LanceDatasetWriter.VacuumAsync(path);
+            // Both data files are still live (latest manifest lists both).
+            Assert.Empty(result.DataFilesDeleted);
+            // v1 manifest and transaction become stale (v2 supersedes them).
+            Assert.Single(result.ManifestsDeleted);
+            Assert.Single(result.TransactionsDeleted);
+
+            // Reading still works.
+            await using var table = await LanceTable.OpenAsync(path);
+            Assert.Equal(5L, table.NumberOfRows);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Vacuum_DryRun_ReportsButDoesNotDelete()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1, 2 });
+                await ds.FinishAsync();
+            }
+            await using (var ds = await LanceDatasetWriter.OverwriteAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 99 });
+                await ds.FinishAsync();
+            }
+
+            var result = await LanceDatasetWriter.VacuumAsync(path,
+                new LanceVacuumOptions { RetainVersions = 1, DryRun = true });
+            Assert.True(result.DryRun);
+            Assert.Single(result.DataFilesDeleted);
+            Assert.Single(result.ManifestsDeleted);
+            Assert.Single(result.TransactionsDeleted);
+            Assert.True(result.BytesDeleted > 0);
+
+            // Files should still all be present.
+            string versions = Path.Combine(path, "_versions");
+            string data = Path.Combine(path, "data");
+            string txns = Path.Combine(path, "_transactions");
+            Assert.Equal(2, Directory.GetFiles(versions, "*.manifest").Length);
+            Assert.Equal(2, Directory.GetFiles(data, "*.lance").Length);
+            Assert.Equal(2, Directory.GetFiles(txns, "*.txn").Length);
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Vacuum_RetainVersions_KeepsOlderHistory()
+    {
+        // Three versions; RetainVersions=2 should keep v3+v2 and only
+        // prune v1's files.
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            await using (var ds = await LanceDatasetWriter.OverwriteAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 2 });
+                await ds.FinishAsync();
+            }
+            await using (var ds = await LanceDatasetWriter.OverwriteAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 3 });
+                await ds.FinishAsync();
+            }
+
+            var result = await LanceDatasetWriter.VacuumAsync(path,
+                new LanceVacuumOptions { RetainVersions = 2 });
+            // Only v1 prunes — v2 and v3 stay.
+            Assert.Single(result.DataFilesDeleted);
+            Assert.Single(result.ManifestsDeleted);
+            Assert.Single(result.TransactionsDeleted);
+
+            // v2 should still be reachable by version.
+            await using var v2 = await LanceTable.OpenAsync(path, version: 2);
+            Assert.Equal(1L, v2.NumberOfRows);
+            // v3 latest.
+            await using var v3 = await LanceTable.OpenAsync(path);
+            Assert.Equal(1L, v3.NumberOfRows);
+
+            // v1 manifest is gone — opening it should throw.
+            await Assert.ThrowsAsync<LanceTableFormatException>(async () =>
+                await LanceTable.OpenAsync(path, version: 1));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Vacuum_RejectsRetainVersionsZero()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await using (var ds = await LanceDatasetWriter.CreateAsync(path))
+            {
+                await ds.FileWriter.WriteInt32ColumnAsync("x", new[] { 1 });
+                await ds.FinishAsync();
+            }
+            await Assert.ThrowsAsync<ArgumentOutOfRangeException>(async () =>
+                await LanceDatasetWriter.VacuumAsync(path,
+                    new LanceVacuumOptions { RetainVersions = 0 }));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task Vacuum_RejectsMissingDataset()
+    {
+        string path = MakeTempDatasetPath();
+        try
+        {
+            await Assert.ThrowsAsync<InvalidOperationException>(async () =>
+                await LanceDatasetWriter.VacuumAsync(path));
+        }
+        finally
+        {
+            if (Directory.Exists(path)) Directory.Delete(path, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task Append_AddsFragmentToExistingDataset()
     {
         string path = MakeTempDatasetPath();
