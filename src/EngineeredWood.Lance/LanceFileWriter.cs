@@ -1263,12 +1263,13 @@ public sealed class LanceFileWriter : IAsyncDisposable
             else { totalLevels += len; visibleItems += len; }
         }
 
-        // Build rep/def streams. rep=1 opens a list boundary; rep=0 is a
-        // continuation. def=0 marks a valid item or list opening; non-zero
-        // marks a null/empty list at the corresponding cascade layer or a
-        // null inner element at the item layer.
+        // Build rep/def streams along with a parallel "consumes a value
+        // slot" indicator per level (true for inner-item entries, false for
+        // null/empty/cascade markers). The chunker uses this indicator to
+        // align chunk boundaries with visible-item counts.
         var rep = new ushort[totalLevels];
         var def = hasDef ? new ushort[totalLevels] : null;
+        var consumesPerLevel = new bool[totalLevels];
         int writePos = 0;
         for (int i = 0; i < outerRows; i++)
         {
@@ -1289,18 +1290,21 @@ public sealed class LanceFileWriter : IAsyncDisposable
                     throw new InvalidOperationException(
                         $"Cascade marked row {i} null at ancestor {ancestorIdx} but the layer has no def slot.");
                 def![writePos] = (ushort)slot;
+                consumesPerLevel[writePos] = false;
                 writePos++;
             }
             else if (isNull)
             {
                 rep[writePos] = 1;
                 def![writePos] = (ushort)listNullDef;
+                consumesPerLevel[writePos] = false;
                 writePos++;
             }
             else if (len == 0)
             {
                 rep[writePos] = 1;
                 if (hasDef) def![writePos] = (ushort)listEmptyDef;
+                consumesPerLevel[writePos] = false;
                 writePos++;
             }
             else
@@ -1316,17 +1320,16 @@ public sealed class LanceFileWriter : IAsyncDisposable
                             || (innerValidity![(rowStart + j) >> 3] & (1 << ((rowStart + j) & 7))) != 0;
                         def![writePos] = itemValid ? (ushort)0 : (ushort)itemNullDef;
                     }
+                    consumesPerLevel[writePos] = true;
                     writePos++;
                 }
             }
         }
 
-        // Build the chunk's value buffer. For fixed-width inner: pack bytes
-        // contiguously. For string/binary inner: build a Variable-encoded
-        // buffer = (visibleItems+1) × u32 absolute offsets, then concatenated
-        // string bytes; offsets[0] = (visibleItems+1)*4 (start of data).
-        byte[] valueBytes;
-        CompressiveEncoding valueEncoding;
+        // Build per-visible-item byte data for the chunker. For fixed-width
+        // inner: a contiguous valueBytes (visibleItems × bpv). For variable
+        // inner: a flat data buffer (no offsets — the chunker rebuilds them
+        // per chunk) plus a per-visible-item byte length array.
         // Helper: returns true if row i should contribute NO visible items
         // (either ancestor cascade null, list null, or list empty).
         bool RowSkipsValueSlots(int i)
@@ -1338,24 +1341,29 @@ public sealed class LanceFileWriter : IAsyncDisposable
             return false;
         }
 
+        byte[] flatValueBytes;
+        int[]? dataBytesPerVisible = null;
+        CompressiveEncoding valueEncoding;
         if (isVariableInner)
         {
             var binArr = (BinaryArray)innerValues;
+            dataBytesPerVisible = new int[visibleItems];
             int totalDataLen = 0;
+            int v = 0;
             for (int i = 0; i < outerRows; i++)
             {
                 if (RowSkipsValueSlots(i)) continue;
                 int start = outerOffsets[i];
                 int end = outerOffsets[i + 1];
                 for (int k = start; k < end; k++)
-                    totalDataLen += binArr.GetBytes(k).Length;
+                {
+                    int rowLen = binArr.GetBytes(k).Length;
+                    dataBytesPerVisible[v++] = rowLen;
+                    totalDataLen += rowLen;
+                }
             }
-            int offsetsBytesLen = checked((visibleItems + 1) * sizeof(uint));
-            valueBytes = new byte[offsetsBytesLen + totalDataLen];
-            uint dataCursor = (uint)offsetsBytesLen;
-            BinaryPrimitives.WriteUInt32LittleEndian(
-                valueBytes.AsSpan(0, sizeof(uint)), dataCursor);
-            int visIdx = 0;
+            flatValueBytes = new byte[totalDataLen];
+            int writeCursor = 0;
             for (int i = 0; i < outerRows; i++)
             {
                 if (RowSkipsValueSlots(i)) continue;
@@ -1364,12 +1372,8 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 for (int k = start; k < end; k++)
                 {
                     var rowBytes = binArr.GetBytes(k);
-                    rowBytes.CopyTo(valueBytes.AsSpan((int)dataCursor));
-                    dataCursor += (uint)rowBytes.Length;
-                    visIdx++;
-                    BinaryPrimitives.WriteUInt32LittleEndian(
-                        valueBytes.AsSpan(visIdx * sizeof(uint), sizeof(uint)),
-                        dataCursor);
+                    rowBytes.CopyTo(flatValueBytes.AsSpan(writeCursor));
+                    writeCursor += rowBytes.Length;
                 }
             }
             valueEncoding = new CompressiveEncoding
@@ -1386,7 +1390,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         else
         {
             int valueBytesLen = checked(visibleItems * innerBytesPerItem);
-            valueBytes = new byte[valueBytesLen];
+            flatValueBytes = new byte[valueBytesLen];
             if (visibleItems > 0)
             {
                 var innerValuesBuf = innerValues.Data.Buffers[1];
@@ -1400,31 +1404,22 @@ public sealed class LanceFileWriter : IAsyncDisposable
                     if (rowLen == 0) continue;
                     int byteCount = rowLen * innerBytesPerItem;
                     innerValuesBuf.Span.Slice(start * innerBytesPerItem, byteCount)
-                        .CopyTo(valueBytes.AsSpan(outBytes, byteCount));
+                        .CopyTo(flatValueBytes.AsSpan(outBytes, byteCount));
                     outBytes += byteCount;
                 }
             }
             valueEncoding = FlatEncoding(innerBytesPerItem * 8);
         }
 
-        // Single-chunk only for now. Multi-chunk lists need to split the
-        // rep stream at list-row boundaries (so a chunk doesn't bisect a
-        // single list's items), which adds enough bookkeeping that it's
-        // best handled in a follow-up.
-        int repPadded = AlignUp(totalLevels * sizeof(ushort), MiniBlockAlignment);
-        int defPadded = hasDef ? AlignUp(totalLevels * sizeof(ushort), MiniBlockAlignment) : 0;
-        int chunkTotalBytes = AlignUp(
-            AlignUp(2 + 2 + (hasDef ? 2 : 0) + 2, MiniBlockAlignment)
-                + repPadded + defPadded
-                + AlignUp(valueBytes.Length, MiniBlockAlignment),
-            MiniBlockAlignment);
-        if (chunkTotalBytes > MaxChunkBytes)
-            throw new NotSupportedException(
-                $"List page exceeds 32 KiB chunk budget ({chunkTotalBytes} bytes); " +
-                "multi-chunk list pages are not yet supported by the writer.");
+        // Chunk the page. Each non-last chunk gets a power-of-2 visible-item
+        // count; the last chunk takes whatever's left. Boundaries can sit
+        // inside a single list (the rep/def streams concatenate transparently
+        // across chunks; only the visible-item count determines log_num_values).
+        var pageChunks = ChunkListPage(
+            rep, def, consumesPerLevel,
+            isVariableInner, innerBytesPerItem, dataBytesPerVisible,
+            flatValueBytes, hasDef, totalLevels, visibleItems);
 
-        var chunk = new PageChunk(0, visibleItems, valueBytes,
-            RepLevels: rep, DefLevels: def);
         var layers = new List<RepDefLayer>(2 + ancestorLayers.Count) { itemLayer, listLayer };
         layers.AddRange(ancestorLayers);
 
@@ -1435,11 +1430,294 @@ public sealed class LanceFileWriter : IAsyncDisposable
                 $"Column '{name}' has {outerRows} rows but earlier columns have {_totalRows}.",
                 nameof(name));
 
+        // Compute the repetition_index buffer: per chunk, (depth+1) u64
+        // values. For our single-list-level pages depth=1, so 2 u64 per
+        // chunk: [rowsClosingInChunk, leftoverItemsAtEndOfChunk].
+        // Pylance's reader uses this for random row access — without it,
+        // lance.dataset() and even lance.file.LanceFileReader stop reading
+        // after the first chunk.
+        byte[] repIndex = BuildRepetitionIndex(pageChunks, consumesPerLevel);
+
         var page = await BuildAndWritePageAsync(
-            valueEncoding, visibleItems, new[] { chunk }, layers, cancellationToken)
+            valueEncoding, visibleItems, pageChunks, layers, cancellationToken,
+            pageLength: outerRows,
+            repetitionIndexBytes: repIndex,
+            repetitionIndexDepth: 1)
             .ConfigureAwait(false);
 
         RegisterListColumn(name, parentLogical, innerLogical, valueEncoding, new[] { page }, parentId);
+    }
+
+    /// <summary>
+    /// Build the repetition_index buffer for a list page (depth=1). Writes
+    /// 2×N u64s (where N = #chunks): per chunk i, <c>[rowsClosed,
+    /// leftoverItems]</c>. <c>rowsClosed</c> counts top-level list rows that
+    /// finish within chunk i (including null/empty rows that close in one
+    /// step); <c>leftoverItems</c> is the count of items already emitted
+    /// into the still-open row at end of chunk (or 0 if no row is open).
+    /// At end-of-stream any still-open row is implicitly closed and recorded
+    /// in the last chunk's <c>rowsClosed</c>.
+    /// </summary>
+    private static byte[] BuildRepetitionIndex(
+        IReadOnlyList<PageChunk> chunks, bool[] consumesPerLevel)
+    {
+        int n = chunks.Count;
+        var buf = new byte[n * 2 * sizeof(ulong)];
+        bool rowOpen = false;
+        int itemsInRow = 0;
+        int globalLevelCursor = 0;
+        for (int c = 0; c < n; c++)
+        {
+            int rowsClosed = 0;
+            ushort[]? rep = chunks[c].RepLevels;
+            if (rep is null)
+            {
+                // No-rep page: there's nothing list-shaped here. Emit zeros.
+                BinaryPrimitives.WriteUInt64LittleEndian(
+                    buf.AsSpan(c * 16 + 0, 8), 0);
+                BinaryPrimitives.WriteUInt64LittleEndian(
+                    buf.AsSpan(c * 16 + 8, 8), 0);
+                continue;
+            }
+            for (int k = 0; k < rep.Length; k++)
+            {
+                bool consuming = consumesPerLevel[globalLevelCursor + k];
+                if (rep[k] == 1)
+                {
+                    if (rowOpen)
+                    {
+                        rowsClosed++;
+                        rowOpen = false;
+                        itemsInRow = 0;
+                    }
+                    if (consuming)
+                    {
+                        rowOpen = true;
+                        itemsInRow = 1;
+                    }
+                    else
+                    {
+                        rowsClosed++;
+                        rowOpen = false;
+                        itemsInRow = 0;
+                    }
+                }
+                else
+                {
+                    // rep=0 = continuation; must be consuming.
+                    itemsInRow++;
+                }
+            }
+            if (c == n - 1 && rowOpen)
+            {
+                // Implicit close at end-of-stream — the still-open row
+                // counts as "closing in" the last chunk.
+                rowsClosed++;
+                rowOpen = false;
+                itemsInRow = 0;
+            }
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                buf.AsSpan(c * 16 + 0, 8), (ulong)rowsClosed);
+            BinaryPrimitives.WriteUInt64LittleEndian(
+                buf.AsSpan(c * 16 + 8, 8), (ulong)itemsInRow);
+            globalLevelCursor += rep.Length;
+        }
+        return buf;
+    }
+
+    /// <summary>
+    /// Slice a list page's full rep/def/value streams into one or more
+    /// 32 KiB-bounded chunks. Non-last chunks contain exactly 2^k visible
+    /// items (so the chunk meta word's <c>log_num_values</c> field can
+    /// represent them); the last chunk may contain any number of remaining
+    /// items. Boundaries are picked greedily — try the largest 2^k that
+    /// fits in budget — and trailing non-consuming levels (null / empty /
+    /// cascade markers right after a 2^k boundary) are folded into the
+    /// current chunk so the next chunk starts on a value-slot-consuming
+    /// entry.
+    /// </summary>
+    private static List<PageChunk> ChunkListPage(
+        ushort[] rep, ushort[]? def, bool[] consumesPerLevel,
+        bool isVariableInner, int innerBytesPerItem,
+        int[]? dataBytesPerVisible,
+        byte[] flatValueBytes,
+        bool hasDef, int totalLevels, int visibleItems)
+    {
+        var chunks = new List<PageChunk>();
+        int levelCursor = 0;
+        int visibleCursor = 0;
+        int dataByteCursor = 0;
+
+        while (levelCursor < totalLevels || (chunks.Count == 0 && visibleItems == 0))
+        {
+            int remainingLevels = totalLevels - levelCursor;
+            int remainingVisible = visibleItems - visibleCursor;
+
+            // Try fitting EVERYTHING remaining in one (last) chunk.
+            int trialDataBytes = isVariableInner
+                ? SumDataBytes(dataBytesPerVisible!, visibleCursor, visibleCursor + remainingVisible)
+                : 0;
+            if (FitsInChunkBudget(remainingLevels, remainingVisible, trialDataBytes,
+                    isVariableInner, innerBytesPerItem, hasDef))
+            {
+                chunks.Add(BuildListChunk(
+                    rep, def, levelCursor, remainingLevels,
+                    visibleCursor, remainingVisible,
+                    isVariableInner, innerBytesPerItem,
+                    dataBytesPerVisible, flatValueBytes,
+                    dataByteCursor, trialDataBytes));
+                break;
+            }
+
+            // Need a non-last chunk. Try the largest power-of-2 visible-item
+            // count whose chunk fits in budget, walking down from the largest
+            // viable 2^k.
+            int targetK = Log2Floor(remainingVisible);
+            // Cap so we leave at least 1 visible for a future last chunk.
+            // (Equal would have been the "all remaining fits" branch above.)
+            if ((1 << targetK) >= remainingVisible) targetK--;
+            int chosen = -1;
+            int chosenLevels = 0;
+            int chosenDataBytes = 0;
+            for (int k = targetK; k >= 1; k--)
+            {
+                int v = 1 << k;
+                if (v >= remainingVisible) continue;
+
+                // Find the level after which we've consumed v visible items.
+                int found = levelCursor;
+                int consumed = 0;
+                while (found < totalLevels && consumed < v)
+                {
+                    if (consumesPerLevel[found]) consumed++;
+                    found++;
+                }
+                int trialNumLevels = found - levelCursor;
+                int trialDB = isVariableInner
+                    ? SumDataBytes(dataBytesPerVisible!, visibleCursor, visibleCursor + v)
+                    : 0;
+                if (FitsInChunkBudget(trialNumLevels, v, trialDB,
+                        isVariableInner, innerBytesPerItem, hasDef))
+                {
+                    // Greedily fold trailing non-consuming levels into this
+                    // chunk if they still fit; otherwise leave them for the
+                    // next chunk.
+                    int extended = found;
+                    while (extended < totalLevels && !consumesPerLevel[extended])
+                        extended++;
+                    int extendedNumLevels = extended - levelCursor;
+                    if (FitsInChunkBudget(extendedNumLevels, v, trialDB,
+                            isVariableInner, innerBytesPerItem, hasDef))
+                    {
+                        found = extended;
+                        trialNumLevels = extendedNumLevels;
+                    }
+
+                    chosen = v;
+                    chosenLevels = trialNumLevels;
+                    chosenDataBytes = trialDB;
+                    levelCursor += chosenLevels;
+                    visibleCursor += v;
+                    chunks.Add(BuildListChunk(
+                        rep, def, levelCursor - chosenLevels, chosenLevels,
+                        visibleCursor - v, v,
+                        isVariableInner, innerBytesPerItem,
+                        dataBytesPerVisible, flatValueBytes,
+                        dataByteCursor, chosenDataBytes));
+                    dataByteCursor += chosenDataBytes;
+                    break;
+                }
+            }
+            if (chosen < 0)
+                throw new NotSupportedException(
+                    "List page cannot fit even a 2-item non-last chunk in the 32 KiB budget; " +
+                    "very large per-item payloads are not yet supported by the writer.");
+        }
+
+        if (chunks.Count == 0)
+        {
+            // Empty page (visibleItems = 0 and totalLevels = 0). Emit a
+            // single zero-item chunk to keep the chunk-meta buffer non-empty.
+            chunks.Add(new PageChunk(0, 0, System.Array.Empty<byte>(),
+                RepLevels: rep, DefLevels: def));
+        }
+        return chunks;
+    }
+
+    private static int SumDataBytes(int[] perVisible, int start, int end)
+    {
+        int total = 0;
+        for (int i = start; i < end; i++) total += perVisible[i];
+        return total;
+    }
+
+    private static bool FitsInChunkBudget(
+        int numLevels, int visibleItems, int dataBytes,
+        bool isVariableInner, int innerBytesPerItem, bool hasDef)
+    {
+        int header = 2 + 2 + (hasDef ? 2 : 0) + 2;
+        int headerPadded = AlignUp(header, MiniBlockAlignment);
+        int repPadded = AlignUp(numLevels * sizeof(ushort), MiniBlockAlignment);
+        int defPadded = hasDef ? AlignUp(numLevels * sizeof(ushort), MiniBlockAlignment) : 0;
+        int valueBytes = isVariableInner
+            ? checked((visibleItems + 1) * sizeof(uint) + dataBytes)
+            : visibleItems * innerBytesPerItem;
+        int chunkTotal = AlignUp(
+            headerPadded + repPadded + defPadded + AlignUp(valueBytes, MiniBlockAlignment),
+            MiniBlockAlignment);
+        // dividedBytes is 12 bits → max chunkTotal = (4096 + 1) * 8 = 32 KiB.
+        return chunkTotal <= MaxChunkBytes;
+    }
+
+    private static PageChunk BuildListChunk(
+        ushort[] rep, ushort[]? def,
+        int levelStart, int numLevels,
+        int visibleStart, int visibleCount,
+        bool isVariableInner, int innerBytesPerItem,
+        int[]? dataBytesPerVisible, byte[] flatValueBytes,
+        int dataByteCursor, int chunkDataBytes)
+    {
+        var repSlice = new ushort[numLevels];
+        System.Array.Copy(rep, levelStart, repSlice, 0, numLevels);
+        ushort[]? defSlice = null;
+        if (def is not null)
+        {
+            defSlice = new ushort[numLevels];
+            System.Array.Copy(def, levelStart, defSlice, 0, numLevels);
+        }
+
+        byte[] valueBuf;
+        if (isVariableInner)
+        {
+            int offsetsLen = checked((visibleCount + 1) * sizeof(uint));
+            valueBuf = new byte[offsetsLen + chunkDataBytes];
+            uint cursor = (uint)offsetsLen;
+            BinaryPrimitives.WriteUInt32LittleEndian(valueBuf.AsSpan(0, 4), cursor);
+            for (int i = 0; i < visibleCount; i++)
+            {
+                cursor += (uint)dataBytesPerVisible![visibleStart + i];
+                BinaryPrimitives.WriteUInt32LittleEndian(
+                    valueBuf.AsSpan((i + 1) * sizeof(uint), 4), cursor);
+            }
+            if (chunkDataBytes > 0)
+            {
+                flatValueBytes.AsSpan(dataByteCursor, chunkDataBytes)
+                    .CopyTo(valueBuf.AsSpan(offsetsLen));
+            }
+        }
+        else
+        {
+            int byteCount = visibleCount * innerBytesPerItem;
+            valueBuf = new byte[byteCount];
+            if (byteCount > 0)
+            {
+                flatValueBytes.AsSpan(visibleStart * innerBytesPerItem, byteCount)
+                    .CopyTo(valueBuf);
+            }
+        }
+
+        return new PageChunk(visibleStart, visibleCount, valueBuf,
+            RepLevels: repSlice, DefLevels: defSlice);
     }
 
     private Task WriteVariableColumnAsync(
@@ -1641,7 +1919,19 @@ public sealed class LanceFileWriter : IAsyncDisposable
         int numItems,
         IReadOnlyList<PageChunk> chunks,
         IReadOnlyList<RepDefLayer> layers,
-        CancellationToken cancellationToken)
+        CancellationToken cancellationToken,
+        // For list pages outer rows ≠ visible items: Page.length carries the
+        // logical (top-level) row count while MiniBlockLayout.num_items
+        // carries the value-slot count. When pageLength is null we use
+        // numItems for both (correct for non-list shapes).
+        int? pageLength = null,
+        // List pages also carry a 3rd page buffer (repetition_index) plus a
+        // repetition_index_depth on the layout. The buffer holds
+        // (depth+1) × num_chunks u64 values describing how many top-level
+        // rows close in each chunk and how many leftover items are in the
+        // currently-open row at end of chunk.
+        byte[]? repetitionIndexBytes = null,
+        int repetitionIndexDepth = 0)
     {
         int N = chunks.Count;
         bool hasRep = N > 0 && chunks[0].RepLevels is not null;
@@ -1785,12 +2075,22 @@ public sealed class LanceFileWriter : IAsyncDisposable
         await _file.WriteAsync(dataBuf, cancellationToken).ConfigureAwait(false);
         long buf1Size = dataBuf.Length;
 
+        long buf2Offset = 0, buf2Size = 0;
+        if (repetitionIndexBytes is not null)
+        {
+            await PadToAlignmentAsync(PageBufferAlignment, cancellationToken).ConfigureAwait(false);
+            buf2Offset = _file.Position;
+            await _file.WriteAsync(repetitionIndexBytes, cancellationToken).ConfigureAwait(false);
+            buf2Size = repetitionIndexBytes.Length;
+        }
+
         // --- Build the page's encoding (PageLayout → Any → DirectEncoding → Encoding) ---
         var miniBlock = new MiniBlockLayout
         {
             ValueCompression = valueEncoding,
             NumBuffers = 1,
             NumItems = (ulong)numItems,
+            RepetitionIndexDepth = (uint)repetitionIndexDepth,
         };
         if (hasRep)
         {
@@ -1829,7 +2129,7 @@ public sealed class LanceFileWriter : IAsyncDisposable
         // --- Build the Page proto ---
         var page = new ColumnMetadata.Types.Page
         {
-            Length = (ulong)numItems,
+            Length = (ulong)(pageLength ?? numItems),
             Encoding = pageEncoding,
             Priority = 0,
         };
@@ -1837,6 +2137,11 @@ public sealed class LanceFileWriter : IAsyncDisposable
         page.BufferOffsets.Add((ulong)buf1Offset);
         page.BufferSizes.Add((ulong)buf0Size);
         page.BufferSizes.Add((ulong)buf1Size);
+        if (repetitionIndexBytes is not null)
+        {
+            page.BufferOffsets.Add((ulong)buf2Offset);
+            page.BufferSizes.Add((ulong)buf2Size);
+        }
         return page;
     }
 

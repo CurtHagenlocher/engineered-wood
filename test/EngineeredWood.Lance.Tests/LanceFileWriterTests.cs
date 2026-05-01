@@ -2150,6 +2150,164 @@ public class LanceFileWriterTests
     }
 
     [Fact]
+    public async Task ListInt32_MultiChunk_RoundTrip_ViaOurReader()
+    {
+        // 50 rows × 250 int32 = 50 KB of value bytes — exceeds the 32 KiB
+        // single-chunk budget, so the writer must split into multi-chunk.
+        // Lists are uniform 250-long so a single list crosses chunk
+        // boundaries (the rep stream concatenates transparently).
+        const int outerRows = 50;
+        const int innerLen = 250;
+        var rows = new int[outerRows][];
+        for (int i = 0; i < outerRows; i++)
+        {
+            rows[i] = new int[innerLen];
+            for (int j = 0; j < innerLen; j++) rows[i][j] = i * innerLen + j;
+        }
+        var listArr = BuildListInt32(rows, nullMask: null);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mclist-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(outerRows, read.Length);
+            Assert.Equal(0, read.NullCount);
+            var inner = (Int32Array)read.Values;
+            Assert.Equal(outerRows * innerLen, inner.Length);
+            // Spot-check several rows including ones that likely span chunk
+            // boundaries.
+            for (int row = 0; row < outerRows; row++)
+            {
+                Assert.Equal(row * innerLen, read.ValueOffsets[row]);
+                Assert.Equal((row + 1) * innerLen, read.ValueOffsets[row + 1]);
+                Assert.Equal(row * innerLen, inner.GetValue(row * innerLen));
+                Assert.Equal(row * innerLen + innerLen - 1,
+                    inner.GetValue(row * innerLen + innerLen - 1));
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ListString_MultiChunk_RoundTrip_ViaOurReader()
+    {
+        // ~200 rows × 5 strings × 50 bytes = ~50 KB of data + offsets +
+        // rep/def. Variable-encoded multi-chunk needs per-chunk relative
+        // offsets, so this also validates that path.
+        const int outerRows = 200;
+        const int innerLen = 5;
+        var rows = new string[outerRows][];
+        for (int i = 0; i < outerRows; i++)
+        {
+            rows[i] = new string[innerLen];
+            for (int j = 0; j < innerLen; j++)
+                rows[i][j] = $"row{i:D3}-item{j}-" + new string('x', 40);
+        }
+        var listArr = BuildListString(rows, outerNullMask: null);
+
+        string path = Path.Combine(Path.GetTempPath(), $"ew-lance-mcliststr-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("words", listArr);
+                await writer.FinishAsync();
+            }
+
+            await using var reader = await LanceFileReader.OpenAsync(path);
+            var read = (ListArray)await reader.ReadColumnAsync(0);
+            Assert.Equal(outerRows, read.Length);
+            var inner = (StringArray)read.Values;
+            Assert.Equal(outerRows * innerLen, inner.Length);
+            for (int row = 0; row < outerRows; row++)
+            {
+                Assert.Equal(row * innerLen, read.ValueOffsets[row]);
+                for (int j = 0; j < innerLen; j++)
+                    Assert.Equal(rows[row][j], inner.GetString(row * innerLen + j));
+            }
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
+    public async Task ListInt32_MultiChunk_CrossValidatedAgainstPylance()
+    {
+        // Cross-validate the multi-chunk wire format against pylance.
+        if (!IsPythonAvailable()) return;
+        const int outerRows = 50;
+        const int innerLen = 250;
+        var rows = new int[outerRows][];
+        for (int i = 0; i < outerRows; i++)
+        {
+            rows[i] = new int[innerLen];
+            for (int j = 0; j < innerLen; j++) rows[i][j] = i * innerLen + j;
+        }
+        var listArr = BuildListInt32(rows, nullMask: null);
+
+        string path = Path.Combine(Path.GetTempPath(),
+            $"ew-lance-pylance-mclist-{Guid.NewGuid():N}.lance");
+        try
+        {
+            await using (var writer = await LanceFileWriter.CreateAsync(path))
+            {
+                await writer.WriteColumnAsync("nums", listArr);
+                await writer.FinishAsync();
+            }
+
+            string script = "import sys, json\n" +
+                "from lance.file import LanceFileReader\n" +
+                $"r = LanceFileReader(r'{path}')\n" +
+                "t = r.read_all().to_table()\n" +
+                "data = t['nums'].to_pylist()\n" +
+                "out = { 'rows': len(data), 'first_row': data[0][:5], " +
+                "'mid_row_first': data[25][0], 'mid_row_last': data[25][249], " +
+                "'last_row_last': data[49][249], 'lens': [len(r) for r in data] }\n" +
+                "sys.stdout.write(json.dumps(out))\n";
+
+            var psi = new ProcessStartInfo("python", "-c " + EscapeArg(script))
+            {
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                UseShellExecute = false,
+            };
+            using var proc = Process.Start(psi)!;
+            string stdout = await proc.StandardOutput.ReadToEndAsync();
+            string stderr = await proc.StandardError.ReadToEndAsync();
+            await proc.WaitForExitAsync();
+            Assert.True(proc.ExitCode == 0,
+                $"pylance exited {proc.ExitCode}; stderr: {stderr}; stdout: {stdout}");
+
+            var json = System.Text.Json.JsonDocument.Parse(stdout);
+            Assert.Equal(outerRows, json.RootElement.GetProperty("rows").GetInt32());
+            Assert.Equal(25 * innerLen, json.RootElement.GetProperty("mid_row_first").GetInt32());
+            Assert.Equal(25 * innerLen + innerLen - 1,
+                json.RootElement.GetProperty("mid_row_last").GetInt32());
+            Assert.Equal(49 * innerLen + innerLen - 1,
+                json.RootElement.GetProperty("last_row_last").GetInt32());
+            // Every row should have exactly innerLen elements.
+            foreach (var l in json.RootElement.GetProperty("lens").EnumerateArray())
+                Assert.Equal(innerLen, l.GetInt32());
+        }
+        finally
+        {
+            if (File.Exists(path)) File.Delete(path);
+        }
+    }
+
+    [Fact]
     public async Task LargeListInt64_AllValid_RoundTrip_ViaOurReader()
     {
         // LargeList<int64> with 3 non-null/non-empty rows. Schema's parent
