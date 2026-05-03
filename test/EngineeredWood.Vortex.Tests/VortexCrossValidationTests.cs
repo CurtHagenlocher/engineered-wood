@@ -661,6 +661,43 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenSparseFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // 5 000-row Int32 column where most rows are 0 with sprinkles of
+        // non-zero values. Tests the full sparse round-trip through vortex's
+        // Rust reader: fill scalar buffer, indices child, values child,
+        // PatchesMetadata wrapper.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 5_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(i % 50 == 0 ? i + 1 : 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenNullableRunEndFile()
     {
         var validator = FindValidator();

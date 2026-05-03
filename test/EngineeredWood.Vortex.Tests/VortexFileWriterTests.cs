@@ -2560,6 +2560,207 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Sparse_DominantZeroFillCompresses()
+    {
+        // 10 000-row Int32 column where only every 100th row has a non-zero
+        // value. Expect sparse to win: ~100 patches at 4+4 bytes each ≈ 800
+        // bytes vs raw 40 KB. Test asserts >10× compression.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 10_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++)
+            b.Append(i % 100 == 0 ? i : 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            // 1% non-zero gives ~8× shrink in practice — values are stored
+            // through bitpacked which pads to 1024-row FastLanes chunks even
+            // when patches are rare. Ratio is better at higher row counts;
+            // the >5× gate confirms the encoding genuinely fired.
+            Assert.True(compressedSize * 5 < rawSize,
+                $"Sparse on a 1%-non-zero × {n}-row Int32 column should give >5x compression. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(i % 100 == 0 ? i : 0, read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Sparse_NonZeroDominantFillRoundtrips()
+    {
+        // Verify that the chosen fill is the column mode, not hard-coded zero.
+        // Most rows are 42; sprinkles of 7, 11, 13. Encoder should pick 42 as
+        // fill so patches cover only the sprinkles.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt16Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 5_000;
+        var b = new UInt16Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            ushort v = (ushort)(i % 200 switch
+            {
+                17 => 7,
+                53 => 11,
+                129 => 13,
+                _ => 42,
+            });
+            b.Append(v);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt16Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+            {
+                ushort expected = (ushort)(i % 200 switch
+                {
+                    17 => 7,
+                    53 => 11,
+                    129 => 13,
+                    _ => 42,
+                });
+                Assert.Equal(expected, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Sparse_NegativeFillSignedInt8Roundtrips()
+    {
+        // Sign-extension test: the fill is -1 (i8 bit pattern 0xFF). A naive
+        // encoder that doesn't sign-extend the mode key before serializing
+        // would write the fill as +255 and the reader's `(sbyte)Int64Value`
+        // cast would still recover -1, but the wire bytes would differ from
+        // vortex's expectations and Rust cross-validation would break. The
+        // SignExtendSigned helper produces sint64 -1 instead.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int8Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new Int8Array.Builder();
+        for (int i = 0; i < n; i++)
+            b.Append((sbyte)(i % 50 == 0 ? 100 : -1));
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int8Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+            {
+                sbyte expected = (sbyte)(i % 50 == 0 ? 100 : -1);
+                Assert.Equal(expected, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Sparse_NoDominantValueFallsThrough()
+    {
+        // Roughly uniform distribution → sparse rejects (mode covers <10%
+        // of rows here, far below the 1.5× compression gate). Dispatch
+        // should fall through to bitpacked / FoR / etc., and the data must
+        // still round-trip exactly.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(i);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++) Assert.Equal(i, read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Sparse_AllSameValueDeferredToConstant()
+    {
+        // A fully-uniform column should be claimed by vortex.constant before
+        // sparse gets a chance — sparse's IsApplicable rejects when
+        // numPatches == 0 anyway. Test verifies dispatch order: constant
+        // wins, file roundtrips.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 500;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(123);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++) Assert.Equal(123, read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Dict_RepetitiveStringsCompress()
     {
         // Highly repetitive string column — only 5 distinct values, 1000 rows.

@@ -13,7 +13,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
-    ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd);
+    ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd, ushort Sparse);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -53,6 +53,8 @@ internal static class ArrayEncoderDispatch
             return AlpArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && RleArrayEncoder.IsApplicable(array))
             return RleArrayEncoder.Emit(sb, array, idx, statsTicket);
+        if (compress && SparseArrayEncoder.IsApplicable(array))
+            return SparseArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && RunEndArrayEncoder.IsApplicable(array))
             return RunEndArrayEncoder.Emit(sb, array, idx, statsTicket);
         if (compress && DeltaArrayEncoder.IsApplicable(array))
