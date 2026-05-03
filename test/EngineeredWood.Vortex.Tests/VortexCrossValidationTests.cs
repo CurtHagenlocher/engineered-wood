@@ -190,6 +190,45 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenForFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("ts", Int64Type.Default, nullable: false),
+            new Field("offset_from_base", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_500;
+        var ts = new Int64Array.Builder();
+        var off = new Int32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            ts.Append(1_700_000_000_000L + (i * 7L)); // narrow range, high min
+            off.Append(-200 + (i % 50));               // negative min
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { ts.Build(), off.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenConstantFile()
     {
         var validator = FindValidator();

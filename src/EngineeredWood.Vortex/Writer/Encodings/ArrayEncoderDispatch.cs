@@ -12,7 +12,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// </summary>
 internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
-    ushort BitPacked, ushort Decimal, ushort Constant);
+    ushort BitPacked, ushort Decimal, ushort Constant, ushort For);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -24,9 +24,17 @@ internal static class ArrayEncoderDispatch
 {
     /// <summary>
     /// <param name="compress">When true, eligible columns auto-route through
-    /// compressing encodings — <c>vortex.constant</c> for fully-uniform columns,
-    /// then <c>fastlanes.bitpacked</c> for non-nullable integers with MaxBits
-    /// &lt; native. Constant is checked first because it's strictly smaller.</param>
+    /// compressing encodings in this order:
+    /// <list type="number">
+    ///   <item><c>vortex.constant</c> — fully-uniform columns (one ScalarValue, no buffers).</item>
+    ///   <item><c>fastlanes.for</c> — integer columns where shifting by min tightens
+    ///     the bit width (or is required because the column has negative values).</item>
+    ///   <item><c>fastlanes.bitpacked</c> — non-nullable integers with MaxBits &lt; native.</item>
+    /// </list>
+    /// Constant is checked first because it's strictly smaller. FoR is checked
+    /// before plain bitpacked because it strictly subsumes bitpacked for
+    /// columns where it applies (FoR with min=0 would be identical, but we
+    /// only enable FoR when min != 0 or signed-with-negatives).</param>
     /// </summary>
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx,
@@ -34,6 +42,8 @@ internal static class ArrayEncoderDispatch
     {
         if (compress && ConstantArrayEncoder.IsApplicable(array))
             return ConstantArrayEncoder.Emit(sb, array, idx.Constant, statsTicket);
+        if (compress && ForArrayEncoder.IsApplicable(array))
+            return ForArrayEncoder.Emit(sb, array, idx.For, idx.BitPacked, idx.Bool, statsTicket);
         if (compress && BitPackedArrayEncoder.IsApplicable(array))
             return BitPackedArrayEncoder.Emit(sb, array, idx.BitPacked, idx.Bool, statsTicket);
 

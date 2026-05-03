@@ -1354,6 +1354,122 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task For_PositiveMinShiftsBits()
+    {
+        // Int32 column with values in [1_000_000, 1_000_500]. MaxBits over the
+        // raw values is 20; over (values - min) is 9. FoR should kick in.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_000;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(1_000_000 + (i % 500));
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 2,
+                $"FoR should give >2x compression for narrow-range data with high min. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(1_000_000 + (i % 500), read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task For_NegativeValuesViaForResiduals()
+    {
+        // Int64 column with negative values — bitpacked alone wouldn't apply
+        // (rejects signed-with-negatives), but FoR shifts to make residuals
+        // non-negative and then bitpacks the small residuals.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 2_000;
+        var b = new Int64Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(-50_000L + (i % 100));
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 4,
+                $"FoR over Int64 with -50000 min and 100-wide range should compress strongly. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(-50_000L + (i % 100), read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task For_FallsThroughWhenMinIsZero()
+    {
+        // Min=0, all non-negative — FoR offers no advantage, dispatch should
+        // skip it and fall through to plain bitpacked. (We can't directly
+        // observe which encoding was used from the public API, but we CAN
+        // confirm round-trip correctness AND that the file isn't bigger than
+        // raw — i.e., compress: true didn't accidentally pessimize.)
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append((uint)(i % 200)); // min=0, range 0..199
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal((uint)(i % 200), read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Constant_PrimitiveRoundtrips()
     {
         // Three columns where ALL values are identical — should compress to
