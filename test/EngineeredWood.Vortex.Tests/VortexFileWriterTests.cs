@@ -1900,6 +1900,85 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Dict_NullableStringsRoundtrip()
+    {
+        // Repetitive nullable strings: dict applies and codes carry validity.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("status", StringType.Default, nullable: true),
+        }, metadata: null);
+        var palette = new[] { "open", "closed", "pending", "error" };
+        const int n = 800;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 5 == 0) b.AppendNull();
+            else b.Append(palette[i % palette.Length]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            int expectedNulls = 0; for (int i = 0; i < n; i++) if (i % 5 == 0) expectedNulls++;
+            Assert.Equal(expectedNulls, read.NullCount);
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 5 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal(palette[i % palette.Length], read.GetString(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Dict_AllNullColumnFallsThrough()
+    {
+        // All-null column → IsApplicable rejects (no non-null values to dict),
+        // dispatch falls through to plain varbin. Round-trip preserves the
+        // all-null state.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 100;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++) b.AppendNull();
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            Assert.Equal(n, read.NullCount);
+            for (int i = 0; i < n; i++) Assert.False(read.IsValid(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Dict_HighDistinctCountFallsThrough()
     {
         // Mostly-unique strings — distinct count > n/4, dispatch should reject

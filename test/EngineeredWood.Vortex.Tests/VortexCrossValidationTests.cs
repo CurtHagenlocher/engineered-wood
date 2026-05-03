@@ -317,16 +317,25 @@ public class VortexCrossValidationTests
         var validator = FindValidator();
         if (validator is null) return;
 
-        // Repetitive strings: dict dispatches.
+        // Mixed: a non-nullable dict-friendly column AND a nullable one to
+        // exercise both is_nullable_codes flag values + the codes-validity
+        // child encoding path.
         var schema = new Apache.Arrow.Schema(new[]
         {
             new Field("status", StringType.Default, nullable: false),
+            new Field("nullable_status", StringType.Default, nullable: true),
         }, metadata: null);
         var states = new[] { "open", "closed", "pending", "error" };
         const int n = 500;
         var b = new StringArray.Builder();
-        for (int i = 0; i < n; i++) b.Append(states[i % states.Length]);
-        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+        var nb = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            b.Append(states[i % states.Length]);
+            if (i % 7 == 0) nb.AppendNull();
+            else nb.Append(states[(i + 1) % states.Length]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build(), nb.Build() }, n);
 
         var path = Path.GetTempFileName();
         try
