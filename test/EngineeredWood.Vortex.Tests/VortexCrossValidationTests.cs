@@ -580,6 +580,50 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenSlicedDictFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Build a 400-row repetitive nullable string column then slice off
+        // the first 47 rows (odd offset → bit-level validity copy). Both the
+        // values and the validity of the remaining 353 rows must round-trip
+        // correctly through the Rust reader.
+        var palette = new[] { "open", "closed", "pending", "error", "stalled" };
+        const int sourceLen = 400;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < sourceLen; i++)
+        {
+            if (i % 9 == 0) b.AppendNull();
+            else b.Append(palette[i % palette.Length]);
+        }
+        var sliced = (StringArray)((StringArray)b.Build()).Slice(47, sourceLen - 47);
+
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: true),
+        }, metadata: null);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliced.Length);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={sliced.Length}", stdout);
+            Assert.Contains($"DONE total={sliced.Length}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenRunEndFile()
     {
         var validator = FindValidator();

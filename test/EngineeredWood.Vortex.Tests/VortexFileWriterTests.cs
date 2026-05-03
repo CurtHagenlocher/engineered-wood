@@ -2552,6 +2552,95 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Dict_SlicedNonNullableRoundtrip()
+    {
+        // Build a 200-row column then slice off the first 75 rows so the
+        // visible window has data.Offset = 75. The encoder must use
+        // GetString(i) for values (offset-aware) AND read the validity bitmap
+        // at bit (offset + i) when present. Here non-nullable, so we're
+        // verifying just the value path.
+        var palette = new[] { "alpha", "beta", "gamma", "delta", "epsilon" };
+        var b = new StringArray.Builder();
+        for (int i = 0; i < 200; i++) b.Append(palette[i % palette.Length]);
+        var full = (StringArray)b.Build();
+        var sliced = (StringArray)full.Slice(75, 125); // visible: rows 75..199.
+
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: false),
+        }, metadata: null);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 125);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(125, read.Length);
+            for (int i = 0; i < 125; i++)
+                Assert.Equal(palette[(i + 75) % palette.Length], read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Dict_SlicedNullableRoundtrip()
+    {
+        // Same as above but with every 7th row null in the source. Picks an
+        // odd slice offset (43) — bit 43 isn't byte-aligned so this exercises
+        // the bit-level path of ExtractValidityBitmap. After slicing, row k
+        // of the visible window corresponds to source row (43 + k); we expect
+        // null exactly when (43 + k) % 7 == 0.
+        var palette = new[] { "x", "y", "z", "w" };
+        const int sourceLen = 200;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < sourceLen; i++)
+        {
+            if (i % 7 == 0) b.AppendNull();
+            else b.Append(palette[i % palette.Length]);
+        }
+        var full = (StringArray)b.Build();
+        const int sliceOff = 43;
+        const int sliceLen = 100;
+        var sliced = (StringArray)full.Slice(sliceOff, sliceLen);
+
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: true),
+        }, metadata: null);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+            {
+                int sourceRow = sliceOff + i;
+                if (sourceRow % 7 == 0)
+                    Assert.False(read.IsValid(i), $"row {i} (source {sourceRow}) should be null");
+                else
+                    Assert.Equal(palette[sourceRow % palette.Length], read.GetString(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Dict_HighDistinctCountFallsThrough()
     {
         // Mostly-unique strings — distinct count > n/4, dispatch should reject

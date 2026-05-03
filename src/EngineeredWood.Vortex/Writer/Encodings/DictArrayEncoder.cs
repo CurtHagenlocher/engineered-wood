@@ -28,17 +28,15 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 internal static class DictArrayEncoder
 {
     /// <summary>
-    /// Returns true iff the column is a non-sliced StringArray with at least
-    /// one non-null value AND the distinct count is small enough that the
-    /// codes + dict-values payload is meaningfully smaller than the raw varbin
-    /// encoding. Heuristic: at least 4× repetition (<c>K × 4 ≤ n</c>) AND at
-    /// least 8 rows.
+    /// Returns true iff the column is a StringArray with at least one non-null
+    /// value AND the distinct count is small enough that the codes + dict-values
+    /// payload is meaningfully smaller than the raw varbin encoding. Heuristic:
+    /// at least 4× repetition (<c>K × 4 ≤ n</c>) AND at least 8 rows.
     /// </summary>
     public static bool IsApplicable(IArrowArray array)
     {
         if (array is not StringArray s) return false;
         var data = s.Data;
-        if (data.Offset != 0) return false; // dict over sliced — defer
         int n = s.Length;
         if (n < 8) return false;
         int nullCount = data.GetNullCount();
@@ -49,9 +47,10 @@ internal static class DictArrayEncoder
         int cap = n / 4;
         bool hasNulls = nullCount > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
+        int off = data.Offset;
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && !IsValidAt(validity, i)) continue;
+            if (hasNulls && !IsValidAt(validity, off + i)) continue;
             seen.Add(s.GetString(i));
             if (seen.Count > cap) return false;
         }
@@ -68,23 +67,25 @@ internal static class DictArrayEncoder
             throw new NotSupportedException(
                 $"vortex.dict writer requires StringArray, got {array.GetType().Name}.");
         var data = s.Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.dict writer doesn't yet support sliced inputs.");
 
         int n = s.Length;
         int nullCount = data.GetNullCount();
         bool hasNulls = nullCount > 0;
+        int off = data.Offset;
         var validity = hasNulls ? data.Buffers[0].Span : default;
 
         // 1. Build dictionary in input order — first occurrence (of a non-null
         //    value) assigns the index. Null positions get code = 0; the codes
         //    child's validity bit at that row is 0 so the value is masked.
+        //    StringArray.GetString(i) already resolves through data.Offset, but
+        //    the validity bitmap is bit-addressed at data.Offset and needs to
+        //    be read with that offset added to i.
         var lookup = new Dictionary<string, int>(StringComparer.Ordinal);
         var distinct = new List<string>();
         var codes = new int[n];
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && !IsValidAt(validity, i))
+            if (hasNulls && !IsValidAt(validity, off + i))
             {
                 codes[i] = 0;
                 continue;
@@ -101,9 +102,13 @@ internal static class DictArrayEncoder
         int k = distinct.Count;
 
         // 2. Pick the smallest unsigned codes width. PType enum: U8=0, U16=1, U32=2, U64=3.
-        //    For nullable input, the codes array also carries the input's
-        //    validity bitmap so the reader can mark output rows null.
-        ArrowBuffer codesValidityBuf = hasNulls ? data.Buffers[0] : ArrowBuffer.Empty;
+        //    For nullable input, the codes array carries a fresh row-0-aligned
+        //    copy of the visible validity bits — Apache.Arrow's bitmap is bit-
+        //    addressed at data.Offset, so we can't just hand it through
+        //    untouched when the input is sliced.
+        ArrowBuffer codesValidityBuf = hasNulls
+            ? new ArrowBuffer(EncoderHelpers.ExtractValidityBitmap(validity, srcBitOffset: off, rowCount: n))
+            : ArrowBuffer.Empty;
         IArrowArray codesArray;
         byte codesPtype;
         if (k <= byte.MaxValue + 1) // K up to 256 fits in u8.
