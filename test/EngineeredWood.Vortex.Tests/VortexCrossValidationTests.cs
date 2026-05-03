@@ -190,6 +190,56 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenStructOfStructFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        var innerType = new StructType(new[]
+        {
+            new Field("y", Int32Type.Default, nullable: false),
+            new Field("z", StringType.Default, nullable: false),
+        });
+        var outerType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: false),
+            new Field("inner", innerType, nullable: false),
+        });
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("nested", outerType, nullable: false),
+        }, metadata: null);
+
+        const int n = 100;
+        var xB = new Int32Array.Builder();
+        var yB = new Int32Array.Builder();
+        var zB = new StringArray.Builder();
+        for (int i = 0; i < n; i++) { xB.Append(i); yB.Append(i * 2); zB.Append($"v{i}"); }
+        var inner = new StructArray(innerType, n,
+            new IArrowArray[] { yB.Build(), zB.Build() }, ArrowBuffer.Empty, 0);
+        var outer = new StructArray(outerType, n,
+            new IArrowArray[] { xB.Build(), inner }, ArrowBuffer.Empty, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { outer }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenBitPackedWithPatchesFile()
     {
         var validator = FindValidator();

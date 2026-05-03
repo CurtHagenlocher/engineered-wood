@@ -13,7 +13,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
-    ushort Dict, ushort Rle);
+    ushort Dict, ushort Rle, ushort Struct_);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -64,6 +64,7 @@ internal static class ArrayEncoderDispatch
 
         return array switch
         {
+            StructArray => StructArrayEncoder.Emit(sb, array, idx, statsTicket),
             ListArray => ListArrayEncoder.Emit(sb, array, idx, statsTicket),
             FixedSizeListArray => FixedSizeListArrayEncoder.Emit(sb, array, idx, statsTicket),
             // Decimal128/256Array inherit from FixedSizeBinaryArray, so they MUST

@@ -1436,6 +1436,220 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Struct_FlatRoundtrips()
+    {
+        // Top-level field is a Struct with 3 leaf fields. Encoder dispatches
+        // through StructArrayEncoder which recursively encodes each field.
+        var innerType = new StructType(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: false),
+            new Field("b", DoubleType.Default, nullable: false),
+            new Field("c", StringType.Default, nullable: false),
+        });
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("payload", innerType, nullable: false),
+        }, metadata: null);
+
+        const int n = 100;
+        var aB = new Int32Array.Builder();
+        var bB = new DoubleArray.Builder();
+        var cB = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            aB.Append(i * 7);
+            bB.Append(i * 0.5);
+            cB.Append($"row-{i:D3}");
+        }
+        var structArr = new StructArray(innerType, n,
+            new IArrowArray[] { aB.Build(), bB.Build(), cB.Build() },
+            ArrowBuffer.Empty, nullCount: 0);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArr }, n);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StructArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            var aRead = (Int32Array)read.Fields[0];
+            var bRead = (DoubleArray)read.Fields[1];
+            var cRead = (StringArray)read.Fields[2];
+            for (int i = 0; i < n; i++)
+            {
+                Assert.Equal(i * 7, aRead.GetValue(i));
+                Assert.Equal(i * 0.5, bRead.GetValue(i));
+                Assert.Equal($"row-{i:D3}", cRead.GetString(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Struct_OfStructRoundtrips()
+    {
+        // Nested struct: outer { x: i32, inner: struct { y: i32, z: string } }.
+        // Both encoder and decoder must recurse through the nested layer.
+        var innerType = new StructType(new[]
+        {
+            new Field("y", Int32Type.Default, nullable: false),
+            new Field("z", StringType.Default, nullable: false),
+        });
+        var outerType = new StructType(new[]
+        {
+            new Field("x", Int32Type.Default, nullable: false),
+            new Field("inner", innerType, nullable: false),
+        });
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("nested", outerType, nullable: false),
+        }, metadata: null);
+
+        const int n = 50;
+        var xB = new Int32Array.Builder();
+        var yB = new Int32Array.Builder();
+        var zB = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            xB.Append(i);
+            yB.Append(i * 2);
+            zB.Append($"v{i}");
+        }
+        var inner = new StructArray(innerType, n,
+            new IArrowArray[] { yB.Build(), zB.Build() }, ArrowBuffer.Empty, 0);
+        var outer = new StructArray(outerType, n,
+            new IArrowArray[] { xB.Build(), inner }, ArrowBuffer.Empty, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { outer }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StructArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            var xRead = (Int32Array)read.Fields[0];
+            var innerRead = (StructArray)read.Fields[1];
+            Assert.Equal(n, innerRead.Length);
+            var yRead = (Int32Array)innerRead.Fields[0];
+            var zRead = (StringArray)innerRead.Fields[1];
+            for (int i = 0; i < n; i++)
+            {
+                Assert.Equal(i, xRead.GetValue(i));
+                Assert.Equal(i * 2, yRead.GetValue(i));
+                Assert.Equal($"v{i}", zRead.GetString(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Struct_NullableRoundtrips()
+    {
+        // Struct with its own validity bitmap on top of non-nullable fields.
+        var innerType = new StructType(new[]
+        {
+            new Field("a", Int32Type.Default, nullable: false),
+            new Field("b", StringType.Default, nullable: false),
+        });
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", innerType, nullable: true),
+        }, metadata: null);
+
+        const int n = 80;
+        var aB = new Int32Array.Builder();
+        var bB = new StringArray.Builder();
+        for (int i = 0; i < n; i++) { aB.Append(i); bB.Append($"r{i}"); }
+        var validityBitmap = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 5 == 0) nullCount++;
+            else validityBitmap[i / 8] |= (byte)(1 << (i % 8));
+        }
+        var structArr = new StructArray(innerType, n,
+            new IArrowArray[] { aB.Build(), bB.Build() },
+            new ArrowBuffer(validityBitmap), nullCount);
+        var batch = new RecordBatch(schema, new IArrowArray[] { structArr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StructArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            Assert.Equal(nullCount, read.NullCount);
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 5 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                    Assert.True(read.IsValid(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Struct_SlicedRoundtrips()
+    {
+        // Sliced struct: encoder must slice each field child to the parent's
+        // logical window and pass through the bit-aligned validity offset.
+        var innerType = new StructType(new[]
+        {
+            new Field("k", Int32Type.Default, nullable: false),
+        });
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", innerType, nullable: false),
+        }, metadata: null);
+
+        const int total = 100;
+        var kB = new Int32Array.Builder();
+        for (int i = 0; i < total; i++) kB.Append(i * 11);
+        var full = new StructArray(innerType, total,
+            new IArrowArray[] { kB.Build() }, ArrowBuffer.Empty, 0);
+        var sliced = (StructArray)full.Slice(20, 50);
+        Assert.Equal(20, sliced.Offset);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 50);
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StructArray>(await reader.ReadColumnAsync(0));
+            var kRead = (Int32Array)read.Fields[0];
+            for (int i = 0; i < 50; i++)
+                Assert.Equal((20 + i) * 11, kRead.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task BitPacked_WithPatchesCompresses()
     {
         // 99% of values fit in 8 bits; 1% are full-width 32-bit outliers.

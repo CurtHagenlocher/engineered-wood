@@ -85,6 +85,8 @@ internal static class ArrayDecoder
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.List => ListArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
+            VortexArrayEncodings.Struct_ => StructArrayDecoder.Decode(
+                node, serialized, arraySpecs, expectedType, expectedRowCount),
             VortexArrayEncodings.ListView => ListViewArrayDecoder.Decode(
                 node, serialized, arraySpecs, expectedType, expectedRowCount),
             _ => throw new NotSupportedException(
