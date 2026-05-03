@@ -1436,6 +1436,228 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Bool_SlicedRoundtrips()
+    {
+        // BooleanArray uses a packed bitmap at Buffers[1]. Slicing shifts the
+        // visible window by data.Offset bits — encoder must use the bit-aligned
+        // ExtractValidityBitmap helper (which it does for both values + nulls).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("flag", BooleanType.Default, nullable: true),
+        }, metadata: null);
+        const int total = 200;
+        var b = new BooleanArray.Builder();
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 7 == 0) b.AppendNull();
+            else b.Append(i % 3 == 0);
+        }
+        var full = b.Build();
+        var sliced = (BooleanArray)full.Slice(11, 150); // offset=11 → not byte-aligned
+        Assert.Equal(11, sliced.Offset);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 150);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<BooleanArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(150, read.Length);
+            for (int i = 0; i < 150; i++)
+            {
+                int srcRow = 11 + i;
+                if (srcRow % 7 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal(srcRow % 3 == 0, read.GetValue(i)!.Value);
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task List_SlicedRoundtrips()
+    {
+        // List<int32> sliced; encoder must rebase visible offsets to start at 0
+        // and pass only the corresponding range of the elements array to the
+        // recursive encoder.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("xs", new ListType(Int32Type.Default), nullable: true),
+        }, metadata: null);
+        const int total = 80;
+        var listB = new ListArray.Builder(Int32Type.Default);
+        var inner = (Int32Array.Builder)listB.ValueBuilder;
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 13 == 0) listB.AppendNull();
+            else
+            {
+                listB.Append();
+                int len = (i % 4) + 1;
+                for (int j = 0; j < len; j++) inner.Append(i * 100 + j);
+            }
+        }
+        var full = listB.Build();
+        var sliced = (ListArray)full.Slice(20, 50);
+        Assert.Equal(20, sliced.Offset);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 50);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<ListArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(50, read.Length);
+            var readElements = (Int32Array)read.Values;
+            for (int i = 0; i < 50; i++)
+            {
+                int srcRow = 20 + i;
+                if (srcRow % 13 == 0)
+                {
+                    Assert.False(read.IsValid(i));
+                }
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    int len = (srcRow % 4) + 1;
+                    int start = read.ValueOffsets[i];
+                    int end = read.ValueOffsets[i + 1];
+                    Assert.Equal(len, end - start);
+                    for (int j = 0; j < len; j++)
+                        Assert.Equal(srcRow * 100 + j, readElements.GetValue(start + j));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task FixedSizeList_SlicedRoundtrips()
+    {
+        // FSL<int32, 3> sliced; encoder must restrict the elements view to
+        // [Offset*listSize, Offset*listSize + rowCount*listSize).
+        const int listSize = 3;
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("xyz", new FixedSizeListType(Int32Type.Default, listSize), nullable: true),
+        }, metadata: null);
+        const int total = 60;
+        var fslB = new FixedSizeListArray.Builder(Int32Type.Default, listSize);
+        var inner = (Int32Array.Builder)fslB.ValueBuilder;
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 9 == 0) fslB.AppendNull();
+            else
+            {
+                fslB.Append();
+                inner.Append(i * 10);
+                inner.Append(i * 10 + 1);
+                inner.Append(i * 10 + 2);
+            }
+        }
+        var full = fslB.Build();
+        var sliced = (FixedSizeListArray)full.Slice(15, 30);
+        Assert.Equal(15, sliced.Offset);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 30);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<FixedSizeListArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(30, read.Length);
+            var readElements = (Int32Array)read.Values;
+            for (int i = 0; i < 30; i++)
+            {
+                int srcRow = 15 + i;
+                if (srcRow % 9 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal(srcRow * 10, readElements.GetValue(i * listSize));
+                    Assert.Equal(srcRow * 10 + 1, readElements.GetValue(i * listSize + 1));
+                    Assert.Equal(srcRow * 10 + 2, readElements.GetValue(i * listSize + 2));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Varbin_SlicedRoundtrips()
+    {
+        // String column sliced — verify VarBinArrayEncoder honors data.Offset.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int total = 80;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 6 == 0) b.AppendNull();
+            else b.Append($"row-{i:D3}");
+        }
+        var full = b.Build();
+        var sliced = (StringArray)full.Slice(25, 40);
+        Assert.Equal(25, sliced.Offset);
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 40);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(40, read.Length);
+            for (int i = 0; i < 40; i++)
+            {
+                int srcRow = 25 + i;
+                if (srcRow % 6 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    Assert.Equal($"row-{srcRow:D3}", read.GetString(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task BitPacked_SlicedInputRoundtrips()
     {
         // Build a 3000-row UInt32, slice [500..2500). Bitpacked must honor
