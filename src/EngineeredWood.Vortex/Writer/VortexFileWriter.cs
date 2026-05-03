@@ -45,6 +45,7 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort FixedSizeListEncodingIdx = 4;
     private const ushort BitPackedEncodingIdx = 5;
     private const ushort DecimalEncodingIdx = 6;
+    private const ushort ConstantEncodingIdx = 7;
     private static readonly EncodingIndices Indices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
@@ -52,7 +53,8 @@ public sealed class VortexFileWriter : IDisposable
         List: ListEncodingIdx,
         FixedSizeList: FixedSizeListEncodingIdx,
         BitPacked: BitPackedEncodingIdx,
-        Decimal: DecimalEncodingIdx);
+        Decimal: DecimalEncodingIdx,
+        Constant: ConstantEncodingIdx);
 
     // Layout-spec registry constants.
     private const ushort FlatLayoutIdx = 0;
@@ -177,6 +179,7 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.FixedSizeList,
                 VortexArrayEncodings.FastlanesBitPacked,
                 VortexArrayEncodings.Decimal,
+                VortexArrayEncodings.Constant,
             },
             layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked },
             segmentSpecs: _sw.SegmentSpecs);

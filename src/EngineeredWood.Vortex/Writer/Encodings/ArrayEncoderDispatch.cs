@@ -12,7 +12,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// </summary>
 internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
-    ushort BitPacked, ushort Decimal);
+    ushort BitPacked, ushort Decimal, ushort Constant);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -24,13 +24,16 @@ internal static class ArrayEncoderDispatch
 {
     /// <summary>
     /// <param name="compress">When true, eligible columns auto-route through
-    /// compressing encodings (currently <c>fastlanes.bitpacked</c> for
-    /// non-nullable unsigned ints with MaxBits &lt; native).</param>
+    /// compressing encodings — <c>vortex.constant</c> for fully-uniform columns,
+    /// then <c>fastlanes.bitpacked</c> for non-nullable integers with MaxBits
+    /// &lt; native. Constant is checked first because it's strictly smaller.</param>
     /// </summary>
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx,
         int? statsTicket = null, bool compress = false)
     {
+        if (compress && ConstantArrayEncoder.IsApplicable(array))
+            return ConstantArrayEncoder.Emit(sb, array, idx.Constant, statsTicket);
         if (compress && BitPackedArrayEncoder.IsApplicable(array))
             return BitPackedArrayEncoder.Emit(sb, array, idx.BitPacked, idx.Bool, statsTicket);
 

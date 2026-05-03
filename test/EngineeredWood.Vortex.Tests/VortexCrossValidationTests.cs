@@ -190,6 +190,42 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenConstantFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("k", Int64Type.Default, nullable: false),
+            new Field("flag", BooleanType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 800;
+        var k = new Int64Array.Builder();
+        var flag = new BooleanArray.Builder();
+        for (int i = 0; i < n; i++) { k.Append(42L); flag.Append(true); }
+        var batch = new RecordBatch(schema,
+            new IArrowArray[] { k.Build(), flag.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenDecimalFile()
     {
         var validator = FindValidator();

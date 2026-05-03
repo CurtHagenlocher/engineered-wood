@@ -1354,6 +1354,132 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Constant_PrimitiveRoundtrips()
+    {
+        // Three columns where ALL values are identical — should compress to
+        // vortex.constant, dropping the file size dramatically.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("i32", Int32Type.Default, nullable: false),
+            new Field("u64", UInt64Type.Default, nullable: false),
+            new Field("f64", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 5_000;
+        var i32 = new Int32Array.Builder();
+        var u64 = new UInt64Array.Builder();
+        var f64 = new DoubleArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            i32.Append(-42);
+            u64.Append(0xCAFEBABE_DEADBEEFUL);
+            f64.Append(3.14159);
+        }
+        var batch = new RecordBatch(schema,
+            new IArrowArray[] { i32.Build(), u64.Build(), f64.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 10,
+                $"Constant compression should yield <1/10 of raw size; raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var i32Read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            var u64Read = Assert.IsType<UInt64Array>(await reader.ReadColumnAsync(1));
+            var f64Read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(2));
+            Assert.Equal(n, i32Read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                Assert.Equal(-42, i32Read.GetValue(i));
+                Assert.Equal(0xCAFEBABE_DEADBEEFUL, u64Read.GetValue(i));
+                Assert.Equal(3.14159, f64Read.GetValue(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Constant_BoolRoundtrips()
+    {
+        // Bool columns where every row is the same.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("all_true", BooleanType.Default, nullable: false),
+            new Field("all_false", BooleanType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1000;
+        var t = new BooleanArray.Builder();
+        var f = new BooleanArray.Builder();
+        for (int i = 0; i < n; i++) { t.Append(true); f.Append(false); }
+
+        var batch = new RecordBatch(schema, new IArrowArray[] { t.Build(), f.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var tRead = Assert.IsType<BooleanArray>(await reader.ReadColumnAsync(0));
+            var fRead = Assert.IsType<BooleanArray>(await reader.ReadColumnAsync(1));
+            for (int i = 0; i < n; i++)
+            {
+                Assert.True(tRead.GetValue(i)!.Value);
+                Assert.False(fRead.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Constant_FallsBackForNonConstant()
+    {
+        // Non-constant column with compress=true should fall through to plain
+        // primitive (or bitpacked, doesn't matter — what matters is that values
+        // round-trip even when constant detection rejects.)
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("varying", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 100;
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < n; i++) b.Append(i * 7 + 3);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal(i * 7 + 3, read.GetValue(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task SelfRoundtrip_Decimal128_NonNullable()
     {
         var dec = new Decimal128Type(18, 4);
