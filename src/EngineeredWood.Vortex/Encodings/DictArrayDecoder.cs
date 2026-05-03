@@ -16,7 +16,8 @@ namespace EngineeredWood.Vortex.Encodings;
 /// at array-decode time inside a single segment.
 ///
 /// <para>Wire format: 0 buffers, 2 children (codes, values).
-/// Metadata <c>DictMetadata { codes_ptype, values_len, is_nullable_codes, all_values_referenced }</c>.</para>
+/// Metadata <c>DictMetadata { values_len: u32 (tag 1), codes_ptype: PType (tag 2),
+/// is_nullable_codes: optional bool (tag 3), all_values_referenced: optional bool (tag 4) }</c>.</para>
 /// </summary>
 internal static class DictArrayDecoder
 {
@@ -49,11 +50,11 @@ internal static class DictArrayDecoder
     }
 
     /// <summary>
-    /// Parses <c>DictMetadata</c>:
-    ///   field 1 (varint): codes_ptype (PType enum)
-    ///   field 2 (varint): values_len (u32)
-    ///   field 3 (varint, optional): is_nullable_codes (bool)
-    ///   field 4 (varint, optional): all_values_referenced (bool)
+    /// Parses <c>DictMetadata</c> per vortex-array's <c>arrays/dict/array.rs</c>:
+    ///   field 1 (varint, u32): values_len
+    ///   field 2 (varint, PType enum): codes_ptype
+    ///   field 3 (varint, optional bool): is_nullable_codes
+    ///   field 4 (varint, optional bool): all_values_referenced
     /// </summary>
     private static (int CodesPtype, ulong ValuesLen) ParseDictMetadata(ReadOnlySpan<byte> bytes)
     {
@@ -66,9 +67,9 @@ internal static class DictArrayDecoder
             var fieldNum = tag >> 3;
             var wireType = tag & 0x7;
             if (fieldNum == 1 && wireType == 0)
-                codesPtype = (int)Varint.ReadUnsigned(bytes, ref pos);
-            else if (fieldNum == 2 && wireType == 0)
                 valuesLen = (ulong)Varint.ReadUnsigned(bytes, ref pos);
+            else if (fieldNum == 2 && wireType == 0)
+                codesPtype = (int)Varint.ReadUnsigned(bytes, ref pos);
             else
             {
                 switch (wireType)

@@ -1436,6 +1436,114 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Dict_RepetitiveStringsCompress()
+    {
+        // Highly repetitive string column — only 5 distinct values, 1000 rows.
+        // Should route through vortex.dict: codes child = UInt8 (5 ≤ 256),
+        // values child = StringArray of 5 entries. File size should drop
+        // dramatically vs raw varbin.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("color", StringType.Default, nullable: false),
+        }, metadata: null);
+        var palette = new[] { "red", "green", "blue", "yellow", "magenta" };
+        const int n = 1_000;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++) b.Append(palette[i % palette.Length]);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 3,
+                $"Dict on a 5-distinct/1000-row string column should give >3x compression. raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(palette[i % palette.Length], read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Dict_HighDistinctCountFallsThrough()
+    {
+        // Mostly-unique strings — distinct count > n/4, dispatch should reject
+        // dict and fall through to plain varbin. Round-trip must still work.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("id", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 200;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++) b.Append($"unique-{i:D5}");
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal($"unique-{i:D5}", read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Dict_LargeDictUInt16Codes()
+    {
+        // Distinct count 500 forces UInt16 codes (256 < K ≤ 65536).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int distinctCount = 500;
+        const int n = distinctCount * 4; // 4× repetition → still passes K*4 ≤ n.
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++) b.Append($"k-{i % distinctCount:D4}");
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal($"k-{i % distinctCount:D4}", read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Bool_SlicedRoundtrips()
     {
         // BooleanArray uses a packed bitmap at Buffers[1]. Slicing shifts the
