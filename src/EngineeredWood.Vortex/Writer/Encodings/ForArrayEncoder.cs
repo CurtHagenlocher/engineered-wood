@@ -60,7 +60,7 @@ internal static class ForArrayEncoder
 
     public static int Emit(
         SegmentBuilder sb, IArrowArray array,
-        ushort forEncodingIdx, ushort bitpackedEncodingIdx, ushort boolEncodingIdx,
+        ushort forEncodingIdx, ushort bitpackedEncodingIdx, ushort primitiveEncodingIdx, ushort boolEncodingIdx,
         int? statsTicket = null)
     {
         if (array is null) throw new ArgumentNullException(nameof(array));
@@ -73,7 +73,7 @@ internal static class ForArrayEncoder
         // 2. Emit residuals as a child via bitpacked. Child gets no stats —
         //    statsTicket only attaches at the top of the column.
         int residualNodeTicket = BitPackedArrayEncoder.Emit(
-            sb, residualArray, bitpackedEncodingIdx, boolEncodingIdx);
+            sb, residualArray, bitpackedEncodingIdx, primitiveEncodingIdx, boolEncodingIdx);
 
         // 3. Emit FoR metadata as a byte vector (ScalarValue protobuf bytes).
         var metadataTicket = sb.Builder.WriteByteVector(metadataBytes);
@@ -90,10 +90,11 @@ internal static class ForArrayEncoder
 
     /// <summary>Convenience: encode one column's segment in isolation.</summary>
     public static byte[] Encode(
-        IArrowArray array, ushort forEncodingIdx, ushort bitpackedEncodingIdx, ushort boolEncodingIdx)
+        IArrowArray array, ushort forEncodingIdx, ushort bitpackedEncodingIdx,
+        ushort primitiveEncodingIdx, ushort boolEncodingIdx)
     {
         var sb = new SegmentBuilder();
-        var rootTicket = Emit(sb, array, forEncodingIdx, bitpackedEncodingIdx, boolEncodingIdx);
+        var rootTicket = Emit(sb, array, forEncodingIdx, bitpackedEncodingIdx, primitiveEncodingIdx, boolEncodingIdx);
         return sb.FinishSegment(rootTicket);
     }
 

@@ -173,7 +173,7 @@ internal static class DeltaArrayEncoder
         //    plain primitive. This is exactly what vortex's bitpack_compress
         //    does on the deltas child.
         int deltasNodeTicket = BitPackedArrayEncoder.IsApplicable(deltasArray)
-            ? BitPackedArrayEncoder.Emit(sb, deltasArray, bitpackedEncodingIdx, boolEncodingIdx)
+            ? BitPackedArrayEncoder.Emit(sb, deltasArray, bitpackedEncodingIdx, primitiveEncodingIdx, boolEncodingIdx)
             : PrimitiveArrayEncoder.Emit(sb, deltasArray, primitiveEncodingIdx, boolEncodingIdx);
 
         // 4. DeltaMetadata: field 1 (deltas_len, varint u64). Field 2 (offset)

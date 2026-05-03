@@ -1436,6 +1436,105 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task BitPacked_WithPatchesCompresses()
+    {
+        // 99% of values fit in 8 bits; 1% are full-width 32-bit outliers.
+        // Plain bitpacked would need W=32 (no compression). With patches at
+        // W=8, the bulk packs to 1 byte/row and outliers go in a sidecar.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: false),
+        }, metadata: null);
+        const int n = 4_096;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 100 == 0) b.Append((uint)(0x80000000u + (uint)i)); // outlier — needs 32 bits
+            else b.Append((uint)(i % 200));                           // ≤ 8 bits
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var compressedPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(compressedPath))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long compressedSize = new FileInfo(compressedPath).Length;
+            Assert.True(compressedSize < rawSize / 2,
+                $"Bitpacked-with-patches should give >2x compression (99% narrow, 1% wide). raw={rawSize}, compressed={compressedSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(compressedPath);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                uint expected = i % 100 == 0
+                    ? (uint)(0x80000000u + (uint)i)
+                    : (uint)(i % 200);
+                Assert.Equal(expected, read.GetValue(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(compressedPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task BitPacked_WithPatchesNullableRoundtrips()
+    {
+        // Nullable + patches: validity bitmap is the trailing child after
+        // patches indices/values/chunk_offsets.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", UInt32Type.Default, nullable: true),
+        }, metadata: null);
+        const int n = 2_048;
+        var b = new UInt32Array.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 13 == 0) b.AppendNull();
+            else if (i % 100 == 7) b.Append((uint)(0x40000000u + (uint)i)); // outlier
+            else b.Append((uint)(i % 64));
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<UInt32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (i % 13 == 0)
+                    Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    uint expected = i % 100 == 7
+                        ? (uint)(0x40000000u + (uint)i)
+                        : (uint)(i % 64);
+                    Assert.Equal(expected, read.GetValue(i));
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Rle_RepetitiveDoublesCompress()
     {
         // Float64 column with 5 distinct values cycling in 64-row runs.

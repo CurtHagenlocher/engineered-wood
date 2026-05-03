@@ -123,7 +123,11 @@ internal static class BitPackedArrayDecoder
 
     /// <summary>
     /// Mutates <paramref name="rawBytes"/> in place: for each k,
-    /// <c>output[indices[k] - patchesOffset] = values[k]</c>.
+    /// <c>output[indices[k] - patchesOffset] = values[k]</c>. Patch values
+    /// always go through <see cref="GetLongAtIndex"/> (not <see cref="GetIntAtIndex"/>)
+    /// because a u32 column's patch values can hold the full unsigned range,
+    /// and the bitpattern would overflow a checked-int cast for values ≥ 2^31.
+    /// Indices stay with <see cref="GetIntAtIndex"/> — they're bounded by rowCount.
     /// </summary>
     private static void ApplyPatchesInPlace(
         IArrowType type, byte[] rawBytes, int elementSize,
@@ -136,7 +140,7 @@ internal static class BitPackedArrayDecoder
                 for (int k = 0; k < patchCount; k++)
                 {
                     var rowIdx = GetIntAtIndex(indices, k) - patchesOffset;
-                    rawBytes[rowIdx] = (byte)GetIntAtIndex(values, k);
+                    rawBytes[rowIdx] = (byte)GetLongAtIndex(values, k);
                 }
                 break;
             case 2:
@@ -145,7 +149,7 @@ internal static class BitPackedArrayDecoder
                     for (int k = 0; k < patchCount; k++)
                     {
                         var rowIdx = GetIntAtIndex(indices, k) - patchesOffset;
-                        s[rowIdx] = (ushort)GetIntAtIndex(values, k);
+                        s[rowIdx] = (ushort)GetLongAtIndex(values, k);
                     }
                     break;
                 }
@@ -155,7 +159,7 @@ internal static class BitPackedArrayDecoder
                     for (int k = 0; k < patchCount; k++)
                     {
                         var rowIdx = GetIntAtIndex(indices, k) - patchesOffset;
-                        s[rowIdx] = (uint)GetIntAtIndex(values, k);
+                        s[rowIdx] = (uint)GetLongAtIndex(values, k);
                     }
                     break;
                 }

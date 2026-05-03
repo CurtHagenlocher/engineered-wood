@@ -58,9 +58,9 @@ internal static class ArrayEncoderDispatch
         if (compress && DeltaArrayEncoder.IsApplicable(array))
             return DeltaArrayEncoder.Emit(sb, array, idx.Delta, idx.Primitive, idx.BitPacked, idx.Bool, statsTicket);
         if (compress && ForArrayEncoder.IsApplicable(array))
-            return ForArrayEncoder.Emit(sb, array, idx.For, idx.BitPacked, idx.Bool, statsTicket);
+            return ForArrayEncoder.Emit(sb, array, idx.For, idx.BitPacked, idx.Primitive, idx.Bool, statsTicket);
         if (compress && BitPackedArrayEncoder.IsApplicable(array))
-            return BitPackedArrayEncoder.Emit(sb, array, idx.BitPacked, idx.Bool, statsTicket);
+            return BitPackedArrayEncoder.Emit(sb, array, idx.BitPacked, idx.Primitive, idx.Bool, statsTicket);
 
         return array switch
         {
