@@ -13,6 +13,33 @@ namespace EngineeredWood.Vortex.Layouts;
 internal readonly record struct SegmentChunk(uint SegmentRef, ulong RowCount);
 
 /// <summary>
+/// Per-column zoned-stats descriptor. Set when the layout was wrapped in
+/// <c>vortex.stats</c>; null otherwise. Captures everything the reader
+/// needs to materialize the per-zone stats table on demand.
+/// </summary>
+internal sealed class ZoneInfo
+{
+    /// <summary>Logical row count of each zone (final zone may be shorter).</summary>
+    public int ZoneLen { get; }
+    /// <summary>Sorted list of <see cref="EngineeredWood.Vortex.Stat"/>
+    /// values present in the zones table — derived from the bitset bytes
+    /// in the layout's metadata (vortex's <c>as_stat_bitset_bytes</c>).</summary>
+    public IReadOnlyList<int> PresentStats { get; }
+    /// <summary>Segment-spec index of the zones-table data segment.</summary>
+    public uint ZonesSegmentRef { get; }
+    /// <summary>Number of zones (= zones-table row count = batch count for our writer).</summary>
+    public int ZoneCount { get; }
+
+    public ZoneInfo(int zoneLen, IReadOnlyList<int> presentStats, uint zonesSegmentRef, int zoneCount)
+    {
+        ZoneLen = zoneLen;
+        PresentStats = presentStats;
+        ZonesSegmentRef = zonesSegmentRef;
+        ZoneCount = zoneCount;
+    }
+}
+
+/// <summary>
 /// Per-Arrow-field plan. Today there are two concrete kinds:
 /// <see cref="FlatColumnPlan"/> (segments hold the column directly) and
 /// <see cref="DictColumnPlan"/> (the layout is <c>vortex.dict</c>: the column
@@ -22,6 +49,9 @@ internal readonly record struct SegmentChunk(uint SegmentRef, ulong RowCount);
 internal abstract class ColumnPlan
 {
     public IArrowType ArrowType { get; }
+    /// <summary>Set when this column was wrapped in <c>vortex.stats</c> at
+    /// file write time. Null otherwise — pruning is unavailable.</summary>
+    public ZoneInfo? ZoneInfo { get; init; }
     public abstract ulong TotalRows { get; }
     public abstract int ChunkCount { get; }
 

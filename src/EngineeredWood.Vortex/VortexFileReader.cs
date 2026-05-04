@@ -345,7 +345,24 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
     /// chunk in the layout tree. For files without chunking (the common case
     /// today) this yields exactly one batch with all rows.
     /// </summary>
+    public IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+        CancellationToken cancellationToken = default)
+        => ReadAllAsync(acceptedZones: null, cancellationToken);
+
+    /// <summary>
+    /// Streams the file as Arrow <see cref="RecordBatch"/>es, optionally
+    /// filtered by zone. When <paramref name="acceptedZones"/> is non-null,
+    /// only chunks whose zone index is in the set are decoded — letting
+    /// callers prune whole zones based on the per-column stats returned
+    /// from <see cref="GetZoneStatsAsync"/>.
+    ///
+    /// <para>For files written with <c>preserveStats: true</c> using uniform
+    /// batch sizes, chunk index == zone index. For non-zoned files
+    /// <paramref name="acceptedZones"/> still filters the chunk index but
+    /// the caller has no per-zone stats to drive the decision.</para>
+    /// </summary>
     public async IAsyncEnumerable<Apache.Arrow.RecordBatch> ReadAllAsync(
+        ISet<int>? acceptedZones,
         [EnumeratorCancellation] CancellationToken cancellationToken = default)
     {
         if (_columnPlans.Length == 0)
@@ -362,6 +379,7 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
 
         for (int chunkIdx = 0; chunkIdx < chunkCount; chunkIdx++)
         {
+            if (acceptedZones is not null && !acceptedZones.Contains(chunkIdx)) continue;
             var arrays = new Apache.Arrow.IArrowArray[_columnPlans.Length];
             int rowCount = -1;
             for (int colIdx = 0; colIdx < arrays.Length; colIdx++)
@@ -400,6 +418,48 @@ public sealed class VortexFileReader : IAsyncDisposable, IDisposable
                 throw new NotSupportedException(
                     $"Column plan type {plan.GetType().Name} is not yet supported.");
         }
+    }
+
+    /// <summary>
+    /// Returns the per-zone stats table for column <paramref name="fieldIndex"/>,
+    /// or <c>null</c> if the column wasn't written with a <c>vortex.stats</c>
+    /// (zoned) layout. Materializes the stats segment lazily — the file open
+    /// path doesn't decode it.
+    ///
+    /// <para>Use the returned <see cref="ZoneStats"/> to derive a
+    /// <see cref="HashSet{T}"/> of accepted zone indices, then pass that set
+    /// to <see cref="ReadAllAsync(System.Collections.Generic.IReadOnlySet{int}?, CancellationToken)"/>
+    /// to skip whole zones at decode time.</para>
+    /// </summary>
+    public async Task<ZoneStats?> GetZoneStatsAsync(
+        int fieldIndex, CancellationToken cancellationToken = default)
+    {
+        if ((uint)fieldIndex >= (uint)_columnPlans.Length)
+            throw new ArgumentOutOfRangeException(nameof(fieldIndex), fieldIndex,
+                $"fieldIndex must be in [0, {_columnPlans.Length}).");
+        var plan = _columnPlans[fieldIndex];
+        if (plan.ZoneInfo is null) return null;
+        var zi = plan.ZoneInfo;
+
+        var locator = _segmentSpecs[(int)zi.ZonesSegmentRef];
+        using var owner = await _reader.ReadAsync(
+            new FileRange(checked((long)locator.Offset), checked((int)locator.Length)),
+            cancellationToken).ConfigureAwait(false);
+        var compressed = owner.Memory.Span;
+        var raw = locator.Codec == CompressionCodec.Uncompressed
+            ? compressed
+            : throw new NotSupportedException(
+                $"Decompressing the zones segment with codec {locator.Codec} is not yet implemented.");
+        var serialized = SerializedArray.Parse(raw);
+
+        // The zones segment contains a vortex.struct ArrayNode whose fields
+        // correspond to PresentStats (with min/max followed by their
+        // truncation flag). Build the matching Arrow struct dtype, decode,
+        // then map fields back to ZoneStats.
+        var structType = ZoneStatsLayout.BuildStructType(plan.ArrowType, zi.PresentStats);
+        var structArray = (Apache.Arrow.StructArray)ArrayDecoder.Decode(
+            serialized, _arraySpecs, structType, zi.ZoneCount);
+        return ZoneStatsLayout.FromStruct(structArray, plan.ArrowType, zi);
     }
 
     private async Task<Apache.Arrow.IArrowArray> ReadFlatChunkAsync(

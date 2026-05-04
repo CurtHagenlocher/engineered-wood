@@ -40,10 +40,18 @@ internal static class LayoutPlanner
         switch (layout.EncodingId)
         {
             case VortexLayoutEncodings.Stats:
-                // Skip the stats wrapper; child[0] is the actual data layout.
-                if (layout.Children.Count < 1)
-                    throw new VortexFormatException("vortex.stats layout has no children.");
-                return PlanField(arrowType, layout.Children[0]);
+                {
+                    // vortex.stats: child[0] = data, child[1] = zones table.
+                    // Capture the zones segment ref + present_stats so the
+                    // reader can materialize per-zone stats on demand.
+                    if (layout.Children.Count < 2)
+                        throw new VortexFormatException(
+                            $"vortex.stats layout must have 2 children (data, zones), got {layout.Children.Count}.");
+                    var dataPlan = PlanField(arrowType, layout.Children[0]);
+                    if (TryParseStatsLayout(layout, out var zoneInfo))
+                        dataPlan = WithZoneInfo(dataPlan, zoneInfo!);
+                    return dataPlan;
+                }
 
             case VortexLayoutEncodings.Dictionary:
                 {
@@ -80,6 +88,71 @@ internal static class LayoutPlanner
                     "Add a case and a fixture that exercises it.");
         }
     }
+
+    /// <summary>
+    /// Parses a <c>vortex.stats</c> layout: extracts <c>zone_len</c> +
+    /// <c>present_stats</c> from the metadata and pulls the zones segment
+    /// ref out of children[1] (which we expect to be a <c>vortex.flat</c>
+    /// pointing at a single segment). Returns false when the metadata is
+    /// malformed or zone_len is 0 (legacy / pruning-disabled marker).
+    /// </summary>
+    private static bool TryParseStatsLayout(VortexLayout layout, out ZoneInfo? zoneInfo)
+    {
+        zoneInfo = null;
+        var meta = layout.Metadata;
+        if (meta.Length < 4) return false;
+        // u32 LE zone_len at bytes 0..3.
+        int zoneLen =
+            meta[0] |
+            (meta[1] << 8) |
+            (meta[2] << 16) |
+            (meta[3] << 24);
+        if (zoneLen <= 0) return false;
+
+        var presentStats = ParseStatBitset(meta, 4);
+
+        // Zones layout (child[1]) — typically vortex.flat with one segment.
+        var zonesLayout = layout.Children[1];
+        if (zonesLayout.EncodingId != VortexLayoutEncodings.Flat) return false;
+        if (zonesLayout.SegmentRefs.Count != 1) return false;
+        int zoneCount = checked((int)zonesLayout.RowCount);
+
+        zoneInfo = new ZoneInfo(zoneLen, presentStats, zonesLayout.SegmentRefs[0], zoneCount);
+        return true;
+    }
+
+    /// <summary>
+    /// Returns the sorted Stat enum values whose bits are set in
+    /// <paramref name="bytes"/> starting at <paramref name="offset"/>. The
+    /// bitset shape matches upstream's <c>as_stat_bitset_bytes</c>: 9-bit
+    /// packed field covering Stats 0..8.
+    /// </summary>
+    private static IReadOnlyList<int> ParseStatBitset(byte[] bytes, int offset)
+    {
+        var stats = new List<int>();
+        int totalBits = (bytes.Length - offset) * 8;
+        // Stat enum has values 0..8; ignore higher indices we don't recognize.
+        int maxStat = 8;
+        for (int i = 0; i <= maxStat && i < totalBits; i++)
+        {
+            int byteIdx = offset + (i >> 3);
+            int bitIdx = i & 7;
+            if ((bytes[byteIdx] & (1 << bitIdx)) != 0)
+                stats.Add(i);
+        }
+        return stats;
+    }
+
+    /// <summary>
+    /// Returns a copy of <paramref name="plan"/> with <see cref="ColumnPlan.ZoneInfo"/>
+    /// populated. Concrete types: <see cref="FlatColumnPlan"/> / <see cref="DictColumnPlan"/>.
+    /// </summary>
+    private static ColumnPlan WithZoneInfo(ColumnPlan plan, ZoneInfo zoneInfo) => plan switch
+    {
+        FlatColumnPlan f => new FlatColumnPlan(f.ArrowType, f.Chunks) { ZoneInfo = zoneInfo },
+        DictColumnPlan d => new DictColumnPlan(d.ArrowType, d.Values, d.Codes) { ZoneInfo = zoneInfo },
+        _ => plan,
+    };
 
     /// <summary>
     /// Parses <c>DictLayoutMetadata</c> (vortex-layout/src/layouts/dict/mod.rs)

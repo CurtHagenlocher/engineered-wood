@@ -1287,6 +1287,199 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task ZonePruning_GetZoneStatsExposesPerZoneMinMax()
+    {
+        // Build a 4-zone file with monotonically-increasing batches and
+        // verify GetZoneStatsAsync returns the right per-zone min/max.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var sizes = new[] { 100, 100, 100, 50 };
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                int rows = 0;
+                foreach (var sz in sizes)
+                {
+                    var b = new Int32Array.Builder();
+                    for (int i = 0; i < sz; i++) b.Append(rows + i);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, sz));
+                    rows += sz;
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var stats = await reader.GetZoneStatsAsync(0);
+            Assert.NotNull(stats);
+            Assert.Equal(100, stats!.ZoneLen);
+            Assert.Equal(4, stats.ZoneCount);
+
+            var min = (Int32Array)stats.Min!;
+            var max = (Int32Array)stats.Max!;
+            // Zone 0: rows 0..99 → min=0, max=99
+            // Zone 1: rows 100..199 → min=100, max=199
+            // Zone 2: rows 200..299 → min=200, max=299
+            // Zone 3: rows 300..349 → min=300, max=349
+            Assert.Equal(new[] { 0, 100, 200, 300 },
+                new[] { min.GetValue(0), min.GetValue(1), min.GetValue(2), min.GetValue(3) }
+                    .Select(v => v!.Value).ToArray());
+            Assert.Equal(new[] { 99, 199, 299, 349 },
+                new[] { max.GetValue(0), max.GetValue(1), max.GetValue(2), max.GetValue(3) }
+                    .Select(v => v!.Value).ToArray());
+
+            // null_count should be all-zero (non-nullable column).
+            for (int z = 0; z < stats.ZoneCount; z++)
+                Assert.Equal(0UL, stats.NullCount!.GetValue(z));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ZonePruning_AcceptedZonesSkipsNonMatchingChunks()
+    {
+        // Same 4-zone shape. Filter to zones whose max >= 250 — only the
+        // last two zones qualify. ReadAllAsync(accepted) should yield
+        // exactly 2 batches.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var sizes = new[] { 100, 100, 100, 50 };
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                int rows = 0;
+                foreach (var sz in sizes)
+                {
+                    var b = new Int32Array.Builder();
+                    for (int i = 0; i < sz; i++) b.Append(rows + i);
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, sz));
+                    rows += sz;
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var stats = await reader.GetZoneStatsAsync(0);
+            var max = (Int32Array)stats!.Max!;
+            var accepted = new HashSet<int>();
+            for (int z = 0; z < stats.ZoneCount; z++)
+                if (max.GetValue(z)!.Value >= 250) accepted.Add(z);
+            Assert.Equal(new[] { 2, 3 }, accepted.OrderBy(x => x).ToArray());
+
+            int batchCount = 0;
+            int totalRows = 0;
+            await foreach (var batch in reader.ReadAllAsync(accepted))
+            {
+                batchCount++;
+                totalRows += batch.Length;
+                var col = (Int32Array)batch.Column(0);
+                // Every value in surviving zones is >= 200 (zone 2's start)
+                // and < 350 (zone 3's end).
+                Assert.True(col.GetValue(0)!.Value >= 200);
+            }
+            Assert.Equal(2, batchCount);
+            Assert.Equal(150, totalRows); // zones 2 + 3 = 100 + 50
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ZonePruning_GetZoneStatsReturnsNullForNonZonedFile()
+    {
+        // File written without preserveStats has no zones layout.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var b = new Int32Array.Builder();
+        for (int i = 0; i < 100; i++) b.Append(i);
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, 100);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch); // preserveStats: false
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var stats = await reader.GetZoneStatsAsync(0);
+            Assert.Null(stats);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task ZonePruning_FloatStatsRoundtrip()
+    {
+        // Float column zoned stats expose Min/Max/Sum/NullCount/NaNCount/UncompressedSize.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 100, 100 };
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < sizes.Length; batchIdx++)
+                {
+                    var b = new DoubleArray.Builder();
+                    int sz = sizes[batchIdx];
+                    for (int i = 0; i < sz; i++)
+                    {
+                        if (batchIdx == 1 && i == 0) b.Append(double.NaN);
+                        else if (i % 17 == 0) b.AppendNull();
+                        else b.Append(batchIdx * 1000.0 + i);
+                    }
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { b.Build() }, sz));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var stats = await reader.GetZoneStatsAsync(0);
+            Assert.NotNull(stats);
+            Assert.Equal(2, stats!.ZoneCount);
+            Assert.NotNull(stats.NaNCount);
+            // Zone 1 has exactly one NaN (i=0).
+            Assert.Equal(0UL, stats.NaNCount!.GetValue(0));
+            Assert.Equal(1UL, stats.NaNCount!.GetValue(1));
+            // Min/Max exclude NaNs and nulls.
+            var min = (DoubleArray)stats.Min!;
+            var max = (DoubleArray)stats.Max!;
+            // Zone 0: i in 1..99 except i%17==0; min = first non-null, max = 99.
+            Assert.True(min.GetValue(0)!.Value <= 5);
+            Assert.Equal(99.0, max.GetValue(0));
+            // Zone 1: i in 1..99 except i%17==0 (and i=0 is NaN); max = 1099.
+            Assert.Equal(1099.0, max.GetValue(1));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task PreserveStats_FloatColumnRoundtrips()
     {
         // Phase C adds float stats: min, max, sum, null_count, nan_count.
