@@ -1233,6 +1233,118 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task PreserveStats_IntegerMinMaxRoundtrips()
+    {
+        // Integer column with monotonic batches — each zone has a distinct
+        // (min, max) range. Phase B emits these as additional zones-table
+        // columns alongside null_count. The reader still ignores zones, so
+        // round-trip is verified via the data column itself.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 250, 250, 250, 100 };
+
+        Int64Array BuildBatch(int startRow, int n)
+        {
+            var b = new Int64Array.Builder();
+            for (int i = 0; i < n; i++)
+            {
+                if ((startRow + i) % 11 == 0) b.AppendNull();
+                else b.Append(startRow + i);
+            }
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                int rows = 0;
+                foreach (var sz in sizes)
+                {
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { BuildBatch(rows, sz) }, sz));
+                    rows += sz;
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            int total = sizes.Sum();
+            for (int i = 0; i < total; i++)
+            {
+                if (i % 11 == 0) Assert.False(read.IsValid(i));
+                else Assert.Equal((long)i, read.GetValue(i)!.Value);
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task PreserveStats_AllNullIntegerBatchClearsMinMaxValidity()
+    {
+        // Edge case: one batch is entirely null. The min/max columns in
+        // the zones table must have their validity bit cleared at that
+        // zone's row (Phase B ComputeIntMinMax returns (null, null) for
+        // all-null batches, and EmitZonesSegmentIntMinMaxNull threads
+        // that through as cleared validity bits).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: true),
+        }, metadata: null);
+        var sizes = new[] { 200, 200, 100 };
+
+        Int32Array BuildBatch(int batchIdx, int n)
+        {
+            var b = new Int32Array.Builder();
+            for (int i = 0; i < n; i++)
+            {
+                if (batchIdx == 1) b.AppendNull(); // entire batch 1 is null
+                else b.Append(batchIdx * 1000 + i);
+            }
+            return b.Build();
+        }
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+            using (var w = new VortexFileWriter(fs, schema, preserveStats: true))
+            {
+                for (int batchIdx = 0; batchIdx < sizes.Length; batchIdx++)
+                {
+                    int sz = sizes[batchIdx];
+                    w.WriteBatch(new RecordBatch(schema, new IArrowArray[] { BuildBatch(batchIdx, sz) }, sz));
+                }
+                w.Close();
+            }
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            int idx = 0;
+            for (int batchIdx = 0; batchIdx < sizes.Length; batchIdx++)
+            {
+                for (int i = 0; i < sizes[batchIdx]; i++)
+                {
+                    if (batchIdx == 1) Assert.False(read.IsValid(idx));
+                    else Assert.Equal(batchIdx * 1000 + i, read.GetValue(idx)!.Value);
+                    idx++;
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task PreserveStats_NonUniformBatchesFallsBackToChunked()
     {
         // Batches of (300, 200, 100) rows — non-uniform → CanZoneBatches

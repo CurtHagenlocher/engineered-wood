@@ -91,11 +91,42 @@ public sealed class VortexFileWriter : IDisposable
     private readonly List<uint>[] _columnSegmentsByBatch;
     /// <summary>One per column; per-batch null counts for the zoned-stats layout.</summary>
     private readonly List<ulong>[] _columnNullCountsByBatch;
+    /// <summary>One per column; the zones-table schema scheme for this column's type.</summary>
+    private readonly ZoneStatScheme[] _columnStatScheme;
+    /// <summary>For IntMinMaxNull columns: per-batch min/max bytes (column-width raw bytes)
+    /// plus a has-value flag (false when the batch was all-null).</summary>
+    private readonly List<byte[]?>[] _columnMinByBatch;
+    private readonly List<byte[]?>[] _columnMaxByBatch;
     private readonly List<ulong> _batchRowCounts = new();
     private readonly bool _compress;
     private readonly bool _preferVarBinView;
     private readonly bool _preserveStats;
     private bool _closed;
+
+    /// <summary>
+    /// Stat schema for a column's per-zone table. Determines the column set
+    /// in the auxiliary zones array AND the bitset that lands in the
+    /// vortex.stats layout's metadata. Per upstream's `present_stats` rules
+    /// the order is sorted ascending by Stat enum value.
+    /// </summary>
+    private enum ZoneStatScheme
+    {
+        /// <summary>
+        /// bitset = [0x40, 0x00] — bit 6 (NullCount).
+        /// zones struct = { null_count: u64 }.
+        /// </summary>
+        NullCountOnly,
+
+        /// <summary>
+        /// bitset = [0x58, 0x00] — bits 3 (Max), 4 (Min), 6 (NullCount).
+        /// zones struct = { max: T?, max_is_truncated: bool,
+        ///                  min: T?, min_is_truncated: bool,
+        ///                  null_count: u64 }.
+        /// Used for non-nullable / nullable integer columns where Min/Max
+        /// are well-defined and cheap to capture per batch.
+        /// </summary>
+        IntMinMaxNull,
+    }
 
     /// <summary>
     /// Begins a Vortex file. The <paramref name="schema"/> is fixed for the
@@ -128,12 +159,19 @@ public sealed class VortexFileWriter : IDisposable
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
         _sw = new SegmentWriter(_stream);
-        _columnSegmentsByBatch = new List<uint>[schema.FieldsList.Count];
-        _columnNullCountsByBatch = new List<ulong>[schema.FieldsList.Count];
-        for (int i = 0; i < _columnSegmentsByBatch.Length; i++)
+        int nFields = schema.FieldsList.Count;
+        _columnSegmentsByBatch = new List<uint>[nFields];
+        _columnNullCountsByBatch = new List<ulong>[nFields];
+        _columnMinByBatch = new List<byte[]?>[nFields];
+        _columnMaxByBatch = new List<byte[]?>[nFields];
+        _columnStatScheme = new ZoneStatScheme[nFields];
+        for (int i = 0; i < nFields; i++)
         {
             _columnSegmentsByBatch[i] = new List<uint>();
             _columnNullCountsByBatch[i] = new List<ulong>();
+            _columnMinByBatch[i] = new List<byte[]?>();
+            _columnMaxByBatch[i] = new List<byte[]?>();
+            _columnStatScheme[i] = SchemeForType(schema.FieldsList[i].DataType);
         }
 
         // Leading VTXF magic.
@@ -175,6 +213,17 @@ public sealed class VortexFileWriter : IDisposable
             // case for sliced columns even though we don't slice at the
             // top-level here.
             _columnNullCountsByBatch[i].Add((ulong)((Apache.Arrow.Array)col).Data.GetNullCount());
+
+            // For integer columns, also capture per-batch min/max for the
+            // zones table. Phase B emits these alongside null_count so the
+            // reader (when it grows pruning) can skip whole zones via
+            // predicate evaluation against the min/max bounds.
+            if (_columnStatScheme[i] == ZoneStatScheme.IntMinMaxNull)
+            {
+                var (minBytes, maxBytes) = ComputeIntMinMax(col);
+                _columnMinByBatch[i].Add(minBytes);
+                _columnMaxByBatch[i].Add(maxBytes);
+            }
         }
         _batchRowCounts.Add(checked((ulong)batch.Length));
     }
@@ -196,34 +245,257 @@ public sealed class VortexFileWriter : IDisposable
         return _batchRowCounts[n - 1] <= first;
     }
 
+    private static ZoneStatScheme SchemeForType(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        Apache.Arrow.Types.Int8Type or Apache.Arrow.Types.Int16Type
+            or Apache.Arrow.Types.Int32Type or Apache.Arrow.Types.Int64Type
+            or Apache.Arrow.Types.UInt8Type or Apache.Arrow.Types.UInt16Type
+            or Apache.Arrow.Types.UInt32Type or Apache.Arrow.Types.UInt64Type
+            => ZoneStatScheme.IntMinMaxNull,
+        _ => ZoneStatScheme.NullCountOnly,
+    };
+
     /// <summary>
-    /// Builds and appends the per-column zones segment carrying the per-zone
-    /// null_count table. The segment holds a <c>vortex.struct</c> ArrayNode
-    /// with a single <c>null_count</c> u64 child of length = batch count.
-    /// Returns the segment index.
+    /// Returns the bitset bytes for the layout-metadata's `present_stats`
+    /// field. Layout matches upstream's `as_stat_bitset_bytes`: 9-bit
+    /// packed field (Stat enum values 0..8), 2 bytes total.
+    /// </summary>
+    private static byte[] BitsetForScheme(ZoneStatScheme scheme) => scheme switch
+    {
+        // Bit 6 (NullCount) only.
+        ZoneStatScheme.NullCountOnly => new byte[] { 0x40, 0x00 },
+        // Bits 3 (Max) | 4 (Min) | 6 (NullCount) = 0x58 in byte 0.
+        ZoneStatScheme.IntMinMaxNull => new byte[] { 0x58, 0x00 },
+        _ => throw new NotSupportedException(),
+    };
+
+    private static int ByteWidthForIntType(Apache.Arrow.Types.IArrowType type) => type switch
+    {
+        Apache.Arrow.Types.Int8Type or Apache.Arrow.Types.UInt8Type => 1,
+        Apache.Arrow.Types.Int16Type or Apache.Arrow.Types.UInt16Type => 2,
+        Apache.Arrow.Types.Int32Type or Apache.Arrow.Types.UInt32Type => 4,
+        Apache.Arrow.Types.Int64Type or Apache.Arrow.Types.UInt64Type => 8,
+        _ => throw new NotSupportedException(),
+    };
+
+    /// <summary>
+    /// Computes (min, max) over an integer column's non-null rows. Returns
+    /// the raw bytes (column-width LE) for each, or <c>null</c> when the
+    /// column is empty / all-null in this batch — the zones-table cell
+    /// for that batch then has its validity bit cleared.
+    /// </summary>
+    private static (byte[]? Min, byte[]? Max) ComputeIntMinMax(Apache.Arrow.IArrowArray col)
+    {
+        var data = ((Apache.Arrow.Array)col).Data;
+        int n = col.Length;
+        if (n == 0) return (null, null);
+        bool hasNulls = data.GetNullCount() > 0;
+        var validity = hasNulls ? data.Buffers[0].Span : default;
+        int off = data.Offset;
+
+        bool isSigned = col is Apache.Arrow.Int8Array or Apache.Arrow.Int16Array
+            or Apache.Arrow.Int32Array or Apache.Arrow.Int64Array;
+        int byteWidth = ByteWidthForIntType(((Apache.Arrow.Array)col).Data.DataType);
+        var src = data.Buffers[1].Span.Slice(off * byteWidth, n * byteWidth);
+
+        bool any = false;
+        long sMin = long.MaxValue, sMax = long.MinValue;
+        ulong uMin = ulong.MaxValue, uMax = ulong.MinValue;
+
+        for (int i = 0; i < n; i++)
+        {
+            if (hasNulls)
+            {
+                int gb = off + i;
+                if ((validity[gb >> 3] & (1 << (gb & 7))) == 0) continue;
+            }
+            int p = i * byteWidth;
+            if (isSigned)
+            {
+                long v = byteWidth switch
+                {
+                    1 => (sbyte)src[p],
+                    2 => System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(src.Slice(p, 2)),
+                    4 => System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(src.Slice(p, 4)),
+                    8 => System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(src.Slice(p, 8)),
+                    _ => throw new NotSupportedException(),
+                };
+                if (!any) { sMin = sMax = v; any = true; }
+                else { if (v < sMin) sMin = v; if (v > sMax) sMax = v; }
+            }
+            else
+            {
+                ulong v = byteWidth switch
+                {
+                    1 => src[p],
+                    2 => System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(src.Slice(p, 2)),
+                    4 => System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(src.Slice(p, 4)),
+                    8 => System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(src.Slice(p, 8)),
+                    _ => throw new NotSupportedException(),
+                };
+                if (!any) { uMin = uMax = v; any = true; }
+                else { if (v < uMin) uMin = v; if (v > uMax) uMax = v; }
+            }
+        }
+
+        if (!any) return (null, null);
+
+        var minBytes = new byte[byteWidth];
+        var maxBytes = new byte[byteWidth];
+        if (isSigned)
+        {
+            WriteIntLE(minBytes, sMin, byteWidth);
+            WriteIntLE(maxBytes, sMax, byteWidth);
+        }
+        else
+        {
+            WriteIntLE(minBytes, unchecked((long)uMin), byteWidth);
+            WriteIntLE(maxBytes, unchecked((long)uMax), byteWidth);
+        }
+        return (minBytes, maxBytes);
+    }
+
+    private static void WriteIntLE(Span<byte> dest, long value, int byteWidth)
+    {
+        switch (byteWidth)
+        {
+            case 1: dest[0] = (byte)value; break;
+            case 2: System.Buffers.Binary.BinaryPrimitives.WriteInt16LittleEndian(dest, (short)value); break;
+            case 4: System.Buffers.Binary.BinaryPrimitives.WriteInt32LittleEndian(dest, (int)value); break;
+            case 8: System.Buffers.Binary.BinaryPrimitives.WriteInt64LittleEndian(dest, value); break;
+            default: throw new NotSupportedException();
+        }
+    }
+
+    /// <summary>
+    /// Builds and appends a per-column zones segment. Dispatches on the
+    /// column's <see cref="ZoneStatScheme"/> — NullCountOnly emits a
+    /// 1-field struct, IntMinMaxNull emits 5 fields.
     /// </summary>
     private uint EmitZonesSegment(int columnIdx)
+    {
+        return _columnStatScheme[columnIdx] switch
+        {
+            ZoneStatScheme.NullCountOnly => EmitZonesSegmentNullCountOnly(columnIdx),
+            ZoneStatScheme.IntMinMaxNull => EmitZonesSegmentIntMinMaxNull(columnIdx),
+            _ => throw new NotSupportedException(),
+        };
+    }
+
+    private uint EmitZonesSegmentNullCountOnly(int columnIdx)
     {
         var counts = _columnNullCountsByBatch[columnIdx];
         int numZones = counts.Count;
         var bytes = new byte[(long)numZones * 8];
         var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(bytes.AsSpan());
         for (int i = 0; i < numZones; i++) span[i] = counts[i];
-        var nullCountArr = new Apache.Arrow.UInt64Array(
-            new Apache.Arrow.ArrowBuffer(bytes), Apache.Arrow.ArrowBuffer.Empty, numZones, 0, 0);
 
         var sb = new SegmentBuilder();
-        // The zones table is a vortex.struct with one u64 child. We hand-emit
-        // both ArrayNodes here rather than going through StructArrayEncoder
-        // (which expects an Apache.Arrow.StructArray) — the wire shape is
-        // simple enough that hand-rolling is clearer than constructing an
-        // Apache.Arrow StructArray just to throw it away.
         ushort u64BufIdx = sb.AddBuffer(bytes, alignmentExponent: 3);
         int u64Ticket = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, u64BufIdx);
         int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
             sb.Builder, StructEncodingIdx, new[] { u64Ticket });
         byte[] segBytes = sb.FinishSegment(structTicket);
         return _sw.AppendSegment(segBytes, alignmentExponent: 0);
+    }
+
+    /// <summary>
+    /// Builds the zones segment for an integer column carrying
+    /// <c>{ max: T?, max_is_truncated: bool, min: T?, min_is_truncated: bool,
+    /// null_count: u64 }</c>. Field order matches upstream's
+    /// <c>stats_table_dtype</c> for present_stats = [Max, Min, NullCount].
+    /// </summary>
+    private uint EmitZonesSegmentIntMinMaxNull(int columnIdx)
+    {
+        var nullCounts = _columnNullCountsByBatch[columnIdx];
+        var minByBatch = _columnMinByBatch[columnIdx];
+        var maxByBatch = _columnMaxByBatch[columnIdx];
+        int numZones = nullCounts.Count;
+        int byteWidth = ByteWidthForIntType(_schema.FieldsList[columnIdx].DataType);
+
+        // Build min/max buffers with validity (null when batch was all-null
+        // → has-value flag is false → minByBatch[i] / maxByBatch[i] is null).
+        var minBytes = new byte[(long)numZones * byteWidth];
+        var maxBytes = new byte[(long)numZones * byteWidth];
+        int validityByteCount = (numZones + 7) / 8;
+        var minMaxValidity = new byte[validityByteCount];
+        // Pre-fill validity to all-1s (most batches have data); clear for null entries.
+        for (int i = 0; i < validityByteCount; i++) minMaxValidity[i] = 0xFF;
+        // Mask trailing garbage bits in the last byte.
+        if ((numZones & 7) != 0)
+            minMaxValidity[validityByteCount - 1] &= (byte)((1 << (numZones & 7)) - 1);
+        int minMaxNullCount = 0;
+        for (int i = 0; i < numZones; i++)
+        {
+            if (minByBatch[i] is null)
+            {
+                minMaxValidity[i >> 3] &= (byte)~(1 << (i & 7));
+                minMaxNullCount++;
+            }
+            else
+            {
+                minByBatch[i].AsSpan().CopyTo(minBytes.AsSpan(i * byteWidth, byteWidth));
+                maxByBatch[i]!.AsSpan().CopyTo(maxBytes.AsSpan(i * byteWidth, byteWidth));
+            }
+        }
+
+        // null_count column (always non-null).
+        var ncBytes = new byte[(long)numZones * 8];
+        var ncSpan = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, ulong>(ncBytes.AsSpan());
+        for (int i = 0; i < numZones; i++) ncSpan[i] = nullCounts[i];
+
+        // *_is_truncated columns are always all-false here — we never
+        // truncate. Build a numZones-bit zero bitmap.
+        var truncatedBytes = new byte[(numZones + 7) / 8];
+
+        // Now emit the 5-field struct: max, max_is_truncated, min,
+        // min_is_truncated, null_count. Each field is its own ArrayNode.
+        var sb = new SegmentBuilder();
+
+        // 1. max: vortex.primitive with value buffer + validity child.
+        int maxTicket = EmitNullablePrimitive(sb, maxBytes, byteWidth, minMaxValidity, minMaxNullCount);
+
+        // 2. max_is_truncated: vortex.bool with the all-zero bitmap.
+        int maxTruncTicket = EmitBoolBitmap(sb, truncatedBytes);
+
+        // 3. min: same shape as max (shares the same min/max validity).
+        int minTicket = EmitNullablePrimitive(sb, minBytes, byteWidth, minMaxValidity, minMaxNullCount);
+
+        // 4. min_is_truncated: bool bitmap (all-zero).
+        int minTruncTicket = EmitBoolBitmap(sb, truncatedBytes);
+
+        // 5. null_count: vortex.primitive (non-nullable u64).
+        ushort ncBufIdx = sb.AddBuffer(ncBytes, alignmentExponent: 3);
+        int ncTicket = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, ncBufIdx);
+
+        int structTicket = ArrayNodeEmitter.EmitWithChildrenOnly(
+            sb.Builder, StructEncodingIdx,
+            new[] { maxTicket, maxTruncTicket, minTicket, minTruncTicket, ncTicket });
+        byte[] segBytes = sb.FinishSegment(structTicket);
+        return _sw.AppendSegment(segBytes, alignmentExponent: 0);
+    }
+
+    private int EmitNullablePrimitive(
+        SegmentBuilder sb, byte[] valueBytes, int byteWidth,
+        byte[] validity, int nullCount)
+    {
+        // Pick alignment per width: 8 → 3, 4 → 2, 2 → 1, 1 → 0.
+        byte alignExp = byteWidth switch { 1 => 0, 2 => 1, 4 => 2, 8 => 3, _ => 0 };
+        ushort valBuf = sb.AddBuffer(valueBytes, alignmentExponent: alignExp);
+        if (nullCount == 0)
+        {
+            return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, PrimitiveEncodingIdx, valBuf);
+        }
+        ushort validityBuf = sb.AddBuffer(validity, alignmentExponent: 0);
+        int validityNode = ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, BoolEncodingIdx, validityBuf);
+        return ArrayNodeEmitter.EmitWithBufferAndChildren(
+            sb.Builder, PrimitiveEncodingIdx, valBuf, new[] { validityNode });
+    }
+
+    private int EmitBoolBitmap(SegmentBuilder sb, byte[] bitmap)
+    {
+        ushort bufIdx = sb.AddBuffer(bitmap, alignmentExponent: 0);
+        return ArrayNodeEmitter.EmitWithSingleBuffer(sb.Builder, BoolEncodingIdx, bufIdx);
     }
 
     /// <summary>
@@ -271,12 +543,16 @@ public sealed class VortexFileWriter : IDisposable
             int zoneLen = checked((int)_batchRowCounts[0]);
             int numZones = _batchRowCounts.Count;
             var perColumnSegByBatch = new uint[_columnSegmentsByBatch.Length][];
+            var perColumnBitset = new byte[_columnSegmentsByBatch.Length][];
             for (int i = 0; i < perColumnSegByBatch.Length; i++)
+            {
                 perColumnSegByBatch[i] = _columnSegmentsByBatch[i].ToArray();
+                perColumnBitset[i] = BitsetForScheme(_columnStatScheme[i]);
+            }
             layoutBytes = LayoutSerializer.SerializeStructStatsChunked(
                 StructLayoutIdx, StatsLayoutIdx, ChunkedLayoutIdx, FlatLayoutIdx,
                 totalRows, zoneLen, numZones,
-                _batchRowCounts, perColumnSegByBatch, perColumnZonesSeg);
+                _batchRowCounts, perColumnSegByBatch, perColumnZonesSeg, perColumnBitset);
         }
         else if (_batchRowCounts.Count == 1)
         {

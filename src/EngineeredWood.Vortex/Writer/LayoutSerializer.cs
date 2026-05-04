@@ -138,7 +138,8 @@ internal static class LayoutSerializer
         int numZones,
         IReadOnlyList<ulong> perBatchRowCount,
         uint[][] perColumnSegmentIdx,
-        IReadOnlyList<uint> perColumnZonesSegmentIdx)
+        IReadOnlyList<uint> perColumnZonesSegmentIdx,
+        IReadOnlyList<byte[]> perColumnStatsBitset)
     {
         if (perColumnSegmentIdx.Length == 0)
             throw new ArgumentException("perColumnSegmentIdx must be non-empty.", nameof(perColumnSegmentIdx));
@@ -146,22 +147,32 @@ internal static class LayoutSerializer
             throw new ArgumentException(
                 "perColumnZonesSegmentIdx must have one entry per column.",
                 nameof(perColumnZonesSegmentIdx));
+        if (perColumnStatsBitset.Count != perColumnSegmentIdx.Length)
+            throw new ArgumentException(
+                "perColumnStatsBitset must have one entry per column.",
+                nameof(perColumnStatsBitset));
         int batchCount = perBatchRowCount.Count;
 
         var b = new BackwardsFlatBufferBuilder();
 
-        // Phase A: only Stat::NullCount (= 6) is present. Bitset bytes layout
-        // matches upstream's `as_stat_bitset_bytes`: a packed 9-bit field
-        // covering all Stats, 2 bytes total. Bit 6 = 0x40 in byte 0.
-        var statsMetadata = new byte[6];
-        // u32 zone_len LE at bytes 0..3.
-        statsMetadata[0] = (byte)(zoneLen & 0xFF);
-        statsMetadata[1] = (byte)((zoneLen >> 8) & 0xFF);
-        statsMetadata[2] = (byte)((zoneLen >> 16) & 0xFF);
-        statsMetadata[3] = (byte)((zoneLen >> 24) & 0xFF);
-        statsMetadata[4] = 0x40; // NullCount
-        statsMetadata[5] = 0x00;
-        var statsMetadataTicket = b.WriteByteVector(statsMetadata);
+        // Per-column metadata: [u32 zone_len LE][bitset bytes]. The bitset
+        // shape matches upstream's `as_stat_bitset_bytes` (a packed 9-bit
+        // field covering all Stats; Phase A used [0x40, 0x00] for NullCount,
+        // Phase B uses [0x58, 0x00] for {Max, Min, NullCount} on integer
+        // columns). Each column carries its own metadata since schemes can
+        // differ across types.
+        var columnMetadataTickets = new int[perColumnSegmentIdx.Length];
+        for (int c = 0; c < columnMetadataTickets.Length; c++)
+        {
+            var bitset = perColumnStatsBitset[c];
+            var meta = new byte[4 + bitset.Length];
+            meta[0] = (byte)(zoneLen & 0xFF);
+            meta[1] = (byte)((zoneLen >> 8) & 0xFF);
+            meta[2] = (byte)((zoneLen >> 16) & 0xFF);
+            meta[3] = (byte)((zoneLen >> 24) & 0xFF);
+            bitset.CopyTo(meta, 4);
+            columnMetadataTickets[c] = b.WriteByteVector(meta);
+        }
 
         var columnTickets = new int[perColumnSegmentIdx.Length];
         for (int c = 0; c < perColumnSegmentIdx.Length; c++)
@@ -201,7 +212,7 @@ internal static class LayoutSerializer
                 .EmitU16(statsEncodingIdx)             // offset 20..21
                 .EmitUOffset(statsChildrenTicket)      // offset 16..19
                 .EmitU64(totalRows)                    // offset 8..15
-                .EmitUOffset(statsMetadataTicket)      // offset 4..7
+                .EmitUOffset(columnMetadataTickets[c]) // offset 4..7
                 .EmitSOffsetTo(statsVt);               // offset 0..3
         }
 
