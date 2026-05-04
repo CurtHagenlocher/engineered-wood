@@ -56,6 +56,7 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort SparseEncodingIdx = 15;
     private const ushort FsstStringEncodingIdx = 16;
     private const ushort AlpRdEncodingIdx = 17;
+    private const ushort VarBinViewEncodingIdx = 18;
     private static readonly EncodingIndices Indices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
@@ -74,7 +75,8 @@ public sealed class VortexFileWriter : IDisposable
         RunEnd: RunEndEncodingIdx,
         Sparse: SparseEncodingIdx,
         FsstString: FsstStringEncodingIdx,
-        AlpRd: AlpRdEncodingIdx);
+        AlpRd: AlpRdEncodingIdx,
+        VarBinView: VarBinViewEncodingIdx);
 
     // Layout-spec registry constants.
     private const ushort FlatLayoutIdx = 0;
@@ -88,6 +90,7 @@ public sealed class VortexFileWriter : IDisposable
     private readonly List<uint>[] _columnSegmentsByBatch;
     private readonly List<ulong> _batchRowCounts = new();
     private readonly bool _compress;
+    private readonly bool _preferVarBinView;
     private bool _closed;
 
     /// <summary>
@@ -96,12 +99,20 @@ public sealed class VortexFileWriter : IDisposable
     /// pass batches with a structurally-equal schema.
     /// </summary>
     /// <param name="compress">When true, opt eligible columns into compressing
-    /// encodings. Currently this means routing non-nullable unsigned-integer
-    /// columns through <c>fastlanes.bitpacked</c> when their max value fits in
-    /// fewer bits than the native type. Default <c>false</c>.</param>
-    public VortexFileWriter(Stream stream, Apache.Arrow.Schema schema, bool compress = false)
+    /// encodings (bitpacked, FoR, dict, ALP, FSST, runend, sparse, etc.).
+    /// Default <c>false</c>.</param>
+    /// <param name="preferVarBinView">When true, string columns that fall
+    /// through the compressing-encoding chain (no constant / dict / FSST hit)
+    /// land on <c>vortex.varbinview</c> instead of <c>vortex.varbin</c>.
+    /// Useful for cross-tool interop with consumers that prefer Arrow's
+    /// BinaryView shape; for short-string columns vortex.varbin is more
+    /// compact (4 + len bytes/row vs varbinview's 16 + len bytes/row).</param>
+    public VortexFileWriter(
+        Stream stream, Apache.Arrow.Schema schema,
+        bool compress = false, bool preferVarBinView = false)
     {
         _compress = compress;
+        _preferVarBinView = preferVarBinView;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
         _sw = new SegmentWriter(_stream);
@@ -137,7 +148,8 @@ public sealed class VortexFileWriter : IDisposable
             var statsValues = ArrayStatsComputer.Compute(col);
             int? statsTicket = ArrayStatsEmitter.Emit(sb.Builder, statsValues);
 
-            int rootTicket = ArrayEncoderDispatch.Emit(sb, col, Indices, statsTicket, _compress, statsValues);
+            int rootTicket = ArrayEncoderDispatch.Emit(
+                sb, col, Indices, statsTicket, _compress, statsValues, _preferVarBinView);
             byte[] bytes = sb.FinishSegment(rootTicket);
             uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
             _columnSegmentsByBatch[i].Add(segIdx);
@@ -210,6 +222,7 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.Sparse,
                 VortexArrayEncodings.FsstString,
                 VortexArrayEncodings.AlpRD,
+                VortexArrayEncodings.VarBinView,
             },
             layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked },
             segmentSpecs: _sw.SegmentSpecs);
@@ -240,10 +253,12 @@ public sealed class VortexFileWriter : IDisposable
     }
 
     /// <summary>One-shot convenience: writes <paramref name="batch"/> as a single-batch file.</summary>
-    public static void Write(Stream stream, RecordBatch batch, bool compress = false)
+    public static void Write(
+        Stream stream, RecordBatch batch,
+        bool compress = false, bool preferVarBinView = false)
     {
         if (batch is null) throw new ArgumentNullException(nameof(batch));
-        using var writer = new VortexFileWriter(stream, batch.Schema, compress);
+        using var writer = new VortexFileWriter(stream, batch.Schema, compress, preferVarBinView);
         writer.WriteBatch(batch);
         writer.Close();
     }

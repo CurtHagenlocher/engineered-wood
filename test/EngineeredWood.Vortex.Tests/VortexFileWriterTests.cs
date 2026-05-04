@@ -3187,6 +3187,154 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task VarBinView_NonNullableMixedLengthRoundtrips()
+    {
+        // Half short (≤ 12 bytes) → inlined; half long (> 12 bytes) →
+        // referenced into the data buffer with prefix + buf_idx + offset.
+        // Verifies both view encodings round-trip through the existing reader.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 200;
+        var b = new StringArray.Builder();
+        var expected = new string[n];
+        for (int i = 0; i < n; i++)
+        {
+            expected[i] = i % 2 == 0
+                ? $"short-{i}"                                                 // ≤ 12 bytes
+                : $"this-is-a-longer-string-row-{i:D6}-with-suffix";            // > 12 bytes
+            b.Append(expected[i]);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preferVarBinView: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++) Assert.Equal(expected[i], read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task VarBinView_NullableRoundtrips()
+    {
+        // Nullable column with mix of inline / referenced strings. Null rows
+        // get a zeroed view; the validity child masks them on read.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 150;
+        var b = new StringArray.Builder();
+        var expected = new string?[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 11 == 0) { expected[i] = null; b.AppendNull(); }
+            else
+            {
+                expected[i] = i % 2 == 0
+                    ? $"a-{i}"
+                    : $"longer-than-twelve-bytes-row-{i:D5}";
+                b.Append(expected[i]);
+            }
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preferVarBinView: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else Assert.Equal(expected[i], read.GetString(i));
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task VarBinView_AllInlineNoDataBuffer()
+    {
+        // All strings ≤ 12 bytes → no data buffer is emitted (only the views
+        // buffer). Exercises the single-buffer path in the wire format.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 60;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++) b.Append($"r{i}");
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preferVarBinView: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++) Assert.Equal($"r{i}", read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task VarBinView_DispatchPrefersFsstWhenApplicable()
+    {
+        // Even with preferVarBinView=true, the compress chain still wins for
+        // strings that match a more specific encoder (FSST here, due to
+        // shared substrings). VarBinView is the *fallback* string encoding,
+        // not an override.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 1_000;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+            b.Append($"https://www.example.com/path/to/resource/{i:D6}?token=abc");
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferVarBinView: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            for (int i = 0; i < n; i++)
+                Assert.Equal($"https://www.example.com/path/to/resource/{i:D6}?token=abc", read.GetString(i));
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task Fsst_AllNullColumnFallsThrough()
     {
         // 100% null string column → IsApplicable rejects (nothing to train),

@@ -14,7 +14,7 @@ internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
     ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd, ushort Sparse,
-    ushort FsstString, ushort AlpRd);
+    ushort FsstString, ushort AlpRd, ushort VarBinView);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -44,7 +44,8 @@ internal static class ArrayEncoderDispatch
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx,
         int? statsTicket = null, bool compress = false,
-        ArrayStatsValues stats = default)
+        ArrayStatsValues stats = default,
+        bool preferVarBinView = false)
     {
         if (compress && ConstantArrayEncoder.IsApplicable(array))
             return ConstantArrayEncoder.Emit(sb, array, idx.Constant, statsTicket);
@@ -77,6 +78,7 @@ internal static class ArrayEncoderDispatch
             // Decimal128/256Array inherit from FixedSizeBinaryArray, so they MUST
             // be matched before any FixedSizeBinary case (none yet, but mind it).
             Decimal128Array or Decimal256Array => DecimalArrayEncoder.Emit(sb, array, idx.Decimal, idx.Bool, statsTicket),
+            StringArray when preferVarBinView => VarBinViewArrayEncoder.Emit(sb, array, idx, statsTicket),
             StringArray or BinaryArray => VarBinArrayEncoder.Emit(sb, array, idx.VarBin, idx.Primitive, idx.Bool, statsTicket),
             BooleanArray => BoolArrayEncoder.Emit(sb, array, idx.Bool, statsTicket),
             _ => PrimitiveArrayEncoder.Emit(sb, array, idx.Primitive, idx.Bool, statsTicket),

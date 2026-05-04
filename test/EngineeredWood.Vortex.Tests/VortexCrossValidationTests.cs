@@ -864,6 +864,47 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenVarBinViewFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Mixed inline (≤ 12 bytes) and referenced (> 12 bytes) strings,
+        // with nulls. Tests the views buffer + data buffer split + validity
+        // child end-to-end through vortex's Rust reader.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("s", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 250;
+        var b = new StringArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 17 == 0) b.AppendNull();
+            else if (i % 2 == 0) b.Append($"row-{i}");
+            else b.Append($"longer-than-twelve-bytes-row-{i:D6}-tail");
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preferVarBinView: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenAlpRdFloatFile()
     {
         var validator = FindValidator();
