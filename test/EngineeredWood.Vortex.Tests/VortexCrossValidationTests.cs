@@ -1215,6 +1215,116 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenTimestampPrimitiveFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Default Timestamp path: vortex.timestamp Extension wrapping
+        // vortex.ext { vortex.primitive } i64 storage. Validates that the
+        // Extension dtype + array wrapping round-trip through vortex 0.70.
+        var type = new TimestampType(TimeUnit.Microsecond, (string?)"UTC");
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("ts", type, nullable: false),
+        }, metadata: null);
+        const int n = 100;
+        long baseUs = 1_704_067_200L * 1_000_000L;
+        var ticks = new long?[n];
+        for (int i = 0; i < n; i++) ticks[i] = baseUs + (long)i * 60_000_000L;
+        var batch = new RecordBatch(schema, new IArrowArray[]
+        {
+            BuildTimestampArrayForCrossValidation(type, ticks),
+        }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void RustReader_OpensDotNetWrittenDateTimePartsFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // preferDateTimeParts: vortex.timestamp Extension wrapping vortex.ext
+        // { vortex.datetimeparts(days, seconds, subseconds) }. Each part is
+        // recursively encoded with compress=true so children land on
+        // bitpacked / FoR.
+        var type = new TimestampType(TimeUnit.Microsecond, (string?)null);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("ts", type, nullable: false),
+        }, metadata: null);
+        const int n = 4096;
+        long baseUs = 1_704_067_200L * 1_000_000L;
+        var rng = new Random(2026);
+        var ticks = new long?[n];
+        for (int i = 0; i < n; i++)
+            ticks[i] = baseUs + (long)i * 600_000_000L + rng.Next(0, 1_000_000);
+        var batch = new RecordBatch(schema, new IArrowArray[]
+        {
+            BuildTimestampArrayForCrossValidation(type, ticks),
+        }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferDateTimeParts: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    /// <summary>
+    /// Helper: builds a TimestampArray directly from raw i64 ticks (Apache.Arrow's
+    /// TimestampArray.Builder takes DateTimeOffset and would lossily convert ns
+    /// inputs).
+    /// </summary>
+    private static TimestampArray BuildTimestampArrayForCrossValidation(
+        TimestampType type, long?[] ticksOrNull)
+    {
+        int n = ticksOrNull.Length;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (ticksOrNull[i] is null) { nullCount++; continue; }
+            span[i] = ticksOrNull[i]!.Value;
+            validity[i >> 3] |= (byte)(1 << (i & 7));
+        }
+        return new TimestampArray(
+            type, new ArrowBuffer(bytes),
+            nullCount > 0 ? new ArrowBuffer(validity) : ArrowBuffer.Empty,
+            n, nullCount, 0);
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenListFile()
     {
         var validator = FindValidator();

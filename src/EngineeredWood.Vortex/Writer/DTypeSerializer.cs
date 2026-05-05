@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
 using Apache.Arrow.Types;
 using EngineeredWood.Vortex.FlatBuffers;
 using EngineeredWood.Vortex.Format;
@@ -85,6 +86,7 @@ internal static class DTypeSerializer
             StructType st => EmitStructDType(b, st.Fields, nullable),
             ListType lst => WrapDType(b, DTypeKind.List, EmitListDType(b, lst.ValueField, nullable)),
             FixedSizeListType fsl => WrapDType(b, DTypeKind.FixedSizeList, EmitFixedSizeListDType(b, fsl.ValueField, fsl.ListSize, nullable)),
+            TimestampType ts => WrapDType(b, DTypeKind.Extension, EmitTimestampExtension(b, ts, nullable)),
             _ => throw new NotSupportedException(
                 $"Vortex writer Phase 1 doesn't yet support Arrow type {field.DataType} (field '{field.Name}')."),
         };
@@ -162,6 +164,56 @@ internal static class DTypeSerializer
             .EmitBool(nullable)
             .EmitU32(checked((uint)listSize))
             .EmitUOffset(elementTicket)
+            .EmitSOffsetTo(vt);
+    }
+
+    /// <summary>
+    /// Emits a <c>vortex.timestamp</c> Extension DType wrapping I64 storage.
+    /// Storage carries the column's nullability (the Extension layer doesn't
+    /// have its own nullable slot). Metadata layout per upstream
+    /// <c>vortex-array/src/extension/datetime/timestamp.rs</c>:
+    /// <c>[unit:u8, tz_len:u16 LE, tz_bytes (UTF-8)]</c>; unit tag is
+    /// 0=Ns, 1=Us, 2=Ms, 3=S (Days isn't representable as Arrow TimestampType).
+    /// </summary>
+    private static int EmitTimestampExtension(
+        BackwardsFlatBufferBuilder b, TimestampType ts, bool nullable)
+    {
+        // Storage = Primitive(I64) wrapped as a DType.
+        var storageInner = EmitPrimitive(b, PType.I64, nullable);
+        var storageTicket = WrapDType(b, DTypeKind.Primitive, storageInner);
+
+        // Metadata: unit byte + tz_len (u16 LE) + UTF-8 tz bytes.
+        byte unitTag = ts.Unit switch
+        {
+            Apache.Arrow.Types.TimeUnit.Nanosecond => 0,
+            Apache.Arrow.Types.TimeUnit.Microsecond => 1,
+            Apache.Arrow.Types.TimeUnit.Millisecond => 2,
+            Apache.Arrow.Types.TimeUnit.Second => 3,
+            _ => throw new NotSupportedException(
+                $"vortex.timestamp doesn't support TimeUnit {ts.Unit} (Days maps to vortex.date, not Timestamp)."),
+        };
+        var tzBytes = ts.Timezone is null
+            ? System.Array.Empty<byte>()
+            : System.Text.Encoding.UTF8.GetBytes(ts.Timezone);
+        if (tzBytes.Length > ushort.MaxValue)
+            throw new ArgumentOutOfRangeException(
+                nameof(ts), ts.Timezone, $"Timezone string is {tzBytes.Length} bytes; must fit in u16.");
+        var metadata = new byte[3 + tzBytes.Length];
+        metadata[0] = unitTag;
+        BinaryPrimitives.WriteUInt16LittleEndian(metadata.AsSpan(1, 2), (ushort)tzBytes.Length);
+        if (tzBytes.Length > 0) Buffer.BlockCopy(tzBytes, 0, metadata, 3, tzBytes.Length);
+        var metadataTicket = b.WriteByteVector(metadata);
+
+        var idTicket = b.WriteString("vortex.timestamp");
+
+        // Extension table: { id (string, slot 0), storage_dtype (DType, slot 1),
+        // metadata (vec<u8>, slot 2) }. vt_size = 4 + 3*2 = 10. inline = 16
+        // (soffset(4) + id_uoff(4@4) + storage_uoff(4@8) + metadata_uoff(4@12)).
+        var vt = b.WriteUInt16s(new ushort[] { 10, 16, 4, 8, 12 });
+        return b.StartTable(alignment: 4, inlineSize: 16)
+            .EmitUOffset(metadataTicket)
+            .EmitUOffset(storageTicket)
+            .EmitUOffset(idTicket)
             .EmitSOffsetTo(vt);
     }
 

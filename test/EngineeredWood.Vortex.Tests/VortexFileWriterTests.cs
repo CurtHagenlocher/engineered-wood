@@ -6101,4 +6101,168 @@ public class VortexFileWriterTests
             try { File.Delete(path); } catch { }
         }
     }
+
+    /// <summary>
+    /// Helper: builds a TimestampArray directly from raw i64 ticks. Apache.Arrow's
+    /// TimestampArray.Builder takes DateTimeOffset and converts internally,
+    /// which is awkward for tests that want to write specific tick values.
+    /// </summary>
+    private static TimestampArray BuildTimestampArray(
+        TimestampType type, long?[] ticksOrNull)
+    {
+        int n = ticksOrNull.Length;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        for (int i = 0; i < n; i++)
+        {
+            if (ticksOrNull[i] is null) { nullCount++; continue; }
+            span[i] = ticksOrNull[i]!.Value;
+            validity[i >> 3] |= (byte)(1 << (i & 7));
+        }
+        return new TimestampArray(
+            type,
+            new ArrowBuffer(bytes),
+            nullCount > 0 ? new ArrowBuffer(validity) : ArrowBuffer.Empty,
+            n, nullCount, 0);
+    }
+
+    [Fact]
+    public async Task SelfRoundtrip_TimestampViaPrimitive()
+    {
+        // Writer first needed to LEARN how to emit Timestamp at all (DType
+        // serializer + PrimitiveArrayEncoder gained TimestampType / Array
+        // cases). This locks in the default Timestamp path:
+        // vortex.timestamp Extension wrapping a vortex.primitive i64 storage.
+        var type = new TimestampType(TimeUnit.Microsecond, (string?)"UTC");
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("ts", type, nullable: true),
+        }, metadata: null);
+        const int n = 100;
+        // Microseconds since 2024-01-01 base, every 5th row null.
+        long baseUs = 1_704_067_200L * 1_000_000L;
+        var expected = new long?[n];
+        for (int i = 0; i < n; i++)
+            expected[i] = (i % 5 == 0) ? null : baseUs + (long)i * 60_000_000L + i * 137;
+        var batch = new RecordBatch(schema, new IArrowArray[] { BuildTimestampArray(type, expected) }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var ts = Assert.IsType<TimestampType>(reader.Schema.FieldsList[0].DataType);
+            Assert.Equal(TimeUnit.Microsecond, ts.Unit);
+            Assert.Equal("UTC", ts.Timezone);
+
+            var read = Assert.IsType<TimestampArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task DateTimeParts_MicrosecondsRoundtrip()
+    {
+        // preferDateTimeParts: timestamps split into (days, seconds, subseconds).
+        // 2024-era microseconds → days range ~31, seconds ∈ [0, 86399],
+        // subseconds ∈ [0, 999_999]. Each part fits in a much narrower int
+        // type than the raw 8-byte i64; combined with bitpacked compression
+        // on the children, datetimeparts should produce a smaller file than
+        // raw vortex.primitive.
+        var type = new TimestampType(TimeUnit.Microsecond, (string?)null);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("ts", type, nullable: false),
+        }, metadata: null);
+        const int n = 4096;
+        long baseUs = 1_704_067_200L * 1_000_000L; // 2024-01-01 UTC
+        var expected = new long[n];
+        var rng = new Random(2026);
+        var ticks = new long?[n];
+        for (int i = 0; i < n; i++)
+        {
+            long v = baseUs + (long)i * 600_000_000L + rng.Next(0, 1_000_000);
+            expected[i] = v;
+            ticks[i] = v;
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { BuildTimestampArray(type, ticks) }, n);
+
+        var rawPath = Path.GetTempFileName();
+        var dtpPath = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(rawPath))
+                VortexFileWriter.Write(fs, batch);
+            using (var fs = File.Create(dtpPath))
+                VortexFileWriter.Write(fs, batch, compress: true, preferDateTimeParts: true);
+
+            long rawSize = new FileInfo(rawPath).Length;
+            long dtpSize = new FileInfo(dtpPath).Length;
+            Assert.True(dtpSize < rawSize,
+                $"datetimeparts should compress vs raw i64 timestamps. raw={rawSize}, dtp={dtpSize}.");
+
+            await using var reader = await VortexFileReader.OpenAsync(dtpPath);
+            var read = Assert.IsType<TimestampArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(rawPath); } catch { }
+            try { File.Delete(dtpPath); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task DateTimeParts_NullableMillisecondsRoundtrip()
+    {
+        // Validity rides on the days child only — seconds/subseconds at
+        // null rows have garbage value bytes (we write 0). Reader masks via
+        // days.validity, matching upstream's split_temporal contract.
+        var type = new TimestampType(TimeUnit.Millisecond, (string?)null);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("ts", type, nullable: true),
+        }, metadata: null);
+        const int n = 2048;
+        long baseMs = 1_704_067_200L * 1_000L;
+        var expected = new long?[n];
+        for (int i = 0; i < n; i++)
+            expected[i] = (i % 7 == 0) ? null : baseMs + (long)i * 1_000L + (i % 1000);
+        var batch = new RecordBatch(schema, new IArrowArray[] { BuildTimestampArray(type, expected) }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferDateTimeParts: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<TimestampArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
 }

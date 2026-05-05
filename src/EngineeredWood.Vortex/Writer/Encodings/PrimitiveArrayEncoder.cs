@@ -87,6 +87,11 @@ internal static class PrimitiveArrayEncoder
             Int64Array => (CopyBytes(data.Buffers[1].Span, byteOffset * 8, rowCount * 8), (byte)3),
             UInt64Array => (CopyBytes(data.Buffers[1].Span, byteOffset * 8, rowCount * 8), (byte)3),
             DoubleArray => (CopyBytes(data.Buffers[1].Span, byteOffset * 8, rowCount * 8), (byte)3),
+            // TimestampArray inherits from PrimitiveArray<long>; storage is i64
+            // ticks with the unit recorded in the column's TimestampType
+            // (lifted into the vortex.timestamp Extension dtype by
+            // DTypeSerializer). Same byte width as Int64.
+            TimestampArray => (CopyBytes(data.Buffers[1].Span, byteOffset * 8, rowCount * 8), (byte)3),
             _ => throw new NotSupportedException(
                 $"vortex.primitive writer doesn't support Arrow array {array.GetType().Name}."),
         };

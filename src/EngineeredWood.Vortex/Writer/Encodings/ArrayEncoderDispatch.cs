@@ -14,7 +14,8 @@ internal readonly record struct EncodingIndices(
     ushort Primitive, ushort Bool, ushort VarBin, ushort List, ushort FixedSizeList,
     ushort BitPacked, ushort Decimal, ushort Constant, ushort For, ushort Delta,
     ushort Dict, ushort Rle, ushort Struct_, ushort Alp, ushort RunEnd, ushort Sparse,
-    ushort FsstString, ushort AlpRd, ushort VarBinView, ushort Pco);
+    ushort FsstString, ushort AlpRd, ushort VarBinView, ushort Pco,
+    ushort DateTimeParts, ushort Ext);
 
 /// <summary>
 /// Routes an Arrow array to its matching encoder's recursive <c>Emit</c>
@@ -46,8 +47,26 @@ internal static class ArrayEncoderDispatch
         int? statsTicket = null, bool compress = false,
         ArrayStatsValues stats = default,
         bool preferVarBinView = false,
-        bool preferPco = false)
+        bool preferPco = false,
+        bool preferDateTimeParts = false)
     {
+        // Extension-typed columns (currently: TimestampArray) need to be
+        // wrapped in a vortex.ext ArrayNode whose single child is the
+        // storage encoding. Upstream's wire shape: 0 buffers, 1 child,
+        // empty metadata (per vortex-array/src/arrays/extension/vtable/mod.rs).
+        // Dispatched ahead of the compress chain so the wrapper sits on the
+        // OUTSIDE — stats attach to the wrapper, the storage encoding has
+        // statsTicket=null.
+        if (array is Apache.Arrow.TimestampArray)
+        {
+            int storageTicket;
+            if (preferDateTimeParts && DateTimePartsArrayEncoder.IsApplicable(array))
+                storageTicket = DateTimePartsArrayEncoder.Emit(sb, array, idx, statsTicket: null);
+            else
+                storageTicket = PrimitiveArrayEncoder.Emit(sb, array, idx.Primitive, idx.Bool, statsTicket: null);
+            return WrapExtension(sb, idx.Ext, storageTicket, statsTicket);
+        }
+
         if (compress && ConstantArrayEncoder.IsApplicable(array))
             return ConstantArrayEncoder.Emit(sb, array, idx.Constant, statsTicket);
         if (compress && DictArrayEncoder.IsApplicable(array))
@@ -90,5 +109,18 @@ internal static class ArrayEncoderDispatch
             BooleanArray => BoolArrayEncoder.Emit(sb, array, idx.Bool, statsTicket),
             _ => PrimitiveArrayEncoder.Emit(sb, array, idx.Primitive, idx.Bool, statsTicket),
         };
+    }
+
+    /// <summary>
+    /// Wraps <paramref name="storageTicket"/> in a <c>vortex.ext</c> ArrayNode.
+    /// Upstream's wire shape: 0 buffers, 1 child (the storage encoding),
+    /// empty metadata. Stats attach to the wrapper, not the storage.
+    /// </summary>
+    private static int WrapExtension(SegmentBuilder sb, ushort extEncodingIdx, int storageTicket, int? statsTicket)
+    {
+        var children = new[] { storageTicket };
+        return statsTicket is null
+            ? ArrayNodeEmitter.EmitWithChildrenOnly(sb.Builder, extEncodingIdx, children)
+            : ArrayNodeEmitter.EmitWithChildrenAndStats(sb.Builder, extEncodingIdx, children, statsTicket.Value);
     }
 }

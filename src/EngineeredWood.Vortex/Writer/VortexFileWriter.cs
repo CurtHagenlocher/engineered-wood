@@ -58,6 +58,8 @@ public sealed class VortexFileWriter : IDisposable
     private const ushort AlpRdEncodingIdx = 17;
     private const ushort VarBinViewEncodingIdx = 18;
     private const ushort PcoEncodingIdx = 19;
+    private const ushort DateTimePartsEncodingIdx = 20;
+    private const ushort ExtEncodingIdx = 21;
     private static readonly EncodingIndices Indices = new(
         Primitive: PrimitiveEncodingIdx,
         Bool: BoolEncodingIdx,
@@ -78,7 +80,9 @@ public sealed class VortexFileWriter : IDisposable
         FsstString: FsstStringEncodingIdx,
         AlpRd: AlpRdEncodingIdx,
         VarBinView: VarBinViewEncodingIdx,
-        Pco: PcoEncodingIdx);
+        Pco: PcoEncodingIdx,
+        DateTimeParts: DateTimePartsEncodingIdx,
+        Ext: ExtEncodingIdx);
 
     // Layout-spec registry constants.
     private const ushort FlatLayoutIdx = 0;
@@ -100,6 +104,7 @@ public sealed class VortexFileWriter : IDisposable
     private readonly bool _preferVarBinView;
     private readonly bool _preserveStats;
     private readonly bool _preferPco;
+    private readonly bool _preferDateTimeParts;
     private bool _closed;
 
     /// <summary>
@@ -213,15 +218,27 @@ public sealed class VortexFileWriter : IDisposable
     /// Constant, dict, and FSST still take precedence — those strictly
     /// subsume pco for their niches. Has no effect when
     /// <paramref name="compress"/> is <c>false</c>.</param>
+    /// <param name="preferDateTimeParts">When true, encode
+    /// <see cref="Apache.Arrow.TimestampArray"/> columns as
+    /// <c>vortex.datetimeparts</c> — three integer children
+    /// (days, seconds, subseconds) chosen at the smallest ptype that fits
+    /// each part's actual range, recursively encoded with compress=true so
+    /// each child can land on bitpacked / FoR. Default <c>false</c> keeps
+    /// timestamps on plain <c>vortex.primitive</c>. Independent of
+    /// <paramref name="compress"/>: datetimeparts splitting helps even
+    /// without other compression, since per-part widths typically narrow
+    /// from 8 bytes to 1–4 bytes per row.</param>
     public VortexFileWriter(
         Stream stream, Apache.Arrow.Schema schema,
         bool compress = false, bool preferVarBinView = false,
-        bool preserveStats = false, bool preferPco = false)
+        bool preserveStats = false, bool preferPco = false,
+        bool preferDateTimeParts = false)
     {
         _compress = compress;
         _preferVarBinView = preferVarBinView;
         _preserveStats = preserveStats;
         _preferPco = preferPco;
+        _preferDateTimeParts = preferDateTimeParts;
         _stream = stream ?? throw new ArgumentNullException(nameof(stream));
         _schema = schema ?? throw new ArgumentNullException(nameof(schema));
         _sw = new SegmentWriter(_stream);
@@ -266,7 +283,7 @@ public sealed class VortexFileWriter : IDisposable
 
             int rootTicket = ArrayEncoderDispatch.Emit(
                 sb, col, Indices, statsTicket, _compress, statsValues,
-                _preferVarBinView, _preferPco);
+                _preferVarBinView, _preferPco, _preferDateTimeParts);
             byte[] bytes = sb.FinishSegment(rootTicket);
             uint segIdx = _sw.AppendSegment(bytes, alignmentExponent: 0);
             _columnSegmentsByBatch[i].Add(segIdx);
@@ -918,6 +935,8 @@ public sealed class VortexFileWriter : IDisposable
                 VortexArrayEncodings.AlpRD,
                 VortexArrayEncodings.VarBinView,
                 VortexArrayEncodings.Pco,
+                VortexArrayEncodings.DateTimeParts,
+                VortexArrayEncodings.Extension,
             },
             layoutSpecs: new[] { VortexLayoutEncodings.Flat, VortexLayoutEncodings.Struct, VortexLayoutEncodings.Chunked, VortexLayoutEncodings.Stats },
             segmentSpecs: _sw.SegmentSpecs);
@@ -951,11 +970,13 @@ public sealed class VortexFileWriter : IDisposable
     public static void Write(
         Stream stream, RecordBatch batch,
         bool compress = false, bool preferVarBinView = false,
-        bool preserveStats = false, bool preferPco = false)
+        bool preserveStats = false, bool preferPco = false,
+        bool preferDateTimeParts = false)
     {
         if (batch is null) throw new ArgumentNullException(nameof(batch));
         using var writer = new VortexFileWriter(
-            stream, batch.Schema, compress, preferVarBinView, preserveStats, preferPco);
+            stream, batch.Schema, compress, preferVarBinView,
+            preserveStats, preferPco, preferDateTimeParts);
         writer.WriteBatch(batch);
         writer.Close();
     }

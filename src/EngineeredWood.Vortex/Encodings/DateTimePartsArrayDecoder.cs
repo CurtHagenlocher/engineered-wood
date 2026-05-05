@@ -129,19 +129,33 @@ internal static class DateTimePartsArrayDecoder
         return (days, seconds, subseconds);
     }
 
-    private static long GetLongAtIndex(IArrowArray array, int i) => array switch
+    /// <summary>
+    /// Reads value at logical index <paramref name="i"/> from a primitive
+    /// child as a sign-extended <see cref="long"/>. Reads raw buffer bytes
+    /// rather than going through <c>GetValue(i)</c> so null rows return their
+    /// underlying byte pattern (which may be garbage) instead of throwing —
+    /// the combined output's null bitmap (inherited from the days child) is
+    /// what masks them at read time.
+    /// </summary>
+    private static long GetLongAtIndex(IArrowArray array, int i)
     {
-        UInt8Array u8 => u8.GetValue(i)!.Value,
-        UInt16Array u16 => u16.GetValue(i)!.Value,
-        UInt32Array u32 => u32.GetValue(i)!.Value,
-        UInt64Array u64 => unchecked((long)u64.GetValue(i)!.Value),
-        Int8Array i8 => i8.GetValue(i)!.Value,
-        Int16Array i16 => i16.GetValue(i)!.Value,
-        Int32Array i32 => i32.GetValue(i)!.Value,
-        Int64Array i64 => i64.GetValue(i)!.Value,
-        _ => throw new VortexFormatException(
-            $"vortex.datetimeparts child type {array.GetType().Name} not supported."),
-    };
+        var data = ((Apache.Arrow.Array)array).Data;
+        int abs = data.Offset + i;
+        var span = data.Buffers[1].Span;
+        return array switch
+        {
+            UInt8Array => span[abs],
+            UInt16Array => System.Buffers.Binary.BinaryPrimitives.ReadUInt16LittleEndian(span.Slice(abs * 2, 2)),
+            UInt32Array => System.Buffers.Binary.BinaryPrimitives.ReadUInt32LittleEndian(span.Slice(abs * 4, 4)),
+            UInt64Array => unchecked((long)System.Buffers.Binary.BinaryPrimitives.ReadUInt64LittleEndian(span.Slice(abs * 8, 8))),
+            Int8Array => unchecked((sbyte)span[abs]),
+            Int16Array => System.Buffers.Binary.BinaryPrimitives.ReadInt16LittleEndian(span.Slice(abs * 2, 2)),
+            Int32Array => System.Buffers.Binary.BinaryPrimitives.ReadInt32LittleEndian(span.Slice(abs * 4, 4)),
+            Int64Array => System.Buffers.Binary.BinaryPrimitives.ReadInt64LittleEndian(span.Slice(abs * 8, 8)),
+            _ => throw new VortexFormatException(
+                $"vortex.datetimeparts child type {array.GetType().Name} not supported."),
+        };
+    }
 
     private static IArrowType PtypeIntToArrowType(int ptype) => ptype switch
     {

@@ -29,11 +29,35 @@ internal static class ExtensionArrayDecoder
             throw new VortexFormatException(
                 $"vortex.ext expects 1 child (the storage array), got {node.ChildCount}.");
 
+        // vortex.datetimeparts needs the parent Extension dtype's TimeUnit
+        // (carried in TimestampType.Unit) to compute the combine divisor —
+        // upstream's `decode_to_temporal` reads `ext.metadata_opt::<Timestamp>().unit`
+        // for exactly this reason. So when the inner encoding is datetimeparts
+        // we pass the original Extension Arrow type through unchanged and
+        // skip the Rewrap step (the inner decoder produces the typed
+        // extension array directly).
+        var child = node.Child(0);
+        var childEncoding = ResolveChildEncoding(child, arraySpecs);
+        if (childEncoding == VortexArrayEncodings.DateTimeParts)
+        {
+            return ArrayDecoder.DecodeNode(
+                child, serialized, arraySpecs, expectedType, expectedRowCount);
+        }
+
         var storageType = StorageTypeFor(expectedType);
         var inner = ArrayDecoder.DecodeNode(
-            node.Child(0), serialized, arraySpecs, storageType, expectedRowCount);
+            child, serialized, arraySpecs, storageType, expectedRowCount);
 
         return Rewrap(expectedType, inner);
+    }
+
+    private static string ResolveChildEncoding(ArrayNode child, IReadOnlyList<string> arraySpecs)
+    {
+        var idx = child.EncodingIndex;
+        if (idx >= arraySpecs.Count)
+            throw new VortexFormatException(
+                $"Encoding index {idx} out of range for arraySpecs (count={arraySpecs.Count}).");
+        return arraySpecs[idx];
     }
 
     /// <summary>Maps an extension Arrow type to its underlying storage Arrow type.</summary>
