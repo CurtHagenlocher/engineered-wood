@@ -18,12 +18,17 @@ internal static class VortexLayoutEncodings
     /// <summary>Row-wise partitioned wrapper: children are row chunks, materialized in order.</summary>
     public const string Chunked = "vortex.chunked";
 
-    /// <summary>Stats-wrapper layout: typically a child carrying a stats table plus the data layout.</summary>
+    /// <summary>
+    /// Zoned layout (upstream Rust calls this <c>ZonedLayout</c> but
+    /// serializes the encoding id as the legacy string <c>vortex.stats</c>;
+    /// per <c>vortex-layout/src/layouts/zoned/mod.rs</c>: "For legacy
+    /// reasons the serialized layout encoding ID is still vortex.stats.").
+    /// Two children — child[0] = data, child[1] = zones table — plus
+    /// metadata <c>{ zone_len: u32 LE, present_stats: bitset }</c>. Used
+    /// for filter pruning via <see cref="EngineeredWood.Vortex.Predicate"/>.
+    /// </summary>
     public const string Stats = "vortex.stats";
 
     /// <summary>Dictionary-sharing layout: one child for indices, sibling for the dictionary array.</summary>
     public const string Dictionary = "vortex.dict";
-
-    /// <summary>Zone-map layout for filter pruning. Not yet implemented.</summary>
-    public const string Zoned = "vortex.zoned";
 }

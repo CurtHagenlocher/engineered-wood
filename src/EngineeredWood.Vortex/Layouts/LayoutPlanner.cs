@@ -41,9 +41,14 @@ internal static class LayoutPlanner
         {
             case VortexLayoutEncodings.Stats:
                 {
-                    // vortex.stats: child[0] = data, child[1] = zones table.
-                    // Capture the zones segment ref + present_stats so the
-                    // reader can materialize per-zone stats on demand.
+                    // vortex.stats wire id == upstream's ZonedLayout (the
+                    // string is preserved for legacy compatibility per
+                    // vortex-layout/src/layouts/zoned/mod.rs). Two children:
+                    // child[0] is the transparent data layout, child[1] is
+                    // the auxiliary zones-table flat segment. Metadata
+                    // carries zone_len + present_stats bitset; we capture
+                    // both so the reader can materialize per-zone stats and
+                    // drive Predicate-based pruning on demand.
                     if (layout.Children.Count < 2)
                         throw new VortexFormatException(
                             $"vortex.stats layout must have 2 children (data, zones), got {layout.Children.Count}.");
