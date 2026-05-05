@@ -35,9 +35,9 @@ internal static class FsstArrayDecoder
         IArrowType expectedType,
         long expectedRowCount)
     {
-        if (expectedType is not StringType)
+        if (expectedType is not StringType and not BinaryType)
             throw new NotSupportedException(
-                $"vortex.fsst decoder only supports StringType, got {expectedType}.");
+                $"vortex.fsst decoder only supports StringType / BinaryType, got {expectedType}.");
 
         if (node.BufferRefCount != 3)
             throw new VortexFormatException(
@@ -129,13 +129,14 @@ internal static class FsstArrayDecoder
             throw new VortexFormatException(
                 $"vortex.fsst: sum of uncompressed_lengths is {cumulative} but FSST wrote {totalWritten} bytes.");
 
-        return new StringArray(
-            rowCount,
-            new ArrowBuffer(offsetBytes),
-            new ArrowBuffer(arrowData),
-            nullBuffer,
-            nullCount,
-            offset: 0);
+        var offsetsArrowBuf = new ArrowBuffer(offsetBytes);
+        var valuesArrowBuf = new ArrowBuffer(arrowData);
+        // FSST trains on raw bytes — its symbol substitution is dtype-agnostic,
+        // so the decompressed output is valid for either Utf8 or Binary
+        // semantically (the writer's input determines the dtype).
+        return expectedType is StringType
+            ? new StringArray(rowCount, offsetsArrowBuf, valuesArrowBuf, nullBuffer, nullCount, offset: 0)
+            : new BinaryArray(BinaryType.Default, rowCount, offsetsArrowBuf, valuesArrowBuf, nullBuffer, nullCount, offset: 0);
     }
 
     private static void AssertNoBufferCompression(

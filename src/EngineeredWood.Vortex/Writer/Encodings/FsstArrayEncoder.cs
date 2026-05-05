@@ -11,10 +11,11 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// <summary>
 /// Inverse of <see cref="EngineeredWood.Vortex.Encodings.FsstArrayDecoder"/>:
 /// emits a <c>vortex.fsst</c> ArrayNode subtree for repetitive
-/// <see cref="StringArray"/> columns. FSST (Fast Static Symbol Table) trains
-/// a 1-byte-per-code symbol table on the input strings, then expresses each
-/// string as a sequence of symbol codes. Substrings appearing as symbols
-/// shrink to a single byte each; bytes outside the table escape to a literal.
+/// <see cref="StringArray"/> + <see cref="BinaryArray"/> columns. FSST
+/// (Fast Static Symbol Table) trains a 1-byte-per-code symbol table on the
+/// input bytes, then expresses each value as a sequence of symbol codes.
+/// Substrings appearing as symbols shrink to a single byte each; bytes
+/// outside the table escape to a literal.
 ///
 /// <para>Wire shape: 3 buffers (symbols at N×8 bytes, symbol_lengths at N×1
 /// bytes, compressed_codes_bytes), 2 children (uncompressed_lengths: per-row
@@ -23,8 +24,11 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// (validity bitmap appended). Metadata
 /// <c>FSSTMetadata { uncompressed_lengths_ptype, codes_offsets_ptype }</c>.</para>
 ///
-/// <para>Scope: nullable + non-nullable, sliced + non-sliced StringArray.
-/// Floats / binary deferred.</para>
+/// <para>Scope: nullable + non-nullable, sliced + non-sliced StringArray
+/// AND BinaryArray. FSST trains on raw bytes regardless of UTF-8-ness, so
+/// the encode path is identical for both — the column's schema-level
+/// dtype determines how the reader interprets the decompressed bytes.
+/// Floats deferred.</para>
 ///
 /// <para>Symbol-table extraction uses the public
 /// <see cref="SymbolTable.SymbolCount"/> + <see cref="SymbolTable.ExportRaw"/>
@@ -41,7 +45,11 @@ internal static class FsstArrayEncoder
 
     public static bool IsApplicable(IArrowArray array)
     {
-        if (array is not StringArray s) return false;
+        // BinaryArray is the base of StringArray; FSST trains on raw bytes
+        // regardless of UTF-8-ness, so both shapes flow through the same
+        // path. The schema-level dtype determines how the reader interprets
+        // the decompressed bytes.
+        if (array is not BinaryArray s) return false;
         var data = s.Data;
         int n = s.Length;
         if (n < MinRows) return false;
@@ -84,9 +92,9 @@ internal static class FsstArrayEncoder
     public static int Emit(
         SegmentBuilder sb, IArrowArray array, EncodingIndices idx, int? statsTicket = null)
     {
-        if (array is not StringArray s)
+        if (array is not BinaryArray s)
             throw new NotSupportedException(
-                $"vortex.fsst writer requires StringArray, got {array.GetType().Name}.");
+                $"vortex.fsst writer requires StringArray or BinaryArray, got {array.GetType().Name}.");
         var data = s.Data;
 
         int n = s.Length;
@@ -161,7 +169,7 @@ internal static class FsstArrayEncoder
                 sb.Builder, idx.FsstString, bufIdxs, metadataTicket, children, statsTicket.Value);
     }
 
-    private static byte[][] ExtractRowBytes(StringArray s, int n)
+    private static byte[][] ExtractRowBytes(BinaryArray s, int n)
     {
         var rows = new byte[n][];
         for (int i = 0; i < n; i++)

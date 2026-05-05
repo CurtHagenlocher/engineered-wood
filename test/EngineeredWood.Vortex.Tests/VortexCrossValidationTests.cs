@@ -1604,6 +1604,96 @@ public class VortexCrossValidationTests
     }
 
     [Fact]
+    public void RustReader_OpensDotNetWrittenFsstBinaryFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // Repetitive binary column → FSST. Validates the symbol-table +
+        // codes wire shape works for BinaryType the same way it does for
+        // StringType (vortex 0.70 dispatches both through the same
+        // vortex.fsst encoding).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", BinaryType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 200;
+        var prefix = new byte[] { 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF };
+        var b = new BinaryArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            var bytes = new byte[12];
+            Buffer.BlockCopy(prefix, 0, bytes, 0, 8);
+            bytes[8] = (byte)(i & 0xFF);
+            bytes[9] = (byte)((i >> 8) & 0xFF);
+            bytes[10] = 0x55;
+            bytes[11] = 0xAA;
+            b.Append((ReadOnlySpan<byte>)bytes);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public void RustReader_OpensDotNetWrittenVarBinViewBinaryFile()
+    {
+        var validator = FindValidator();
+        if (validator is null) return;
+
+        // BinaryArray under preferVarBinView. Mix of inline + referenced
+        // payloads exercises both view-format branches.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", BinaryType.Default, nullable: false),
+        }, metadata: null);
+        const int n = 100;
+        var b = new BinaryArray.Builder();
+        for (int i = 0; i < n; i++)
+        {
+            var bytes = (i % 2 == 0)
+                ? new byte[] { (byte)i, 0xAA, 0xBB }
+                : new byte[20];
+            if (i % 2 == 1)
+                for (int k = 0; k < 20; k++) bytes[k] = (byte)((i + k) & 0xFF);
+            b.Append((ReadOnlySpan<byte>)bytes);
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preferVarBinView: true);
+
+            var (code, stdout, stderr) = RunValidator(validator, path);
+            Assert.True(code == 0,
+                $"Rust validator failed (exit {code}). stderr:\n{stderr}\nstdout:\n{stdout}");
+            Assert.Contains($"OK rows={n}", stdout);
+            Assert.Contains($"DONE total={n}", stdout);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public void RustReader_OpensDotNetWrittenStringStatsFile()
     {
         var validator = FindValidator();

@@ -6684,6 +6684,65 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task Fsst_BinaryArrayRoundtrip()
+    {
+        // Repetitive binary payloads with a shared prefix — FSST trains a
+        // useful symbol table on the bytes regardless of UTF-8-ness. Mix
+        // in nulls so the validity-child path also fires.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", BinaryType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 200;
+        var prefix = new byte[] { 0xCA, 0xFE, 0xBA, 0xBE, 0xDE, 0xAD, 0xBE, 0xEF };
+        var b = new BinaryArray.Builder();
+        var expected = new byte[n][];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 11 == 0) { b.AppendNull(); expected[i] = null!; continue; }
+            // 8-byte shared prefix + 4-byte varying suffix → FSST should
+            // pick up the prefix as a high-frequency symbol.
+            var bytes = new byte[12];
+            Buffer.BlockCopy(prefix, 0, bytes, 0, 8);
+            bytes[8] = (byte)(i & 0xFF);
+            bytes[9] = (byte)((i >> 8) & 0xFF);
+            bytes[10] = 0x55;
+            bytes[11] = 0xAA;
+            b.Append((ReadOnlySpan<byte>)bytes);
+            expected[i] = bytes;
+        }
+        var batch = new RecordBatch(schema, new IArrowArray[] { b.Build() }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.IsType<BinaryType>(reader.Schema.FieldsList[0].DataType);
+            var read = Assert.IsType<BinaryArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else
+                {
+                    Assert.True(read.IsValid(i));
+                    var actual = read.GetBytes(i);
+                    Assert.Equal(expected[i].Length, actual.Length);
+                    for (int k = 0; k < expected[i].Length; k++)
+                        Assert.Equal(expected[i][k], actual[k]);
+                }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task VarBinView_BinaryArrayRoundtrip()
     {
         // BinaryArray under preferVarBinView. Mix of inline-eligible
