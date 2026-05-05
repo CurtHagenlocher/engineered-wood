@@ -83,9 +83,14 @@ internal static class PrimitiveArrayDecoder
                 (vb, nb, len, nc) => new FloatArray(vb, nb, len, nc, offset: 0)),
             DoubleType => BuildArray<double>(data, rowCount, sizeof(double), nullBuffer, nullCount,
                 (vb, nb, len, nc) => new DoubleArray(vb, nb, len, nc, offset: 0)),
+#if NET6_0_OR_GREATER
+            HalfFloatType => BuildArray<Half>(data, rowCount, elementSize: 2, nullBuffer, nullCount,
+                (vb, nb, len, nc) => new HalfFloatArray(vb, nb, len, nc, offset: 0)),
+#else
             HalfFloatType => throw new NotSupportedException(
-                "HalfFloat (F16) decode is not yet implemented (Apache.Arrow's HalfFloatArray "
-                + "requires System.Half, which isn't available on netstandard2.0)."),
+                "HalfFloat (F16) decode requires System.Half (net6+); netstandard2.0 builds "
+                + "of Apache.Arrow don't ship HalfFloatArray."),
+#endif
             _ => throw new NotSupportedException(
                 $"vortex.primitive decoder doesn't support Arrow type {expectedType}."),
         };

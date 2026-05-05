@@ -6462,6 +6462,62 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task SelfRoundtrip_HalfFloat()
+    {
+        // F16: 2 bytes/row, no Extension wrap. Reader's PrimitiveArrayDecoder
+        // gates F16 on NET6_0_OR_GREATER; this test only runs on the modern
+        // TFMs the test project targets (net8.0 / net10.0), both of which
+        // satisfy the gate.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("h", HalfFloatType.Default, nullable: true),
+        }, metadata: null);
+        const int n = 50;
+        var bytes = new byte[(long)n * 2];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, Half>(bytes.AsSpan());
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        var expected = new Half?[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 4 == 0) { nullCount++; expected[i] = null; }
+            else
+            {
+                var v = (Half)(0.5f + i * 0.25f);
+                span[i] = v;
+                validity[i >> 3] |= (byte)(1 << (i & 7));
+                expected[i] = v;
+            }
+        }
+        var arrData = new ArrayData(
+            HalfFloatType.Default, n, nullCount, 0,
+            new[] { new ArrowBuffer(validity), new ArrowBuffer(bytes) });
+        var arr = new HalfFloatArray(arrData);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            Assert.IsType<HalfFloatType>(reader.Schema.FieldsList[0].DataType);
+            var read = Assert.IsType<HalfFloatArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task SelfRoundtrip_Date64()
     {
         // Date64: i64 milliseconds since epoch, wrapped in vortex.date Extension
