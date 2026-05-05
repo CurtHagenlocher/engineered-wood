@@ -66,7 +66,8 @@ internal static class ArrayEncoderDispatch
                 storageTicket = PrimitiveArrayEncoder.Emit(sb, array, idx.Primitive, idx.Bool, statsTicket: null);
             return WrapExtension(sb, idx.Ext, storageTicket, statsTicket);
         }
-        if (array is Apache.Arrow.Date32Array or Apache.Arrow.Date64Array)
+        if (array is Apache.Arrow.Date32Array or Apache.Arrow.Date64Array
+            or Apache.Arrow.Time32Array or Apache.Arrow.Time64Array)
         {
             int storageTicket = PrimitiveArrayEncoder.Emit(
                 sb, array, idx.Primitive, idx.Bool, statsTicket: null);

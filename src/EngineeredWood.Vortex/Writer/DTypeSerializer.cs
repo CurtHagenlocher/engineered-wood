@@ -89,6 +89,8 @@ internal static class DTypeSerializer
             TimestampType ts => WrapDType(b, DTypeKind.Extension, EmitTimestampExtension(b, ts, nullable)),
             Date32Type => WrapDType(b, DTypeKind.Extension, EmitDateExtension(b, isDate64: false, nullable)),
             Date64Type => WrapDType(b, DTypeKind.Extension, EmitDateExtension(b, isDate64: true, nullable)),
+            Time32Type t32 => WrapDType(b, DTypeKind.Extension, EmitTimeExtension(b, t32.Unit, isWide: false, nullable)),
+            Time64Type t64 => WrapDType(b, DTypeKind.Extension, EmitTimeExtension(b, t64.Unit, isWide: true, nullable)),
             _ => throw new NotSupportedException(
                 $"Vortex writer Phase 1 doesn't yet support Arrow type {field.DataType} (field '{field.Name}')."),
         };
@@ -225,6 +227,36 @@ internal static class DTypeSerializer
         var storageTicket = WrapDType(b, DTypeKind.Primitive, storageInner);
         var metadataTicket = b.WriteByteVector(new[] { unitTag });
         var idTicket = b.WriteString("vortex.date");
+        return EmitExtensionTable(b, idTicket, storageTicket, metadataTicket);
+    }
+
+    /// <summary>
+    /// Emits a <c>vortex.time</c> Extension DType. Storage is Primitive(I32)
+    /// for Time32 (Seconds tag 3 / Milliseconds tag 2) and Primitive(I64)
+    /// for Time64 (Microseconds tag 1 / Nanoseconds tag 0) — matching the
+    /// reader's <c>ResolveTime</c>. Metadata is a single unit byte. Mirrors
+    /// upstream <c>vortex-array/src/extension/datetime/time.rs</c>.
+    /// </summary>
+    private static int EmitTimeExtension(
+        BackwardsFlatBufferBuilder b, Apache.Arrow.Types.TimeUnit unit, bool isWide, bool nullable)
+    {
+        // Time32 supports {S, Ms}; Time64 supports {Us, Ns}. The Apache.Arrow
+        // ctor enforces that, so we don't need to re-validate here — but
+        // tagging is unit-driven, not width-driven.
+        byte unitTag = unit switch
+        {
+            Apache.Arrow.Types.TimeUnit.Second => 3,
+            Apache.Arrow.Types.TimeUnit.Millisecond => 2,
+            Apache.Arrow.Types.TimeUnit.Microsecond => 1,
+            Apache.Arrow.Types.TimeUnit.Nanosecond => 0,
+            _ => throw new NotSupportedException(
+                $"vortex.time doesn't support TimeUnit {unit}."),
+        };
+        var ptype = isWide ? PType.I64 : PType.I32;
+        var storageInner = EmitPrimitive(b, ptype, nullable);
+        var storageTicket = WrapDType(b, DTypeKind.Primitive, storageInner);
+        var metadataTicket = b.WriteByteVector(new[] { unitTag });
+        var idTicket = b.WriteString("vortex.time");
         return EmitExtensionTable(b, idTicket, storageTicket, metadataTicket);
     }
 

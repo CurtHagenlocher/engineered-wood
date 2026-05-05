@@ -6312,6 +6312,96 @@ public class VortexFileWriterTests
     }
 
     [Fact]
+    public async Task SelfRoundtrip_Time32_Milliseconds()
+    {
+        // Time32(Ms): i32 ms-of-day, range [0, 86_400_000), wrapped in
+        // vortex.time Extension with TimeUnit::Ms (tag 2).
+        var type = new Time32Type(TimeUnit.Millisecond);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("t", type, nullable: true),
+        }, metadata: null);
+        const int n = 60;
+        var bytes = new byte[(long)n * 4];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, int>(bytes.AsSpan());
+        var validity = new byte[(n + 7) / 8];
+        int nullCount = 0;
+        var expected = new int?[n];
+        for (int i = 0; i < n; i++)
+        {
+            if (i % 7 == 0) { nullCount++; expected[i] = null; }
+            else { int v = i * 60_000; span[i] = v; validity[i >> 3] |= (byte)(1 << (i & 7)); expected[i] = v; }
+        }
+        var arr = new Time32Array(type, new ArrowBuffer(bytes), new ArrowBuffer(validity), n, nullCount, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var t32 = Assert.IsType<Time32Type>(reader.Schema.FieldsList[0].DataType);
+            Assert.Equal(TimeUnit.Millisecond, t32.Unit);
+            var read = Assert.IsType<Time32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+            {
+                if (expected[i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task SelfRoundtrip_Time64_Microseconds()
+    {
+        // Time64(Us): i64 us-of-day, wrapped in vortex.time Extension with
+        // TimeUnit::Us (tag 1).
+        var type = new Time64Type(TimeUnit.Microsecond);
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("t", type, nullable: false),
+        }, metadata: null);
+        const int n = 80;
+        var bytes = new byte[(long)n * 8];
+        var span = System.Runtime.InteropServices.MemoryMarshal.Cast<byte, long>(bytes.AsSpan());
+        var expected = new long[n];
+        for (int i = 0; i < n; i++)
+        {
+            long v = (long)i * 1_000_000L;
+            span[i] = v;
+            expected[i] = v;
+        }
+        var arr = new Time64Array(type, new ArrowBuffer(bytes), ArrowBuffer.Empty, n, 0, 0);
+        var batch = new RecordBatch(schema, new IArrowArray[] { arr }, n);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var t64 = Assert.IsType<Time64Type>(reader.Schema.FieldsList[0].DataType);
+            Assert.Equal(TimeUnit.Microsecond, t64.Unit);
+            var read = Assert.IsType<Time64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(n, read.Length);
+            for (int i = 0; i < n; i++)
+                Assert.Equal(expected[i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
     public async Task SelfRoundtrip_Date64()
     {
         // Date64: i64 milliseconds since epoch, wrapped in vortex.date Extension
