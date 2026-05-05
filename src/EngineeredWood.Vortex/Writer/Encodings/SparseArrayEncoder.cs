@@ -20,11 +20,10 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// vortex's <c>SparseMetadata</c> wraps the patches descriptor as a
 /// length-delimited submessage at field 1.</para>
 ///
-/// <para>Phase 1 scope: non-nullable, non-sliced primitive integer columns
-/// (Int8..Int64, UInt8..UInt64). Float fill values are deferred until ALP +
-/// RLE stop being the dominant float-compression paths. Nullable inputs would
-/// require encoding a null fill via <c>ScalarValueKind.Null</c>; matched
-/// reader behaviour is also pending.</para>
+/// <para>Phase 1 scope: nullable + non-nullable, sliced + non-sliced
+/// primitive integer columns (Int8..Int64, UInt8..UInt64). Float fill values
+/// are deferred until ALP + RLE stop being the dominant float-compression
+/// paths.</para>
 /// </summary>
 internal static class SparseArrayEncoder
 {
@@ -38,7 +37,6 @@ internal static class SparseArrayEncoder
         if (array is null) return false;
         if (ElementSize(array) is not int elemSize) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         int n = array.Length;
         if (n < 2) return false; // constant catches the 1-row case.
         int nullCount = data.GetNullCount();
@@ -71,10 +69,8 @@ internal static class SparseArrayEncoder
             throw new NotSupportedException(
                 $"vortex.sparse writer doesn't support Arrow {array.GetType().Name}.");
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.sparse writer doesn't yet support sliced inputs.");
-
         int n = array.Length;
+        int off = data.Offset;
         int nullCount = data.GetNullCount();
         bool hasNulls = nullCount > 0;
         var src = data.Buffers[1].Span;
@@ -88,8 +84,8 @@ internal static class SparseArrayEncoder
         int patchCount = 0;
         for (int i = 0; i < n; i++)
         {
-            bool isNull = hasNulls && (validity[i >> 3] & (1 << (i & 7))) == 0;
-            if (isNull || ReadKey(src, i * elemSize, elemSize) != modeKey) patchCount++;
+            bool isNull = hasNulls && (validity[(off + i) >> 3] & (1 << ((off + i) & 7))) == 0;
+            if (isNull || ReadKey(src, (off + i) * elemSize, elemSize) != modeKey) patchCount++;
         }
 
         byte indicesPtype = SmallestUIntPtypeFor(n);
@@ -104,13 +100,15 @@ internal static class SparseArrayEncoder
         int writeIdx = 0;
         for (int i = 0; i < n; i++)
         {
-            bool isNull = hasNulls && (validity[i >> 3] & (1 << (i & 7))) == 0;
-            if (!isNull && ReadKey(src, i * elemSize, elemSize) == modeKey) continue;
+            bool isNull = hasNulls && (validity[(off + i) >> 3] & (1 << ((off + i) & 7))) == 0;
+            if (!isNull && ReadKey(src, (off + i) * elemSize, elemSize) == modeKey) continue;
 
+            // Patch indices are logical positions within the slice, NOT
+            // absolute rows in the underlying buffer.
             WriteIndex(indicesBytes.AsSpan(writeIdx * indicesElemSize, indicesElemSize), (ulong)i, indicesElemSize);
             if (!isNull)
             {
-                src.Slice(i * elemSize, elemSize)
+                src.Slice((off + i) * elemSize, elemSize)
                     .CopyTo(valuesBytes.AsSpan(writeIdx * elemSize, elemSize));
             }
             // (else the value slot stays zeroed — the patch's validity bit masks it)
@@ -160,13 +158,14 @@ internal static class SparseArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         var src = data.Buffers[1].Span;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
         var counts = new Dictionary<long, int>();
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && (validity[i >> 3] & (1 << (i & 7))) == 0) continue;
-            long key = ReadKey(src, i * elemSize, elemSize);
+            if (hasNulls && (validity[(off + i) >> 3] & (1 << ((off + i) & 7))) == 0) continue;
+            long key = ReadKey(src, (off + i) * elemSize, elemSize);
             counts.TryGetValue(key, out int c);
             counts[key] = c + 1;
         }

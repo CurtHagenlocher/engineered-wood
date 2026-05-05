@@ -29,8 +29,8 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 ///     buffer index (u32), bytes 12..15 = offset within buffer (u32).</item>
 /// </list></para>
 ///
-/// <para>Phase 1 scope: <see cref="StringArray"/>, nullable + non-nullable.
-/// Single data buffer (all long strings concatenated). Sliced inputs and
+/// <para>Scope: <see cref="StringArray"/>, nullable + non-nullable, sliced +
+/// non-sliced. Single data buffer (all long strings concatenated).
 /// <see cref="BinaryArray"/> deferred. The encoder is exposed as an opt-in
 /// (<c>VortexFileWriter</c>'s <c>preferVarBinView</c> flag) rather than
 /// auto-dispatched — for short-string columns vortex.varbin is more compact
@@ -48,8 +48,6 @@ internal static class VarBinViewArrayEncoder
             throw new NotSupportedException(
                 $"vortex.varbinview writer requires StringArray, got {array.GetType().Name}.");
         var data = s.Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.varbinview writer doesn't yet support sliced inputs.");
 
         int n = s.Length;
         int nullCount = data.GetNullCount();

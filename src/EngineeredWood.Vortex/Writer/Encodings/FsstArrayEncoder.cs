@@ -23,10 +23,8 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// (validity bitmap appended). Metadata
 /// <c>FSSTMetadata { uncompressed_lengths_ptype, codes_offsets_ptype }</c>.</para>
 ///
-/// <para>Phase 1 scope: non-nullable, non-sliced StringArray. Nullable +
-/// sliced inputs are deferred — the encoder would need to honor data.Offset
-/// and emit a per-row validity child following the rule used by the existing
-/// reader (child[2] is a vortex.bool). Floats / binary deferred.</para>
+/// <para>Scope: nullable + non-nullable, sliced + non-sliced StringArray.
+/// Floats / binary deferred.</para>
 ///
 /// <para>Symbol-table extraction uses the public
 /// <see cref="SymbolTable.SymbolCount"/> + <see cref="SymbolTable.ExportRaw"/>
@@ -45,7 +43,6 @@ internal static class FsstArrayEncoder
     {
         if (array is not StringArray s) return false;
         var data = s.Data;
-        if (data.Offset != 0) return false;
         int n = s.Length;
         if (n < MinRows) return false;
         int nullCount = data.GetNullCount();
@@ -65,7 +62,7 @@ internal static class FsstArrayEncoder
         var rowBytes = ExtractRowBytes(s, n);
         var trainingRows = nullCount == 0
             ? rowBytes
-            : ExtractNonNullRows(rowBytes, data.Buffers[0].Span, n);
+            : ExtractNonNullRows(rowBytes, data.Buffers[0].Span, data.Offset, n);
         SymbolTable table;
         try
         {
@@ -91,8 +88,6 @@ internal static class FsstArrayEncoder
             throw new NotSupportedException(
                 $"vortex.fsst writer requires StringArray, got {array.GetType().Name}.");
         var data = s.Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.fsst writer doesn't yet support sliced inputs.");
 
         int n = s.Length;
         int nullCount = data.GetNullCount();
@@ -104,7 +99,7 @@ internal static class FsstArrayEncoder
         //    including null ones — null rows compress to zero bytes since
         //    we feed them as empty arrays.
         var trainingRows = hasNulls
-            ? ExtractNonNullRows(rowBytes, data.Buffers[0].Span, n)
+            ? ExtractNonNullRows(rowBytes, data.Buffers[0].Span, data.Offset, n)
             : rowBytes;
         var table = FsstEncoder.BuildSymbolTable(trainingRows, zeroTerminated: false);
         var (compressed, perRowCompressedLengths) = FsstEncoder.CompressBatch(table, rowBytes);
@@ -180,9 +175,8 @@ internal static class FsstArrayEncoder
                 rows[i] = System.Array.Empty<byte>();
                 continue;
             }
-            // GetValueLength + GetBytes round-trips through Apache.Arrow's
-            // typed accessor, honoring data.Offset (we already reject offset
-            // != 0 above so it just reads from row 0).
+            // GetValueLength + GetBytes go through Apache.Arrow's typed
+            // accessor, which already honors data.Offset on sliced inputs.
             int len = s.GetValueLength(i);
             rows[i] = s.GetBytes(i).ToArray();
             // Defensive: GetBytes can return a span larger than len when the
@@ -195,16 +189,18 @@ internal static class FsstArrayEncoder
 
     /// <summary>
     /// Returns just the non-null rows from <paramref name="rowBytes"/>,
-    /// suitable as a training sample. Validity is read from the input
-    /// bitmap at bit position <c>i</c> (caller has guaranteed
-    /// <c>data.Offset == 0</c>).
+    /// suitable as a training sample. Validity is read from the underlying
+    /// bitmap at bit position <c>offset + i</c> (logical row <c>i</c> in the
+    /// slice).
     /// </summary>
-    private static byte[][] ExtractNonNullRows(byte[][] rowBytes, ReadOnlySpan<byte> validity, int n)
+    private static byte[][] ExtractNonNullRows(
+        byte[][] rowBytes, ReadOnlySpan<byte> validity, int offset, int n)
     {
         var nonNull = new List<byte[]>(n);
         for (int i = 0; i < n; i++)
         {
-            if ((validity[i >> 3] & (1 << (i & 7))) != 0)
+            int bit = offset + i;
+            if ((validity[bit >> 3] & (1 << (bit & 7))) != 0)
                 nonNull.Add(rowBytes[i]);
         }
         return nonNull.ToArray();

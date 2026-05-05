@@ -47,9 +47,9 @@ internal static class AlpRdArrayEncoder
     {
         if (array is not (FloatArray or DoubleArray)) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         if (data.GetNullCount() > 0) return false; // phase 1: non-null
         int n = array.Length;
+        int off = data.Offset;
         // Need enough rows to amortize FastLanes' 1024-element chunk padding
         // (which forces left/right payloads up to a multiple of 128 × W bytes).
         if (n < 1024) return false;
@@ -62,8 +62,8 @@ internal static class AlpRdArrayEncoder
         bool isF32 = array is FloatArray;
         int floatBytes = isF32 ? 4 : 8;
         var (rightBw, dict, exceptionCount) = isF32
-            ? FindBestDictionaryF32(MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4)))
-            : FindBestDictionary(MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8)));
+            ? FindBestDictionaryF32(MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4)))
+            : FindBestDictionary(MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8)));
         if (rightBw == 0) return false;
 
         int leftBw = BitWidth(dict.Length == 0 ? 0 : dict.Length - 1);
@@ -86,24 +86,23 @@ internal static class AlpRdArrayEncoder
             throw new NotSupportedException(
                 $"vortex.alprd writer requires FloatArray or DoubleArray, got {array.GetType().Name}.");
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.alprd writer doesn't yet support sliced inputs.");
         if (data.GetNullCount() > 0)
             throw new NotSupportedException("vortex.alprd writer doesn't yet support nullable inputs.");
 
         bool isF32 = array is FloatArray;
         int n = array.Length;
+        int off = data.Offset;
 
         int rightBw;
         ushort[] dict;
         if (isF32)
         {
-            var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4));
+            var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4));
             (rightBw, dict, _) = FindBestDictionaryF32(src);
         }
         else
         {
-            var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
+            var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8));
             (rightBw, dict, _) = FindBestDictionary(src);
         }
         if (rightBw == 0)
@@ -128,7 +127,7 @@ internal static class AlpRdArrayEncoder
         if (isF32)
         {
             uint rightMask = (uint)((1UL << rightBw) - 1);
-            var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4));
+            var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4));
             var rightPartsSpan = MemoryMarshal.Cast<byte, uint>(rightPartsBytes.AsSpan());
             for (int i = 0; i < n; i++)
             {
@@ -143,7 +142,7 @@ internal static class AlpRdArrayEncoder
         else
         {
             ulong rightMask = (1UL << rightBw) - 1;
-            var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
+            var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8));
             var rightPartsSpan = MemoryMarshal.Cast<byte, ulong>(rightPartsBytes.AsSpan());
             for (int i = 0; i < n; i++)
             {

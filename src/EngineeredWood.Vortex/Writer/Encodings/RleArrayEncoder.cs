@@ -29,7 +29,7 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// vtable as vortex.list / fastlanes.for / fastlanes.delta / vortex.dict
 /// (slots 0+1+2, with optional slot 4 for stats).</para>
 ///
-/// <para>Scope: non-nullable, non-sliced primitive numeric columns
+/// <para>Scope: non-nullable, sliced + non-sliced primitive numeric columns
 /// (Int8..Int64, UInt8..UInt64, Float32, Float64), length ≥ 1024. Indices are
 /// u8 when every chunk has ≤ 256 distinct values, u16 otherwise. Offsets are
 /// u64 for simplicity. Caller (dispatch) gates on a probe to ensure RLE
@@ -56,19 +56,19 @@ internal static class RleArrayEncoder
         if (array is null) return false;
         if (array is not FloatArray and not DoubleArray) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         if (data.GetNullCount() > 0) return false;
         int n = array.Length;
         if (n < ElementsPerChunk) return false;
         if (ElementSize(array) is not int elemSize) return false;
 
+        int off = data.Offset;
         int numChunks = n / ElementsPerChunk; // ignore trailing partial chunk for the probe
         int cap = n / 4;
         int total = 0;
         var src = data.Buffers[1].Span;
         for (int c = 0; c < numChunks; c++)
         {
-            int chunkStart = c * ElementsPerChunk * elemSize;
+            int chunkStart = (off + c * ElementsPerChunk) * elemSize;
             int chunkBytes = ElementsPerChunk * elemSize;
             // Count distinct via a HashSet over byte sequences. Per-chunk
             // allocation is fine — bounded to the chunk's row count.
@@ -89,8 +89,6 @@ internal static class RleArrayEncoder
     {
         if (array is null) throw new ArgumentNullException(nameof(array));
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("fastlanes.rle writer doesn't yet support sliced inputs.");
         if (data.GetNullCount() > 0)
             throw new NotSupportedException("fastlanes.rle writer doesn't yet support nullable inputs.");
         if (ElementSize(array) is not int elemSize)
@@ -163,6 +161,7 @@ internal static class RleArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         var src = data.Buffers[1].Span;
+        int off = data.Offset;
 
         // Phase 1: discover per-chunk unique-value lists. We need to know the
         // total values_len before allocating, AND the max per-chunk distinct
@@ -173,7 +172,7 @@ internal static class RleArrayEncoder
         int maxPerChunkDistinct = 0;
         for (int c = 0; c < numChunks; c++)
         {
-            int chunkStart = c * ElementsPerChunk * elemSize;
+            int chunkStart = (off + c * ElementsPerChunk) * elemSize;
             int rowsInChunk = Math.Min(ElementsPerChunk, n - c * ElementsPerChunk);
             var dict = new Dictionary<long, int>();
             var keys = new List<long>();
@@ -233,7 +232,7 @@ internal static class RleArrayEncoder
             valuesPos += keys.Count;
 
             // Fill local indices for this chunk's 1024 rows.
-            int chunkStart = c * ElementsPerChunk * elemSize;
+            int chunkStart = (off + c * ElementsPerChunk) * elemSize;
             int rowsInChunk = Math.Min(ElementsPerChunk, n - c * ElementsPerChunk);
             var dict = perChunkDicts[c];
             int chunkIndicesStart = c * ElementsPerChunk * indicesElemSize;

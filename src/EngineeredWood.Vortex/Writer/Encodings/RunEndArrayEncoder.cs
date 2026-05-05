@@ -29,13 +29,14 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// monotonic ints) and values can pick whatever encoding suits the run
 /// values' distribution.</para>
 ///
-/// <para>Scope: nullable + non-nullable, non-sliced primitive integer columns
-/// (Int8..Int64, UInt8..UInt64). For nullable inputs, runs that span only
-/// null rows collapse into a single null run regardless of the underlying
-/// (garbage) value bytes. The values child carries one validity bit per run,
-/// and the reader expands that bitmap row-wise during decode. Floats deferred
-/// — ALP and fastlanes.rle already cover them. Bool / strings deferred until
-/// the reader's <see cref="EngineeredWood.Vortex.Encodings.RunEndArrayDecoder.Expand"/>
+/// <para>Scope: nullable + non-nullable, sliced + non-sliced primitive
+/// integer columns (Int8..Int64, UInt8..UInt64). For nullable inputs, runs
+/// that span only null rows collapse into a single null run regardless of
+/// the underlying (garbage) value bytes. The values child carries one
+/// validity bit per run, and the reader expands that bitmap row-wise during
+/// decode. Floats deferred — ALP and fastlanes.rle already cover them. Bool /
+/// strings deferred until the reader's
+/// <see cref="EngineeredWood.Vortex.Encodings.RunEndArrayDecoder.Expand"/>
 /// grows matching cases.</para>
 /// </summary>
 internal static class RunEndArrayEncoder
@@ -51,7 +52,6 @@ internal static class RunEndArrayEncoder
         if (array is null) return false;
         if (ElementSize(array) is not int elemSize) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         int n = array.Length;
         if (n < 2) return false; // 0/1-row columns: nothing to RLE; constant catches the 1-row case anyway.
         int nullCount = data.GetNullCount();
@@ -77,9 +77,6 @@ internal static class RunEndArrayEncoder
             throw new NotSupportedException(
                 $"vortex.runend writer doesn't support Arrow {array.GetType().Name}.");
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.runend writer doesn't yet support sliced inputs.");
-
         int n = array.Length;
         var (endsArr, valuesArr, endsPtype) = BuildRunEnds(array, elemSize, n);
         int numRuns = endsArr.Length;
@@ -159,16 +156,17 @@ internal static class RunEndArrayEncoder
         var data = ((Apache.Arrow.Array)array).Data;
         var src = data.Buffers[1].Span;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
 
         int runs = 1;
-        bool prevValid = !hasNulls || IsValidAt(validity, 0);
-        long prevKey = prevValid ? ReadKey(src, 0, elemSize) : 0;
+        bool prevValid = !hasNulls || IsValidAt(validity, off);
+        long prevKey = prevValid ? ReadKey(src, off * elemSize, elemSize) : 0;
         for (int i = 1; i < n; i++)
         {
-            bool curValid = !hasNulls || IsValidAt(validity, i);
-            long curKey = curValid ? ReadKey(src, i * elemSize, elemSize) : 0;
+            bool curValid = !hasNulls || IsValidAt(validity, off + i);
+            long curKey = curValid ? ReadKey(src, (off + i) * elemSize, elemSize) : 0;
             if (curValid != prevValid || (curValid && curKey != prevKey))
             {
                 runs++;
@@ -187,6 +185,7 @@ internal static class RunEndArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         var src = data.Buffers[1].Span;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
 
@@ -201,10 +200,10 @@ internal static class RunEndArrayEncoder
         int valuesNullCount = 0;
 
         int runIdx = 0;
-        bool prevValid = !hasNulls || IsValidAt(validity, 0);
-        long prevKey = prevValid ? ReadKey(src, 0, elemSize) : 0;
-        // Seed values[0] + values_validity[0] from row 0.
-        if (prevValid) src.Slice(0, elemSize).CopyTo(valuesBytes.AsSpan(0, elemSize));
+        bool prevValid = !hasNulls || IsValidAt(validity, off);
+        long prevKey = prevValid ? ReadKey(src, off * elemSize, elemSize) : 0;
+        // Seed values[0] + values_validity[0] from row 0 of the slice.
+        if (prevValid) src.Slice(off * elemSize, elemSize).CopyTo(valuesBytes.AsSpan(0, elemSize));
         if (valuesValidityBytes is not null)
         {
             if (prevValid) valuesValidityBytes[0] |= 1;
@@ -212,15 +211,17 @@ internal static class RunEndArrayEncoder
         }
         for (int i = 1; i < n; i++)
         {
-            bool curValid = !hasNulls || IsValidAt(validity, i);
-            long curKey = curValid ? ReadKey(src, i * elemSize, elemSize) : 0;
+            bool curValid = !hasNulls || IsValidAt(validity, off + i);
+            long curKey = curValid ? ReadKey(src, (off + i) * elemSize, elemSize) : 0;
             if (curValid != prevValid || (curValid && curKey != prevKey))
             {
-                // Close run runIdx at position i; start run runIdx+1.
+                // Close run runIdx at position i (run-end indices are
+                // logical positions within the slice, not absolute rows in
+                // the underlying buffer); start run runIdx+1.
                 WriteEnd(endsBytes.AsSpan(runIdx * endsElemSize, endsElemSize), (ulong)i, endsElemSize);
                 runIdx++;
                 if (curValid)
-                    src.Slice(i * elemSize, elemSize).CopyTo(valuesBytes.AsSpan(runIdx * elemSize, elemSize));
+                    src.Slice((off + i) * elemSize, elemSize).CopyTo(valuesBytes.AsSpan(runIdx * elemSize, elemSize));
                 // (else leave the slot zeroed — masked by the run's validity bit)
                 if (valuesValidityBytes is not null)
                 {

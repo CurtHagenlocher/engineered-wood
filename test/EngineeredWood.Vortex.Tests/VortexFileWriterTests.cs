@@ -5694,4 +5694,411 @@ public class VortexFileWriterTests
             try { File.Delete(path); } catch { }
         }
     }
+
+    [Fact]
+    public async Task Constant_SlicedRoundtrips()
+    {
+        // Underlying buffer carries varied data; the slice is uniform.
+        // Writer's IsApplicable must inspect only the sliced window and
+        // SerializeFirstValue must read at data.Offset.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        var b = new Int32Array.Builder();
+        // Rows 0..9: noise. Rows 10..29: all 42. Rows 30..39: noise.
+        for (int i = 0; i < 10; i++) b.Append(i * 100);
+        for (int i = 0; i < 20; i++) b.Append(42);
+        for (int i = 0; i < 10; i++) b.Append(-i);
+        var full = b.Build();
+        var sliced = (Int32Array)full.Slice(10, 20);
+        Assert.Equal(10, sliced.Offset);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, 20);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(20, read.Length);
+            for (int i = 0; i < 20; i++) Assert.Equal(42, read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task RunEnd_SlicedRoundtrips()
+    {
+        // Run-end profitability is sensitive to row count; build a long
+        // base column with cleanly aligned runs, then slice through several
+        // runs so the encoder must compute run boundaries off `data.Offset`.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        const int total = 800;
+        var b = new Int64Array.Builder();
+        var expected = new long?[total];
+        for (int i = 0; i < total; i++)
+        {
+            if ((i / 50) % 3 == 0) { b.AppendNull(); expected[i] = null; }
+            else { long v = (i / 50) * 7; b.Append(v); expected[i] = v; }
+        }
+        var full = b.Build();
+        const int sliceOff = 137;
+        const int sliceLen = 500;
+        var sliced = (Int64Array)full.Slice(sliceOff, sliceLen);
+        Assert.Equal(sliceOff, sliced.Offset);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+            {
+                if (expected[sliceOff + i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[sliceOff + i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Sparse_SlicedRoundtrips()
+    {
+        // Sparse fires when one value covers ≥ ~67% of rows. Build a column
+        // where the slice has a clear mode but the surrounding noise would
+        // confuse the encoder if it didn't honor data.Offset.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int32Type.Default, nullable: false),
+        }, metadata: null);
+        const int total = 1200;
+        var b = new Int32Array.Builder();
+        var expected = new int[total];
+        var rng = new Random(99);
+        for (int i = 0; i < total; i++)
+        {
+            // Slice [200, 1100) is mostly 7 with occasional outliers; outside
+            // the slice is uniform random which would muddy mode detection.
+            int v = (i >= 200 && i < 1100)
+                ? (i % 73 == 0 ? rng.Next(int.MaxValue) : 7)
+                : rng.Next(int.MaxValue);
+            b.Append(v);
+            expected[i] = v;
+        }
+        var full = b.Build();
+        const int sliceOff = 200, sliceLen = 900;
+        var sliced = (Int32Array)full.Slice(sliceOff, sliceLen);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int32Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+                Assert.Equal(expected[sliceOff + i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Alp_SlicedRoundtrips()
+    {
+        // Sliced decimal-shaped doubles. ALP's exponent search must walk
+        // only the sliced rows or the picked (e, f) won't roundtrip.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int total = 1500;
+        var b = new DoubleArray.Builder();
+        var expected = new double[total];
+        for (int i = 0; i < total; i++)
+        {
+            // Slice covers a clean 0.01-precision distribution; outside it
+            // is a mix that ALP would still compress but at different (e, f).
+            expected[i] = i < 250 ? Math.PI * (i + 1) : 1.5 + ((i - 250) % 100) * 0.01;
+            b.Append(expected[i]);
+        }
+        var full = b.Build();
+        const int sliceOff = 300, sliceLen = 1000;
+        var sliced = (DoubleArray)full.Slice(sliceOff, sliceLen);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+                Assert.Equal(expected[sliceOff + i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task AlpRd_SlicedRoundtrips()
+    {
+        // Sliced bounded-magnitude doubles where ALP rejects → ALP-RD claims.
+        // Need ≥ 1024 rows in the slice (ALP-RD's chunk-padding gate).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int total = 4096;
+        var rng = new Random(2026);
+        var b = new DoubleArray.Builder();
+        var expected = new double[total];
+        for (int i = 0; i < total; i++)
+        {
+            double pivot = (i % 3) switch { 0 => 1.5, 1 => 12.5, _ => 100.5 };
+            expected[i] = pivot + rng.NextDouble() * 0.4;
+            b.Append(expected[i]);
+        }
+        var full = b.Build();
+        const int sliceOff = 512, sliceLen = 3000;
+        var sliced = (DoubleArray)full.Slice(sliceOff, sliceLen);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+                Assert.Equal(expected[sliceOff + i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task FloatRle_SlicedRoundtrips()
+    {
+        // Sliced float column with cycling palette → fastlanes.rle. Need
+        // ≥ 1024 rows in the slice (rle's per-chunk dict layout requires
+        // multiples of 1024 rows for clean chunk boundaries).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", DoubleType.Default, nullable: false),
+        }, metadata: null);
+        const int total = 4096;
+        var palette = new[] { 1.5, 2.71828, -3.14, 100.0, 0.0001 };
+        var b = new DoubleArray.Builder();
+        var expected = new double[total];
+        for (int i = 0; i < total; i++)
+        {
+            expected[i] = palette[(i / 64) % palette.Length];
+            b.Append(expected[i]);
+        }
+        var full = b.Build();
+        const int sliceOff = 1024, sliceLen = 2048;
+        var sliced = (DoubleArray)full.Slice(sliceOff, sliceLen);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<DoubleArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+                Assert.Equal(expected[sliceOff + i], read.GetValue(i)!.Value);
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Pco_SlicedRoundtrips()
+    {
+        // Sliced numeric column with mixed nulls; pco compresses only
+        // valid values, so the dense-buffer compaction must walk from
+        // data.Offset rather than 0.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", Int64Type.Default, nullable: true),
+        }, metadata: null);
+        const int total = 4096;
+        var b = new Int64Array.Builder();
+        var expected = new long?[total];
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 11 == 0) { b.AppendNull(); expected[i] = null; }
+            else { long v = (long)i * 1_000_000L - 500L; b.Append(v); expected[i] = v; }
+        }
+        var full = b.Build();
+        const int sliceOff = 250, sliceLen = 3000;
+        var sliced = (Int64Array)full.Slice(sliceOff, sliceLen);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true, preferPco: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<Int64Array>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+            {
+                if (expected[sliceOff + i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[sliceOff + i]!.Value, read.GetValue(i)!.Value); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task Fsst_SlicedRoundtrips()
+    {
+        // Sliced repetitive strings; FSST trains its symbol table on the
+        // sliced rows only (Apache.Arrow's StringArray.GetBytes honors
+        // data.Offset transparently, so the change is mostly dropping the
+        // reject + threading offset through ExtractNonNullRows).
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int total = 200;
+        var b = new StringArray.Builder();
+        var expected = new string?[total];
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 9 == 0) { b.AppendNull(); expected[i] = null; }
+            else
+            {
+                var s = (i % 4) switch
+                {
+                    0 => "https://example.com/foo/bar/" + (i / 4),
+                    1 => "https://example.com/foo/baz/" + (i / 4),
+                    2 => "https://example.com/qux/" + (i / 4),
+                    _ => "https://example.com/zzz/" + (i / 4),
+                };
+                b.Append(s);
+                expected[i] = s;
+            }
+        }
+        var full = b.Build();
+        const int sliceOff = 17, sliceLen = 150;
+        var sliced = (StringArray)full.Slice(sliceOff, sliceLen);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, compress: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+            {
+                if (expected[sliceOff + i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[sliceOff + i], read.GetString(i)); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
+
+    [Fact]
+    public async Task VarBinView_SlicedRoundtrips()
+    {
+        // Sliced strings via preferVarBinView. The encoder reads through
+        // Apache.Arrow's typed StringArray accessors so honoring slicing
+        // amounts to dropping the data.Offset reject.
+        var schema = new Apache.Arrow.Schema(new[]
+        {
+            new Field("v", StringType.Default, nullable: true),
+        }, metadata: null);
+        const int total = 100;
+        var b = new StringArray.Builder();
+        var expected = new string?[total];
+        for (int i = 0; i < total; i++)
+        {
+            if (i % 13 == 0) { b.AppendNull(); expected[i] = null; }
+            else
+            {
+                // Mix short (inline) + long (referenced) strings so both
+                // view layouts are exercised.
+                var s = i % 2 == 0 ? $"row{i:D3}" : new string('x', 20) + i;
+                b.Append(s);
+                expected[i] = s;
+            }
+        }
+        var full = b.Build();
+        const int sliceOff = 7, sliceLen = 80;
+        var sliced = (StringArray)full.Slice(sliceOff, sliceLen);
+        var batch = new RecordBatch(schema, new IArrowArray[] { sliced }, sliceLen);
+
+        var path = Path.GetTempFileName();
+        try
+        {
+            using (var fs = File.Create(path))
+                VortexFileWriter.Write(fs, batch, preferVarBinView: true);
+
+            await using var reader = await VortexFileReader.OpenAsync(path);
+            var read = Assert.IsType<StringArray>(await reader.ReadColumnAsync(0));
+            Assert.Equal(sliceLen, read.Length);
+            for (int i = 0; i < sliceLen; i++)
+            {
+                if (expected[sliceOff + i] is null) Assert.False(read.IsValid(i));
+                else { Assert.True(read.IsValid(i)); Assert.Equal(expected[sliceOff + i], read.GetString(i)); }
+            }
+        }
+        finally
+        {
+            try { File.Delete(path); } catch { }
+        }
+    }
 }

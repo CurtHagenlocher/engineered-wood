@@ -28,10 +28,10 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// output).</para>
 ///
 /// <para>Scope: <see cref="FloatArray"/> / <see cref="DoubleArray"/>,
-/// non-sliced. Sliced inputs land alongside fixtures that exercise them.
-/// Caller (dispatch) gates on a probe in <see cref="IsApplicable"/> that
-/// runs the full encode-and-measure pipeline once and only accepts when
-/// the result is meaningfully smaller than raw.</para>
+/// nullable + non-nullable, sliced + non-sliced. Caller (dispatch) gates on
+/// a probe in <see cref="IsApplicable"/> that runs the full
+/// encode-and-measure pipeline once and only accepts when the result is
+/// meaningfully smaller than raw.</para>
 /// </summary>
 internal static class AlpArrayEncoder
 {
@@ -70,7 +70,6 @@ internal static class AlpArrayEncoder
         if (array is null) return false;
         if (array is not FloatArray && array is not DoubleArray) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         int n = array.Length;
         if (n == 0) return false;
         // All-null column: nothing meaningful to encode.
@@ -98,8 +97,6 @@ internal static class AlpArrayEncoder
             throw new NotSupportedException(
                 $"vortex.alp writer requires FloatArray or DoubleArray, got {array.GetType().Name}.");
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.alp writer doesn't yet support sliced inputs.");
 
         // 1. Pick best exponents and run the full encode pipeline.
         var (expE, expF, _, _) = FindBestExponentsAndEstimate(array);
@@ -160,9 +157,10 @@ internal static class AlpArrayEncoder
     {
         var data = array.Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
-        var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4));
+        var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4));
 
         int bestE = -1, bestF = 0;
         long bestSize = long.MaxValue;
@@ -186,7 +184,7 @@ internal static class AlpArrayEncoder
 
                 for (int i = 0; i < n; i++)
                 {
-                    if (hasNulls && !IsValidAt(validity, i)) continue;
+                    if (hasNulls && !IsValidAt(validity, off + i)) continue;
                     float v = src[i];
                     int encoded = EncodeF32(v, fe, ife);
                     float decoded = DecodeF32(encoded, fdec, idec);
@@ -218,9 +216,10 @@ internal static class AlpArrayEncoder
     {
         var data = array.Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
-        var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
+        var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8));
 
         int bestE = -1, bestF = 0;
         long bestSize = long.MaxValue;
@@ -239,7 +238,7 @@ internal static class AlpArrayEncoder
 
                 for (int i = 0; i < n; i++)
                 {
-                    if (hasNulls && !IsValidAt(validity, i)) continue;
+                    if (hasNulls && !IsValidAt(validity, off + i)) continue;
                     double v = src[i];
                     long encoded = EncodeF64(v, fe, ife);
                     double decoded = DecodeF64(encoded, fdec, idec);
@@ -288,11 +287,17 @@ internal static class AlpArrayEncoder
     {
         var data = array.Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
-        var validityBuf = hasNulls ? data.Buffers[0] : ArrowBuffer.Empty;
         int nullCount = hasNulls ? data.GetNullCount() : 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
-        var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(0, n * 4));
+        // Rebase validity into a fresh offset-0 bitmap so the encoded child
+        // (which is densely packed at logical positions [0..n)) has a
+        // matching null-bitmap layout.
+        var validityBuf = hasNulls
+            ? new ArrowBuffer(EncoderHelpers.ExtractValidityBitmap(validity, srcBitOffset: off, rowCount: n))
+            : ArrowBuffer.Empty;
+        var src = MemoryMarshal.Cast<byte, float>(data.Buffers[1].Span.Slice(off * 4, n * 4));
 
         var encodedBytes = new byte[n * 4];
         var encodedSpan = MemoryMarshal.Cast<byte, int>(encodedBytes.AsSpan());
@@ -305,7 +310,7 @@ internal static class AlpArrayEncoder
         double fdec = F10F64[expF], idec = If10F64[expE];
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && !IsValidAt(validity, i))
+            if (hasNulls && !IsValidAt(validity, off + i))
             {
                 encodedSpan[i] = 0;
                 continue;
@@ -336,11 +341,14 @@ internal static class AlpArrayEncoder
     {
         var data = array.Data;
         int n = array.Length;
+        int off = data.Offset;
         bool hasNulls = data.GetNullCount() > 0;
-        var validityBuf = hasNulls ? data.Buffers[0] : ArrowBuffer.Empty;
         int nullCount = hasNulls ? data.GetNullCount() : 0;
         var validity = hasNulls ? data.Buffers[0].Span : default;
-        var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(0, n * 8));
+        var validityBuf = hasNulls
+            ? new ArrowBuffer(EncoderHelpers.ExtractValidityBitmap(validity, srcBitOffset: off, rowCount: n))
+            : ArrowBuffer.Empty;
+        var src = MemoryMarshal.Cast<byte, double>(data.Buffers[1].Span.Slice(off * 8, n * 8));
 
         var encodedBytes = new byte[n * 8];
         var encodedSpan = MemoryMarshal.Cast<byte, long>(encodedBytes.AsSpan());
@@ -351,7 +359,7 @@ internal static class AlpArrayEncoder
         double fdec = F10F64[expF], idec = If10F64[expE];
         for (int i = 0; i < n; i++)
         {
-            if (hasNulls && !IsValidAt(validity, i))
+            if (hasNulls && !IsValidAt(validity, off + i))
             {
                 encodedSpan[i] = 0;
                 continue;

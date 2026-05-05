@@ -26,9 +26,9 @@ namespace EngineeredWood.Vortex.Writer.Encodings;
 /// exactly one page and the buffer layout simplifies to <c>[meta0, page0,
 /// meta1, page1, …]</c>.</para>
 ///
-/// <para>Scope: i16/u16/i32/u32/i64/u64/f32/f64. Non-sliced inputs only;
-/// nullable + non-nullable supported. Empty / all-null columns produce zero
-/// chunks (header + validity child only).</para>
+/// <para>Scope: i16/u16/i32/u32/i64/u64/f32/f64; nullable + non-nullable;
+/// sliced inputs honored. All-null columns are rejected by IsApplicable
+/// (would produce zero chunks).</para>
 ///
 /// <para>Opt-in via <c>VortexFileWriter(preferPco: true)</c>. When set, Pco
 /// supersedes the float/integer compressing chain (ALP / ALP-RD / RLE / FoR /
@@ -47,11 +47,11 @@ internal static class PcoArrayEncoder
     private const int ValuesPerChunk = 1 << 18;
 
     /// <summary>
-    /// True iff <paramref name="array"/> is a supported numeric type, has
-    /// <c>offset = 0</c>, has at least one valid (non-null) value, and is
-    /// long enough that pco's overhead (header + per-chunk meta) doesn't
-    /// dominate. Profitability isn't probed — caller is expected to opt-in
-    /// via <c>preferPco</c>.
+    /// True iff <paramref name="array"/> is a supported numeric type, has at
+    /// least one valid (non-null) value, and is long enough that pco's
+    /// overhead (header + per-chunk meta) doesn't dominate. Profitability
+    /// isn't probed — caller is expected to opt-in via <c>preferPco</c>.
+    /// Sliced inputs honored.
     /// </summary>
     public static bool IsApplicable(IArrowArray array)
     {
@@ -59,7 +59,6 @@ internal static class PcoArrayEncoder
                           or UInt16Array or UInt32Array or UInt64Array
                           or FloatArray or DoubleArray)) return false;
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0) return false;
         if (array.Length < 16) return false;
         // All-null columns produce zero pco chunks. Cheaper to fall through
         // to plain primitive (validity bitmap + zeroed data buffer) than
@@ -73,8 +72,6 @@ internal static class PcoArrayEncoder
     {
         if (array is null) throw new ArgumentNullException(nameof(array));
         var data = ((Apache.Arrow.Array)array).Data;
-        if (data.Offset != 0)
-            throw new NotSupportedException("vortex.pco writer doesn't yet support sliced inputs.");
 
         int rowCount = array.Length;
         int nullCount = (int)data.GetNullCount();
@@ -167,8 +164,9 @@ internal static class PcoArrayEncoder
     {
         var data = ((Apache.Arrow.Array)array).Data;
         int n = array.Length;
+        int off = data.Offset;
         int elemSize = Marshal.SizeOf<T>();
-        var raw = MemoryMarshal.Cast<byte, T>(data.Buffers[1].Span.Slice(0, n * elemSize));
+        var raw = MemoryMarshal.Cast<byte, T>(data.Buffers[1].Span.Slice(off * elemSize, n * elemSize));
 
         if (!hasNulls)
         {
@@ -181,7 +179,7 @@ internal static class PcoArrayEncoder
         var validity = data.Buffers[0].Span;
         int j = 0;
         for (int i = 0; i < n; i++)
-            if ((validity[i >> 3] & (1 << (i & 7))) != 0)
+            if ((validity[(off + i) >> 3] & (1 << ((off + i) & 7))) != 0)
                 dense[j++] = raw[i];
         return dense;
     }
