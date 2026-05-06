@@ -1,11 +1,12 @@
 # Architecture
 
 EngineeredWood is a .NET 10 monorepo for reading and writing columnar file
-formats — Apache Parquet, Apache ORC, Apache Avro — and table formats —
-Delta Lake and Apache Iceberg — as Apache Arrow `RecordBatch` objects.
-It is designed around cloud storage access patterns — batched range reads,
-concurrent column chunk I/O, and pooled buffer management — rather than
-the traditional single-cursor `Stream` abstraction.
+formats — Apache Parquet, Apache ORC, Apache Avro, Lance, and Vortex — and
+table formats — Lance dataset, Delta Lake, and Apache Iceberg — as Apache
+Arrow `RecordBatch` objects. It is designed around cloud storage access
+patterns — batched range reads, concurrent column chunk I/O, and pooled
+buffer management — rather than the traditional single-cursor `Stream`
+abstraction.
 
 This document describes the implementation. For usage and build instructions, see `README.md`.
 
@@ -73,6 +74,34 @@ src/
                                           DeletionMask, RecordBatchRowFilter
     Indices/                            B-tree + bitmap secondary index reads, IndexPruner
     Proto/                              table.proto, transaction.proto (verbatim)
+  EngineeredWood.Vortex/                Vortex file reader and writer
+    FlatBuffers/                        Hand-rolled FlatBuffer reader (FlatBufferTable /
+                                          Vector) + BackwardsFlatBufferBuilder (no flatc
+                                          / Google.FlatBuffers dependency)
+    Format/                             Postscript, Footer, DType, Layout, Array typed
+                                          ref-struct accessors over FlatBufferTable;
+                                          SegmentLocator (offset, length, alignment, codec)
+    Schema/                             VortexSchemaConverter (DType → Apache.Arrow.Schema,
+                                          including extension types vortex.timestamp /
+                                          vortex.date / vortex.time / vortex.uuid)
+    Layouts/                            VortexLayout tree, LayoutPlanner (per-Arrow-field
+                                          ColumnPlan with chunked / dict / zoned variants),
+                                          DictReconstructor, ZoneStatsLayout
+    Encodings/                          Read-side decoders (one file per array encoding)
+                                          and SerializedArray + ScalarValueProto helpers
+    Writer/                             VortexFileWriter (multi-batch streaming),
+                                          DTypeSerializer, LayoutSerializer,
+                                          PostscriptSerializer, FooterSerializer,
+                                          SegmentWriter
+    Writer/Encodings/                   Write-side encoders (one file per array encoding,
+                                          plus ArrayEncoderDispatch, ArrayStatsComputer,
+                                          ArrayNodeEmitter, EncoderHelpers,
+                                          ScalarValueSerializer, SegmentBuilder)
+    Predicate.cs                        Public predicate API for zone-stats pruning
+    Stat.cs / ZoneStats.cs              Per-zone stats enum + typed accessor surface
+    VortexFileReader.cs                 Open + Schema + ReadAllAsync (with column
+                                          projection, row-range slice, and predicate)
+    VortexFileFormat.cs                 Magic / EndOfFile constants
   EngineeredWood.DeltaLake/             Delta transaction log (low-level)
     Actions/                            AddFile, RemoveFile, MetadataAction, Protocol, etc.
     Log/                                NDJSON commit read/write, log compaction, in-commit timestamps
@@ -110,6 +139,13 @@ test/
                                               (Create / Append / Overwrite / Delete /
                                               Update / Compact / Vacuum / time travel)
   EngineeredWood.Lance.Benchmarks/          BenchmarkDotNet suites for Lance
+  EngineeredWood.Vortex.Tests/              xUnit tests for the Vortex reader and
+                                              writer; cross-validates against the
+                                              Rust vortex-array 0.70 implementation
+                                              via a Rust binary (test/.../Rust/)
+                                              that emits .vortex fixtures and a
+                                              vortex-validator that opens
+                                              .NET-written files. Also targets net472.
   EngineeredWood.DeltaLake.Tests/           xUnit tests for the Delta log layer
   EngineeredWood.DeltaLake.Table.Tests/     xUnit tests for the Delta table API
   EngineeredWood.DeltaLake.Benchmarks/      BenchmarkDotNet suites for Delta Lake
@@ -423,6 +459,274 @@ All 19 ORC types are supported for both reading and writing:
 
 ---
 
+## Vortex (`EngineeredWood.Vortex`)
+
+[Vortex](https://github.com/vortex-data/vortex) is a columnar file format
+with FlatBuffers-based metadata and a rich array-encoding zoo. The
+EngineeredWood implementation reads + writes Vortex 0.70-format files,
+cross-validated against the Rust `vortex-array` crate.
+
+### File container
+
+```
+[VTXF magic][segment_0][segment_1]...
+[DType FB][Layout FB][Statistics FB][Footer FB][Postscript FB]
+[EndOfFile struct][VTXF magic]
+```
+
+`EndOfFile` is `version:u16 | postscript_len:u16 | "VTXF"`. The
+postscript (≤ 65 528 bytes) holds offsets to the DType / Layout /
+Statistics / Footer FlatBuffers; the footer carries the file's
+**registries** — the strings that segments and array nodes reference by
+small integer index:
+
+- `array_specs` — encoding ids the file actually uses
+  (`vortex.primitive`, `fastlanes.bitpacked`, `vortex.fsst`, etc.).
+- `layout_specs` — layout ids (`vortex.flat`, `vortex.struct`,
+  `vortex.chunked`, `vortex.stats`, `vortex.dict`).
+- `segment_specs` — `(offset, length, alignment_exponent,
+  compression_codec)` per segment.
+
+Segment compression is wired through to Core's `CompressionCodec` —
+`None` is implemented; LZ4 / ZLib / ZStd are recognised in the
+locator but rejected at decode time pending fixtures that exercise
+them. Encryption is rejected outright.
+
+### FlatBuffers without codegen
+
+Rather than depend on `Google.FlatBuffers` + a `flatc` build step, the
+project hand-rolls FlatBuffer access:
+
+- **`FlatBuffers/FlatBufferTable.cs`** — `readonly ref struct` over
+  `ReadOnlySpan<byte>` that walks vtables and exposes typed slot reads
+  (scalars, sub-tables, vectors, strings, bytes).
+- **`FlatBuffers/FlatBufferVector.cs`** — typed vector accessor.
+- **`FlatBuffers/BackwardsFlatBufferBuilder.cs`** — high-to-low
+  offset-order writer used by the Writer's `DTypeSerializer`,
+  `LayoutSerializer`, `FooterSerializer`, and `PostscriptSerializer`.
+- **`Format/{Postscript, Footer, DType, Layout, Array}.cs`** — typed
+  ref-struct accessors over `FlatBufferTable`. Enum mappings for
+  `PType`, `DTypeKind`, `CompressionScheme`, `BufferCompression`,
+  `Precision`.
+
+### Schema (`Schema/VortexSchemaConverter`)
+
+Walks a Vortex `DType` tree and emits an `Apache.Arrow.Schema`. Covers
+all 11 `DTypeKind` variants. Extension types are dispatched by id:
+`vortex.timestamp` → `TimestampType(unit, tz)`, `vortex.date` →
+`Date32Type` / `Date64Type`, `vortex.time` → `Time32` / `Time64`,
+`vortex.uuid` → `FixedSizeBinaryType(16)`. Unknown extensions fall
+through to the storage dtype. Decimal precision > 38 widens to
+`Decimal256Type`. Non-Struct roots are rejected at open time — the
+public API is RecordBatch-shaped.
+
+### Layouts (`Layouts/`)
+
+- **`VortexLayout`** — managed tree node carrying encoding id (string,
+  resolved via the layout-spec registry), row count, metadata bytes,
+  children, and segment refs.
+- **`LayoutPlanner.PlanField`** — recursive walk over the layout tree
+  per Arrow field, producing a `ColumnPlan` (a sequence of per-chunk
+  `(SegmentRef, RowCount)`). Handles `vortex.struct` (descend by field
+  index), `vortex.stats` (descend to child[0]; capture per-zone stats
+  ref from child[1] when present), `vortex.chunked` (flatten children),
+  `vortex.dict` (return a `DictColumnPlan` with separate values + codes
+  references), `vortex.flat` (leaf with one segment ref).
+- **`DictReconstructor`** — materialises `output[i] = values[codes[i]]`
+  for the layout-level dict path; supports `StringType` + all integer
+  / float Arrow types and propagates validity from the codes child.
+- **`ZoneStatsLayout`** — reconstructs the zones-table struct dtype
+  from the stats bitset so `GetZoneStatsAsync` can decode it.
+
+The wire encoding id `vortex.stats` is also known upstream as
+`ZonedLayout` — for legacy reasons the serialized id stayed `vortex.stats`.
+
+### Read pipeline
+
+```
+VortexFileReader.OpenAsync()
+  ├─ Validate leading + trailing 'VTXF' magic
+  ├─ Parse EndOfFile (version, postscript_len, magic)
+  ├─ Parse Postscript → segment offsets for DType / Layout / Footer
+  ├─ Decompress + parse Footer (array_specs, layout_specs, segment_specs)
+  ├─ Decompress + parse DType → VortexSchemaConverter → Apache.Arrow.Schema
+  ├─ Decompress + parse Layout → VortexLayout tree
+  └─ LayoutPlanner.Plan → ColumnPlan[] with optional ZoneInfo per column
+
+VortexFileReader.ReadAllAsync(rowOffset, rowCount, columnIndices, predicate)
+  ├─ predicate.EvaluateZonesAsync(this, totalZones) → HashSet<int> acceptedZones
+  ├─ For each chunkIdx:
+  │    ├─ Skip if chunkIdx ∉ acceptedZones
+  │    ├─ Skip via row-range cursor if chunk wholly outside [rowOffset, rowOffset + rowCount)
+  │    ├─ For each requested column:
+  │    │    ├─ Fetch the chunk's segment(s) via IRandomAccessFile
+  │    │    ├─ Decompress (None today)
+  │    │    ├─ SerializedArray.Parse → Array FlatBuffer + raw buffer slices
+  │    │    └─ ArrayDecoder.Decode → IArrowArray
+  │    ├─ Assemble RecordBatch
+  │    └─ Slice via RecordBatch.Slice if at the row-range boundary
+  └─ yield batch
+```
+
+### Array decoders (`Encodings/`)
+
+Per-encoding decoder classes, dispatched by encoding string in
+`ArrayDecoder`. Coverage:
+
+| Group | Encodings |
+|---|---|
+| Primitive | `vortex.primitive` (nullable + non-nullable), `vortex.constant`, `vortex.sequence`, `vortex.null` |
+| Bool | `vortex.bool` (LSB-packed bitmap), `vortex.bytebool` |
+| String / Binary | `vortex.varbin`, `vortex.varbinview`, `vortex.fsst` (via `Clast.Fsst`) |
+| Compression | `vortex.runend`, `vortex.dict` (array-level), `vortex.sparse`, `vortex.masked` |
+| Float | `vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.pco` (via `Clast.Pcodec`) |
+| FastLanes | `fastlanes.bitpacked` (with patches), `fastlanes.for`, `fastlanes.rle` (floats); `fastlanes.delta` wired but skipped pending an upstream Clast.FastLanes lane-major helper |
+| Composite | `vortex.list`, `vortex.listview`, `vortex.fixed_size_list`, `vortex.struct`, `vortex.ext` |
+| Decimal | `vortex.decimal` (i8..i256 → Decimal128/256), `vortex.decimal_byte_parts` |
+| Temporal | `vortex.datetimeparts` (combined with `vortex.ext` → Timestamp) |
+
+Helpers: `SerializedArray` parses a `vortex.flat` segment's trailing
+`u32 fb_length LE` to find the Array FlatBuffer + buffer slices;
+`ScalarValueProto` is a minimal vortex-proto `ScalarValue` parser used
+by constant / sequence / sparse / FoR.
+
+### Write pipeline
+
+```
+VortexFileWriter(stream, schema, compress?, preferVarBinView?, preserveStats?,
+                 preferPco?, preferDateTimeParts?, preferDictLayout?)
+  ├─ Reserve VTXF magic at file head
+  ├─ DTypeSerializer.Emit → schema → DType FlatBuffer (held in memory)
+  └─ Each WriteBatch(batch):
+       ├─ Per column:
+       │    ├─ ArrayEncoderDispatch.Emit (per encoding, recursive)
+       │    │    │  Order: constant > dict > FSST > ALP > ALP-RD >
+       │    │    │  RLE > sparse > runend > delta > FoR > bitpacked >
+       │    │    │  raw primitive (or varbin / varbinview / list / FSL /
+       │    │    │  struct / decimal / datetimeparts / ext)
+       │    │    ├─ Pco supersedes ALP/ALP-RD/RLE/FoR/bitpacked when
+       │    │    │  preferPco is set
+       │    │    ├─ Compressing encoders gate on profitability
+       │    │    │  (e.g. `(encoded × 1.5) < raw`)
+       │    │    └─ Recurse into composite children through dispatch
+       │    ├─ ArrayStatsComputer (if preserveStats) collects per-batch
+       │    │  Min/Max/NullCount/NaNCount/IsConstant/IsSorted/Sum/
+       │    │  UncompressedSizeInBytes per column type
+       │    └─ Emit segment(s) via SegmentWriter
+       └─ Track per-column segment indices
+
+  Close():
+    ├─ FinalizeDictLayoutColumns (if preferDictLayout): emit one shared
+    │  values segment + per-batch codes segments per dict-eligible column
+    ├─ LayoutSerializer builds the root layout per-shape:
+    │    SerializeStructFlat                         single-batch
+    │    SerializeStructChunked                      multi-batch
+    │    SerializeStructStatsChunked                 + zoned stats
+    │    SerializeStructDictMixed                    + dict layout
+    │    SerializeStructDictMixedStats               + dict + zoned stats
+    ├─ FooterSerializer emits array_specs / layout_specs / segment_specs
+    ├─ PostscriptSerializer emits offsets to DType / Layout / Footer
+    └─ Write EndOfFile struct + trailing VTXF magic
+```
+
+### Array encoders (`Writer/Encodings/`)
+
+One file per encoding, plus shared infrastructure:
+
+- **`ArrayEncoderDispatch`** — chooses an encoding per column based on
+  the column's Arrow type, `compress` / `prefer*` flags, and per-encoder
+  `IsApplicable` profitability gates.
+- **`ArrayNodeEmitter`** — vtable shapes for the common Array FlatBuffer
+  layouts (single-buffer, metadata + buffer + children, with-stats,
+  multi-buffer).
+- **`ArrayStatsComputer`** — collects per-batch stats for the
+  `preserveStats` zones table.
+- **`EncoderHelpers`** — shared validity-bitmap rebasing for sliced
+  inputs (`ExtractValidityBitmap(srcBitOffset, rowCount)`).
+- **`ScalarValueSerializer`** — vortex-proto `ScalarValue` writer
+  (mirror of `ScalarValueProto` on the read side).
+- **`SegmentBuilder` / `SegmentWriter`** — collect Array FlatBuffer +
+  raw buffer slices, write them to the underlying `Stream`, and append
+  to the segment-specs registry with the correct alignment exponent.
+
+Compressing encoders honor `data.Offset != 0` so sliced Arrow inputs
+round-trip without a copy. Nullable inputs are supported on every
+encoder that encounters them in practice; `IsApplicable` rejects
+all-null columns where the encoding would degenerate.
+
+### Predicate API + zone pruning
+
+`EngineeredWood.Vortex.Predicate` is a small standalone hierarchy
+(separate from `EngineeredWood.Expressions` because Vortex's zone-stats
+shape needs typed access at decode time):
+
+- Comparisons: `Greater<T>`, `GreaterOrEqual<T>`, `Less<T>`,
+  `LessOrEqual<T>`, `Equal<T>`, `NotEqual<T>` for `T` constrained to
+  numeric structs (i8..i64, u8..u64, f32, f64), plus typed overloads
+  for `string`, `byte[]`, `bool`, `DateTime`, `DateTimeOffset`,
+  `TimeSpan`.
+- Nullability: `IsNull`, `IsNotNull`.
+- Composition: `And(params Predicate[])`, `Or(params Predicate[])`.
+
+Evaluation lives in `Predicate.EvaluateZonesAsync(reader, totalZones)`,
+which calls `reader.GetZoneStatsAsync(columnIdx)` per referenced
+column, applies conservative per-op pruning rules (drop only when
+stats prove the predicate can't match), and folds the per-predicate
+`HashSet<int>` of accepted zones through `And` (intersect) and `Or`
+(union). For temporal predicates the captured .NET ticks are converted
+to the column's unit at evaluation time so a single `DateTime` value
+prunes uniformly against either Date32 (days) or Date64 (ms).
+
+`ReadAllAsync(Predicate, ...)` is a thin wrapper that calls
+`EvaluateZonesAsync` then dispatches to `ReadAllAsync(ISet<int>
+acceptedZones, ...)`.
+
+### Cross-validation
+
+Test fixtures are built by a Rust crate at
+`test/EngineeredWood.Vortex.Tests/Rust/` that uses `vortex-array` /
+`vortex-file` 0.70 from crates.io. A second Rust binary (also under
+`Rust/`) acts as a `vortex-validator` — it opens .NET-written files and
+emits the row-by-row contents in JSON. The C# `VortexCrossValidationTests`
+shells out to that validator to verify writer output.
+
+Observed Vortex compressor heuristics (used to pick fixtures that hit
+each decoder):
+
+| Input shape | Encoding picked |
+|---|---|
+| Monotonic ints `[1,2,3]` | `vortex.sequence` |
+| Random wide-range ints | `vortex.primitive` |
+| All-equal | `vortex.constant` |
+| Nullable ints | `vortex.primitive` + `vortex.bool` validity child |
+| Strings (default) | `vortex.fsst` |
+| Strings (no-compress) | `vortex.varbinview` |
+| Low-cardinality strings, 64+ rows | `vortex.dict` LAYOUT |
+| Long-run integers | `vortex.runend` |
+| Mode-dominant integers | `vortex.sparse` |
+| Decimal-shaped floats, ≥ 1024 rows | `vortex.alp` |
+| Irrational floats, ≥ 1024 rows | `vortex.alprd` |
+| Small-range integers, ≥ 1024 rows | `fastlanes.bitpacked` |
+
+### Multi-targeting
+
+The library compiles clean for `netstandard2.0`, `net8.0`, and `net10.0`
+with no source changes — every encoder / decoder, the FlatBuffer
+reader/writer, the predicate API, and the row-range slicer are
+binary-compatible with .NET Framework 4.7.2. The test suite also runs
+on `net472`; only the two HalfFloat-focused tests are gated behind
+`#if NET6_0_OR_GREATER` because `System.Half` /
+`Apache.Arrow.HalfFloatArray` require .NET 6+.
+
+### Dependencies (above Apache.Arrow + Core)
+
+- **`Clast.FastLanes`** — bit-packing / FoR / delta / RLE primitives
+  (same dependency Lance uses).
+- **`Clast.Fsst`** — FSST symbol-table compression / decompression.
+- **`Clast.Pcodec`** — Pco wrapped encoder / decoder.
+
+---
+
 ## Expressions (`EngineeredWood.Expressions`, `EngineeredWood.Expressions.Arrow`)
 
 A format-agnostic expression library used by Parquet, Delta Lake, and Iceberg for predicate pushdown, plus a separate Arrow-based row evaluator. See [`doc/predicate-pushdown-design.md`](doc/predicate-pushdown-design.md) for the full architecture and remaining phases.
@@ -587,6 +891,7 @@ Pattern match ordering matters: `Decimal32/64/128/256Type` all inherit from `Fix
 - **Parquet:** `TestData.cs` locates the `parquet-testing/data/` submodule by walking up from `AppContext.BaseDirectory`. Sweep tests iterate all sample files, skip encrypted/malformed, collect failures, assert none. The `EngineeredWood.Parquet.Compatibility` project downloads 92 files from fastparquet, parquet-dotnet, parquet-tools, and HuggingFace and validates all row groups. Decoder/encoder tests use both unit-level checks and round-trip verification against ParquetSharp.
 - **ORC:** Test data files (.orc) are included directly in the test project. `CrossValidationTests` validates round-trip correctness against PyArrow's ORC implementation when available.
 - **Avro:** Test data generated by a Python script (`generate_test_data.py`) using fastavro. Cross-validation tests verify both directions: fastavro writes → EngineeredWood reads, and EngineeredWood writes → fastavro reads. Coverage includes all types (primitives, nullable, enum, array, map, fixed, struct, decimal, uuid), all codecs (null, deflate, snappy, zstandard, lz4), schema evolution, projection, and dense unions.
+- **Vortex:** Test fixtures (`*.vortex`) are produced by a Rust crate at `test/EngineeredWood.Vortex.Tests/Rust/` that depends on `vortex-array` / `vortex-file` 0.70 from crates.io. A second Rust binary in the same crate (`vortex-validator`) opens .NET-written files and dumps the row-by-row contents in JSON; `VortexCrossValidationTests` shells out to it. Each Vortex array encoding has at least one fixture chosen to force vortex's Rust compressor to pick it (often via `with_strategy(...)` overrides when the default heuristics would pick something else). The test project targets `net8.0`, `net10.0`, and `net472`; only the two HalfFloat tests are gated to net6+.
 - **Delta Lake:** Two suites. `EngineeredWood.DeltaLake.Tests` covers the log layer (action serialization, snapshot reconstruction, checkpoints, deletion vectors, in-commit timestamps, etc.). `EngineeredWood.DeltaLake.Table.Tests` covers the table API end-to-end with temp-directory tables, including write/read round-trips, partitioning, Iceberg compatibility, identity columns, row tracking, change data feed, deletion vectors, and predicate pushdown.
 - **Iceberg:** `EngineeredWood.Iceberg.Tests` covers schema/partition/snapshot updates, V3 features (geometry, variant, default values, row IDs), catalog operations, manifest serialization, and `TableScan` with predicate pruning.
 - **Expressions:** `EngineeredWood.Expressions.Tests` covers `LiteralValue` (cross-type comparison, high-precision decimal, hashing), expression factories (constant folding, flattening), the binder (identity preservation, lenient mode), and the statistics evaluator (every predicate variant with synthetic stats including truncation edge cases). `EngineeredWood.Expressions.Arrow.Tests` covers the row evaluator with full SQL three-valued logic.

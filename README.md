@@ -1,11 +1,11 @@
 # EngineeredWood
 
-A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, and **Lance** — and table formats — **Lance dataset**, **Delta Lake**, and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
+A .NET library for reading and writing columnar file formats — **Apache Parquet**, **Apache ORC**, **Apache Avro**, **Lance**, and **Vortex** — and table formats — **Lance dataset**, **Delta Lake**, and **Apache Iceberg** — as Apache Arrow `RecordBatch` objects.
 
 ## Highlights
 
-- **Four formats, one Arrow surface.** Parquet, ORC, Avro, and Lance readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
-- **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, and predicate-based delete/update on Lance datasets from the same tree.
+- **Five formats, one Arrow surface.** Parquet, ORC, Avro, Lance, and Vortex readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
+- **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, and predicate-based delete/update on Lance datasets from the same tree. Vortex ships its own zone-stats predicate API for the same purpose.
 - **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 metadata with manifest read/write and partition-transform-aware scan planning.
 - **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files or Azure Blob Storage.
 - **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
@@ -31,6 +31,7 @@ src/
   EngineeredWood.Avro/                   Avro reader and writer
   EngineeredWood.Lance/                  Lance file reader and writer (v2.0 + v2.1 + v2.2)
   EngineeredWood.Lance.Table/            Lance dataset / table API (manifests, fragments, time travel)
+  EngineeredWood.Vortex/                 Vortex file reader and writer
   EngineeredWood.DeltaLake/              Delta Lake transaction log (low-level)
   EngineeredWood.DeltaLake.Table/        Delta Lake table API (high-level Arrow I/O)
   EngineeredWood.Iceberg/                Apache Iceberg metadata + scan planning
@@ -324,6 +325,121 @@ doesn't yet emit, Arrow types not yet covered, dataset-level features
 like fragment-level concurrency control and multi-fragment compaction
 targets).
 
+## Features — Vortex
+
+[Vortex](https://github.com/vortex-data/vortex) is a columnar file format
+with FlatBuffers-based metadata and a rich encoding zoo (ALP, FSST,
+FastLanes bit-packing / FoR / delta / RLE, Pco, sparse, run-end, dict,
+etc.). `EngineeredWood.Vortex` ships a reader, a writer, and a
+predicate-based zone-pruning API — all driven by hand-rolled
+FlatBuffers/protobuf parsing (no `Google.FlatBuffers` or `flatc`
+dependency) and cross-validated against the Rust `vortex-array` 0.70
+implementation.
+
+### Reading
+
+- `VortexFileReader.OpenAsync(string)` / `OpenAsync(IRandomAccessFile)`
+  validates the leading + trailing `'VTXF'` magic, parses the
+  postscript / footer / DType / Layout FlatBuffer segments, and exposes
+  `Schema` (`Apache.Arrow.Schema`) and `NumberOfRows`.
+- `ReadAllAsync()` streams the file as `IAsyncEnumerable<RecordBatch>`,
+  one batch per chunk for chunked layouts.
+- **Column projection**: `ReadAllAsync(IReadOnlyList<int> columnIndices)`
+  decodes only the requested columns. `ReadColumnAsync(int fieldIndex)`
+  returns a single column as one Arrow array (concatenated across chunks).
+- **Row-range slice**: `ReadAllAsync(long rowOffset, long rowCount, ...)`
+  drops chunks fully outside the range with zero I/O; boundary chunks are
+  decoded fully and sliced via `RecordBatch.Slice`.
+- **Predicate-based zone pruning**: `ReadAllAsync(Predicate, ...)` skips
+  zones whose stored stats prove the predicate can't match. Predicates
+  cover numeric (`i8..i64`, `u8..u64`, `f32`, `f64`) + string + binary +
+  bool + temporal (`Date32/64`, `Timestamp`, `Time32/64`) comparisons,
+  `IsNull` / `IsNotNull`, and `And` / `Or` composition.
+- `GetZoneStatsAsync(int fieldIndex)` exposes the per-zone stats table
+  (Min, Max, Sum, NullCount, NaNCount, IsConstant, IsSorted,
+  IsStrictSorted, UncompressedSizeInBytes, MinIsTruncated,
+  MaxIsTruncated) as typed Arrow arrays.
+
+### Writing
+
+- `VortexFileWriter(Stream, Apache.Arrow.Schema, ...)` writes one or
+  more `RecordBatch`es. Single-batch files use a
+  `vortex.struct(vortex.flat × N)` layout; multi-batch files use
+  `vortex.struct(vortex.chunked(vortex.flat × M) × N)`.
+- Opt-in flags: `compress` (turn on the compressing-encoding chain),
+  `preferVarBinView` (use `vortex.varbinview` instead of `vortex.varbin`
+  for strings that fall through compression), `preferPco` (route eligible
+  numeric columns through `vortex.pco`), `preferDateTimeParts` (split
+  `TimestampArray` into days/seconds/subseconds), `preferDictLayout`
+  (share one global string dict across all batches via a
+  `vortex.dict` layout instead of per-batch array-level dicts), and
+  `preserveStats` (wrap each column in a `vortex.stats` layout that
+  carries per-zone Min/Max/NullCount/etc., enabling reader-side zone
+  pruning).
+- `preferDictLayout && preserveStats` emits
+  `vortex.stats(vortex.dict(...), zones-flat)` so predicate pruning
+  works against dict-layout files too.
+
+### Type coverage
+
+| Arrow type | Read | Write |
+|---|---|---|
+| Int8/16/32/64, UInt8/16/32/64, Float, Double | yes | yes |
+| HalfFloat (Float16) | yes (net6+) | yes |
+| Bool | yes | yes |
+| String, Binary | yes | yes |
+| FixedSizeBinary | yes | yes (via `vortex.uuid` for size 16) |
+| Decimal128, Decimal256 | yes | yes |
+| Date32, Date64, Time32, Time64, Timestamp | yes | yes |
+| FixedSizeList | yes | yes |
+| List | yes | yes (i32 offsets; LargeList deferred) |
+| Struct (recursive, including nested struct/list/FSL) | yes | yes |
+| Map, LargeString, LargeBinary, Union | not yet | not yet |
+
+### Encoding coverage
+
+**Layouts**: `vortex.flat`, `vortex.struct`, `vortex.chunked`,
+`vortex.stats` (zoned), `vortex.dict` (layout-level, shared dict).
+
+**Array encodings — read**: `vortex.primitive` (nullable + non-nullable),
+`vortex.constant`, `vortex.sequence`, `vortex.bool`, `vortex.bytebool`,
+`vortex.null`, `vortex.varbin`, `vortex.varbinview`, `vortex.fsst`,
+`vortex.runend`, `vortex.dict`, `vortex.sparse`, `vortex.masked`,
+`vortex.list`, `vortex.listview`, `vortex.fixed_size_list`,
+`vortex.struct`, `vortex.decimal`, `vortex.decimal_byte_parts`,
+`vortex.alp`, `vortex.alprd` (f32 + f64), `vortex.datetimeparts`,
+`vortex.ext` (with extension types `vortex.timestamp` / `vortex.date` /
+`vortex.time` / `vortex.uuid`), `fastlanes.bitpacked` (with patches),
+`fastlanes.for`, `fastlanes.rle`, `vortex.pco`. `fastlanes.delta`
+decoder is wired but the test is skipped pending an upstream API in
+`Clast.FastLanes` to handle vortex's lane-major byte transposition.
+
+**Array encodings — write**: `vortex.primitive`, `vortex.bool`,
+`vortex.varbin`, `vortex.varbinview`, `vortex.constant`,
+`vortex.dict` (string), `vortex.fsst` (string + binary, nullable),
+`vortex.runend` (nullable), `vortex.sparse` (nullable),
+`vortex.alp` (f32 + f64), `vortex.alprd` (f32 + f64, nullable),
+`vortex.list`, `vortex.fixed_size_list`, `vortex.struct`,
+`vortex.decimal`, `vortex.datetimeparts`, `vortex.ext` (Date / Time /
+Timestamp / UUID), `fastlanes.bitpacked` (with best-bit-width selection
+and patches), `fastlanes.for`, `fastlanes.delta`, `fastlanes.rle`
+(floats, nullable), `vortex.pco`. Compressing encoders honor
+`data.Offset != 0` (sliced inputs).
+
+### Storage and compression
+
+- Uses the existing offset-based `IRandomAccessFile`. Per-segment
+  compression — `None` is implemented today; `LZ4`/`ZLib`/`ZStd` are
+  recognised in the segment locator but rejected at decode time pending
+  fixtures that exercise them. Encryption is rejected outright.
+
+### Multi-targeting
+
+- The library compiles clean for `netstandard2.0`, `net8.0`, and
+  `net10.0`. The test suite also runs on `net472`; only the two
+  HalfFloat-focused tests are gated behind `#if NET6_0_OR_GREATER`
+  because `System.Half` / `Apache.Arrow.HalfFloatArray` require .NET 6+.
+
 ## Features — Delta Lake
 
 EngineeredWood ships two layers: a low-level transaction log API
@@ -600,6 +716,44 @@ await using var asOf   = await LanceTable.OpenAsync(
 
 await foreach (var batch in latest.ReadAsync(
     columns: ["x"], filter: Ex.GreaterThan("x", LiteralValue.Of(0))))
+{
+    // ...
+}
+```
+
+### Vortex — Reading and writing
+
+```csharp
+using EngineeredWood.Vortex;
+using EngineeredWood.Vortex.Writer;
+
+// Write a Vortex file with the compressing chain enabled and per-zone stats.
+using (var stream = File.Create("data.vortex"))
+using (var writer = new VortexFileWriter(
+    stream, recordBatch.Schema, compress: true, preserveStats: true))
+{
+    writer.WriteBatch(recordBatch);
+    writer.WriteBatch(recordBatch2);
+    writer.Close();
+}
+
+// Read it back, projecting two columns and pruning by predicate.
+await using var reader = await VortexFileReader.OpenAsync("data.vortex");
+
+await foreach (var batch in reader.ReadAllAsync(
+    columnIndices: new[] { 0, 2 },
+    predicate: Predicate.And(
+        Predicate.GreaterOrEqual(0, 100L),
+        Predicate.Equal(2, "us"))))
+{
+    // batch is an Apache.Arrow.RecordBatch
+}
+
+// Or read a single column as one Arrow array.
+var idColumn = await reader.ReadColumnAsync(0);
+
+// Or take a row-range slice (zero I/O for chunks fully outside the range).
+await foreach (var batch in reader.ReadAllAsync(rowOffset: 1_000, rowCount: 500))
 {
     // ...
 }
