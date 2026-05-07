@@ -198,7 +198,13 @@ internal sealed class RecordBatchEncoder
                 EncodeDecimalBytes(writer, array, row);
                 break;
             case "uuid":
-                writer.WriteString(((StringArray)array).GetString(row)!);
+                // Either StringArray (default mapping) or GuidArray (when the
+                // caller opted in via WithExtensionRegistry). Both round-trip
+                // as 36-char strings on the wire.
+                if (array is GuidArray ga)
+                    writer.WriteString(ga.GetGuid(row)!.Value.ToString("D"));
+                else
+                    writer.WriteString(((StringArray)array).GetString(row)!);
                 break;
             default:
                 // Unknown logical type: fall through to base encoding

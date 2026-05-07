@@ -14,12 +14,12 @@ internal static class ArrowSchemaConverter
     private const int MaxSchemaDepth = 64;
 
     /// <summary>Converts an Avro record schema to an Arrow Schema.</summary>
-    public static Apache.Arrow.Schema ToArrow(AvroRecordSchema record)
+    public static Apache.Arrow.Schema ToArrow(AvroRecordSchema record, ExtensionTypeRegistry? extensionRegistry = null)
     {
         var builder = new Apache.Arrow.Schema.Builder();
         foreach (var field in record.Fields)
         {
-            var (arrowType, nullable) = ToArrowType(field.Schema, 0);
+            var (arrowType, nullable) = ToArrowType(field.Schema, 0, extensionRegistry);
             builder.Field(new Field(field.Name, arrowType, nullable));
         }
         return builder.Build();
@@ -29,7 +29,7 @@ internal static class ArrowSchemaConverter
     /// Converts an Avro schema node to an Arrow type.
     /// Returns the type and whether it is nullable.
     /// </summary>
-    public static (IArrowType type, bool nullable) ToArrowType(AvroSchemaNode node, int depth = 0)
+    public static (IArrowType type, bool nullable) ToArrowType(AvroSchemaNode node, int depth = 0, ExtensionTypeRegistry? extensionRegistry = null)
     {
         if (depth >= MaxSchemaDepth)
             throw new NotSupportedException(
@@ -38,13 +38,13 @@ internal static class ArrowSchemaConverter
         switch (node)
         {
             case AvroPrimitiveSchema p:
-                return (ToArrowPrimitive(p), false);
+                return (ToArrowPrimitive(p, extensionRegistry), false);
 
             case AvroRecordSchema r:
                 var fields = new List<Field>();
                 foreach (var f in r.Fields)
                 {
-                    var (ft, fn) = ToArrowType(f.Schema, depth + 1);
+                    var (ft, fn) = ToArrowType(f.Schema, depth + 1, extensionRegistry);
                     fields.Add(new Field(f.Name, ft, fn));
                 }
                 return (new StructType(fields), false);
@@ -54,11 +54,11 @@ internal static class ArrowSchemaConverter
                 return (new DictionaryType(Int32Type.Default, StringType.Default, false), false);
 
             case AvroArraySchema a:
-                var (itemType, itemNullable) = ToArrowType(a.Items, depth + 1);
+                var (itemType, itemNullable) = ToArrowType(a.Items, depth + 1, extensionRegistry);
                 return (new ListType(new Field("item", itemType, itemNullable)), false);
 
             case AvroMapSchema m:
-                var (valType, valNullable) = ToArrowType(m.Values, depth + 1);
+                var (valType, valNullable) = ToArrowType(m.Values, depth + 1, extensionRegistry);
                 return (new MapType(
                     new Field("key", StringType.Default, false),
                     new Field("value", valType, valNullable)), false);
@@ -73,7 +73,7 @@ internal static class ArrowSchemaConverter
             case AvroUnionSchema u:
                 if (u.IsNullable(out var inner, out _))
                 {
-                    var (innerType, _) = ToArrowType(inner, depth + 1);
+                    var (innerType, _) = ToArrowType(inner, depth + 1, extensionRegistry);
                     return (innerType, true);
                 }
                 // General union → DenseUnion
@@ -81,7 +81,7 @@ internal static class ArrowSchemaConverter
                 var typeIds = new int[u.Branches.Count];
                 for (int i = 0; i < u.Branches.Count; i++)
                 {
-                    var (bt, bn) = ToArrowType(u.Branches[i], depth + 1);
+                    var (bt, bn) = ToArrowType(u.Branches[i], depth + 1, extensionRegistry);
                     unionFields.Add(new Field($"branch{i}", bt, bn));
                     typeIds[i] = i;
                 }
@@ -92,7 +92,7 @@ internal static class ArrowSchemaConverter
         }
     }
 
-    private static IArrowType ToArrowPrimitive(AvroPrimitiveSchema p)
+    private static IArrowType ToArrowPrimitive(AvroPrimitiveSchema p, ExtensionTypeRegistry? extensionRegistry = null)
     {
         // Check logical type first
         if (p.LogicalType != null)
@@ -110,12 +110,30 @@ internal static class ArrowSchemaConverter
                 "local-timestamp-micros" => new TimestampType(TimeUnit.Microsecond, (string?)null),
                 "local-timestamp-nanos" => new TimestampType(TimeUnit.Nanosecond, (string?)null),
                 "decimal" => new Decimal128Type(p.Precision ?? 38, p.Scale ?? 0),
-                "uuid" => StringType.Default, // UUID is a string logical type per Avro spec
+                "uuid" => MakeUuidArrowType(extensionRegistry),
                 _ => ToArrowBasePrimitive(p.Type), // Unknown logical type: fall through to base
             };
         }
 
         return ToArrowBasePrimitive(p.Type);
+    }
+
+    /// <summary>
+    /// Decodes the Avro <c>uuid</c> logical type to an Arrow type. When the
+    /// caller has registered an <c>arrow.uuid</c> extension via the supplied
+    /// <see cref="ExtensionTypeRegistry"/>, returns that extension type
+    /// (typically <c>GuidType</c>); otherwise returns <see cref="StringType"/>
+    /// per the historical Avro mapping.
+    /// </summary>
+    private static IArrowType MakeUuidArrowType(ExtensionTypeRegistry? registry)
+    {
+        if (registry is { } reg
+            && reg.TryGetDefinition("arrow.uuid", out var definition)
+            && definition.TryCreateType(new FixedSizeBinaryType(16), metadata: string.Empty, out var extType))
+        {
+            return extType;
+        }
+        return StringType.Default;
     }
 
     private static IArrowType ToArrowBasePrimitive(AvroType type) => type switch
@@ -182,6 +200,12 @@ internal static class ArrowSchemaConverter
             { LogicalType = "decimal", Precision = dec.Precision, Scale = dec.Scale },
         FixedSizeBinaryType fb => new AvroFixedSchema("fixed", null, fb.ByteWidth),
         DictionaryType dt => new AvroEnumSchema("Enum", null, []),
+        // GuidType -> string + uuid logical type (Avro stores UUIDs as 36-char
+        // strings per spec). Fall back to the storage type for any other
+        // extension we don't have a specialised mapping for.
+        ExtensionType ext when ext.Name == "arrow.uuid"
+            => new AvroPrimitiveSchema(AvroType.String) { LogicalType = "uuid" },
+        ExtensionType ext => FromArrowType(ext.StorageType),
         StructType st => FromArrowStruct(st),
         ListType lt => new AvroArraySchema(FromArrowField(lt.ValueField)),
         MapType mt => new AvroMapSchema(FromArrowField(mt.ValueField)),

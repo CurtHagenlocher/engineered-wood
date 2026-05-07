@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using Apache.Arrow;
 using EngineeredWood.Avro.Container;
 using EngineeredWood.Avro.Schema;
 
@@ -19,6 +20,7 @@ public sealed class AvroReaderBuilder
     private int[]? _projection;
     private string[]? _projectionNames;
     private string[]? _skipFields;
+    private ExtensionTypeRegistry? _extensionRegistry;
 
     /// <summary>Maximum rows per RecordBatch (default: 1024).</summary>
     public AvroReaderBuilder WithBatchSize(int batchSize)
@@ -95,12 +97,25 @@ public sealed class AvroReaderBuilder
         return this;
     }
 
+    /// <summary>
+    /// Registers Arrow extension types for the reader. When supplied and the
+    /// registry contains <c>arrow.uuid</c>, Avro <c>uuid</c> logical-type
+    /// columns materialise as <see cref="GuidArray"/> rather than the default
+    /// <see cref="StringArray"/>. The registered extension's storage type
+    /// must be <c>FixedSizeBinaryType(16)</c>.
+    /// </summary>
+    public AvroReaderBuilder WithExtensionRegistry(ExtensionTypeRegistry registry)
+    {
+        _extensionRegistry = registry ?? throw new ArgumentNullException(nameof(registry));
+        return this;
+    }
+
     /// <summary>Build a synchronous OCF reader.</summary>
     public AvroReader Build(Stream input)
     {
         var ocf = OcfReader.Open(input);
         var effectiveReaderSchema = ResolveReaderSchema(ocf.WriterSchema);
-        return new AvroReader(ocf, _batchSize, effectiveReaderSchema);
+        return new AvroReader(ocf, _batchSize, effectiveReaderSchema, _extensionRegistry);
     }
 
     /// <summary>Build an asynchronous OCF reader.</summary>
@@ -108,7 +123,7 @@ public sealed class AvroReaderBuilder
     {
         var ocf = await OcfReaderAsync.OpenAsync(input, ct).ConfigureAwait(false);
         var effectiveReaderSchema = ResolveReaderSchema(ocf.WriterSchema);
-        return new AvroAsyncReader(ocf, _batchSize, effectiveReaderSchema);
+        return new AvroAsyncReader(ocf, _batchSize, effectiveReaderSchema, _extensionRegistry);
     }
 
     /// <summary>

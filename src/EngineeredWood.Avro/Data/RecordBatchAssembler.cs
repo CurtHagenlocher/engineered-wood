@@ -306,7 +306,12 @@ internal sealed class RecordBatchAssembler
                 "timestamp-micros" or "local-timestamp-micros" => new TimestampBuilder(),
                 "timestamp-nanos" or "local-timestamp-nanos" => new TimestampBuilder(),
                 "decimal" => new DecimalBytesBuilder(p.Precision ?? 38, p.Scale ?? 0),
-                "uuid" => new StringBuilder(), // UUID is a string logical type
+                // The schema converter chose GuidType (extension) when the
+                // caller registered arrow.uuid; otherwise StringType. Mirror
+                // that choice here so the wire format stays a 36-char string
+                // either way.
+                "uuid" when type is ExtensionType => new GuidBuilder(),
+                "uuid" => new StringBuilder(),
                 _ => CreateBuilderForBaseType(type, avroSchema, depth),
             };
         }
@@ -570,6 +575,23 @@ internal sealed class StringBuilder : IColumnBuilder
     public void AppendNull() => _builder.AppendNull();
     public void AppendDefault(string value) => _builder.Append(value);
     public IArrowArray Build(Field field) => _builder.Build();
+    public void Reset() => _builder = new();
+}
+
+/// <summary>
+/// Builds a <see cref="Apache.Arrow.GuidArray"/> from Avro <c>uuid</c>
+/// logical-type strings (36-char canonical form per the Avro spec).
+/// Selected by <see cref="RecordBatchAssembler.CreateBuilderForType"/> when
+/// the target Arrow type is an <c>arrow.uuid</c> extension; falls back to
+/// <see cref="StringBuilder"/> when no registry is supplied.
+/// </summary>
+internal sealed class GuidBuilder : IColumnBuilder
+{
+    private Apache.Arrow.GuidArray.Builder _builder = new();
+    public void Append(ref AvroBinaryReader reader) => _builder.Append(Guid.Parse(reader.ReadString()));
+    public void AppendNull() => _builder.AppendNull();
+    public void AppendDefault(string value) => _builder.Append(Guid.Parse(value));
+    public IArrowArray Build(Field field) => _builder.Build(allocator: null);
     public void Reset() => _builder = new();
 }
 

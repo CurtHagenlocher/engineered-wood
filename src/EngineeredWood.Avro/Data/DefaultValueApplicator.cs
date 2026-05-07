@@ -122,6 +122,11 @@ internal static class DefaultValueApplicator
                     sb.AppendDefault(defaultValue.GetString()!);
                     return true;
                 }
+                if (builder is Data.GuidBuilder gb)
+                {
+                    gb.AppendDefault(defaultValue.GetString()!);
+                    return true;
+                }
                 break;
         }
 

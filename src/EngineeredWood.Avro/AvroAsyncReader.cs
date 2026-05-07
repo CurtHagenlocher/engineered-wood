@@ -34,7 +34,8 @@ public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDispo
     /// <summary>Arbitrary metadata from the OCF header.</summary>
     public IReadOnlyDictionary<string, byte[]> Metadata => _ocf.Metadata;
 
-    internal AvroAsyncReader(OcfReaderAsync ocf, int batchSize, AvroSchema? readerSchema = null)
+    internal AvroAsyncReader(OcfReaderAsync ocf, int batchSize, AvroSchema? readerSchema = null,
+        ExtensionTypeRegistry? extensionRegistry = null)
     {
         _ocf = ocf;
         _batchSize = batchSize;
@@ -53,7 +54,7 @@ public sealed class AvroAsyncReader : IAsyncEnumerable<RecordBatch>, IAsyncDispo
         }
         else
         {
-            Schema = ArrowSchemaConverter.ToArrow(writerRecord);
+            Schema = ArrowSchemaConverter.ToArrow(writerRecord, extensionRegistry);
             _assembler = new RecordBatchAssembler(writerRecord, Schema);
         }
     }
