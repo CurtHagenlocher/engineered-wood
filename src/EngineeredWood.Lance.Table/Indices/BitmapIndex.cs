@@ -178,5 +178,5 @@ public sealed class BitmapIndex : IAsyncDisposable
     private static string JoinPath(string a, string b) =>
         a == "." || a == string.Empty
             ? b
-            : a.EndsWith('/') ? a + b : a + "/" + b;
+            : a.EndsWith("/", StringComparison.Ordinal) ? a + b : a + "/" + b;
 }

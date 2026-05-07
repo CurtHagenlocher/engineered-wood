@@ -52,7 +52,7 @@ internal static class IndexCatalog
                 continue;
             int dash = fileName.IndexOf('-');
             if (dash <= 0) continue;
-            if (!ulong.TryParse(fileName.AsSpan(0, dash), out ulong readVersion))
+            if (!ulong.TryParse(fileName.Substring(0, dash), out ulong readVersion))
                 continue;
             txnEntries.Add((readVersion, info.Path));
         }

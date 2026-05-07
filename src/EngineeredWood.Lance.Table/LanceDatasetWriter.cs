@@ -226,7 +226,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// </summary>
     public async Task NewFragmentAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_disposed) throw new ObjectDisposedException(nameof(LanceDatasetWriter));
         if (_finished)
             throw new InvalidOperationException(
                 "Dataset writer has already been finalised; cannot start a new fragment.");
@@ -254,7 +254,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
     /// </summary>
     public async Task FinishAsync(CancellationToken cancellationToken = default)
     {
-        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_disposed) throw new ObjectDisposedException(nameof(LanceDatasetWriter));
         if (_finished) return;
 
         if (_currentFileWriter.TotalRows > 0)
@@ -293,7 +293,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             Uuid = txnUuid,
         };
         byte[] transactionBytes = transaction.ToByteArray();
-        await File.WriteAllBytesAsync(
+        await WriteAllBytesAsyncCompat(
             Path.Combine(_datasetPath, "_transactions", txnFileName),
             transactionBytes, cancellationToken).ConfigureAwait(false);
 
@@ -361,7 +361,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         ulong encodedName = ulong.MaxValue - manifest.Version;
         string manifestFileName = encodedName.ToString(System.Globalization.CultureInfo.InvariantCulture)
                                 + ".manifest";
-        await File.WriteAllBytesAsync(
+        await WriteAllBytesAsyncCompat(
             Path.Combine(datasetPath, "_versions", manifestFileName),
             buf, cancellationToken).ConfigureAwait(false);
     }
@@ -638,7 +638,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             Uuid = txnUuid,
         };
         byte[] transactionBytes = transaction.ToByteArray();
-        await File.WriteAllBytesAsync(
+        await WriteAllBytesAsyncCompat(
             Path.Combine(datasetPath, "_transactions", txnFileName),
             transactionBytes, cancellationToken).ConfigureAwait(false);
 
@@ -1048,7 +1048,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             Uuid = txnUuid,
         };
         byte[] transactionBytes = transaction.ToByteArray();
-        await File.WriteAllBytesAsync(
+        await WriteAllBytesAsyncCompat(
             Path.Combine(datasetPath, "_transactions", txnFileName),
             transactionBytes, cancellationToken).ConfigureAwait(false);
 
@@ -1286,7 +1286,7 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
             Uuid = txnUuid,
         };
         byte[] transactionBytes = transaction.ToByteArray();
-        await File.WriteAllBytesAsync(
+        await WriteAllBytesAsyncCompat(
             Path.Combine(datasetPath, "_transactions", txnFileName),
             transactionBytes, cancellationToken).ConfigureAwait(false);
 
@@ -1340,7 +1340,10 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         }, metadata: null);
         var batch = new RecordBatch(schema, new[] { (IArrowArray)arr }, sorted.Length);
 
-        await using var fs = File.Create(path);
+        // FileStream became IAsyncDisposable in net5+, so `await using` won't
+        // compile on netstandard2.0. The IPC writer flushes synchronously on
+        // disposal anyway, so plain `using` is equivalent here.
+        using FileStream fs = File.Create(path);
         using (var writer = new ArrowFileWriter(fs, schema))
         {
             await writer.WriteRecordBatchAsync(batch, cancellationToken)
@@ -1517,6 +1520,22 @@ public sealed class LanceDatasetWriter : IAsyncDisposable
         long TotalRows,
         IReadOnlyList<LanceField> Fields,
         LanceVersion Version);
+
+    // File.WriteAllBytesAsync was added in net5.0 and isn't on netstandard2.0.
+    // Use the BCL implementation where available; otherwise open a FileStream
+    // and write asynchronously ourselves.
+    private static
+#if NET6_0_OR_GREATER
+        Task WriteAllBytesAsyncCompat(string path, byte[] bytes, CancellationToken cancellationToken)
+        => File.WriteAllBytesAsync(path, bytes, cancellationToken);
+#else
+        async Task WriteAllBytesAsyncCompat(string path, byte[] bytes, CancellationToken cancellationToken)
+    {
+        using var fs = new FileStream(path, FileMode.Create, FileAccess.Write, FileShare.None,
+            bufferSize: 4096, useAsync: true);
+        await fs.WriteAsync(bytes, 0, bytes.Length, cancellationToken).ConfigureAwait(false);
+    }
+#endif
 }
 
 /// <summary>

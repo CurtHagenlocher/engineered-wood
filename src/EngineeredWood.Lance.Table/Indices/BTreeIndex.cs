@@ -209,7 +209,7 @@ public sealed class BTreeIndex : IAsyncDisposable
     private static string JoinPath(string a, string b) =>
         a == "." || a == string.Empty
             ? b
-            : a.EndsWith('/') ? a + b : a + "/" + b;
+            : a.EndsWith("/", StringComparison.Ordinal) ? a + b : a + "/" + b;
 
     private readonly record struct LookupRow(int PageMin, int PageMax, uint PageIdx);
 }
