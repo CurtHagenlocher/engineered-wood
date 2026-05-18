@@ -21,12 +21,12 @@
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'net472'">
-    <!-- Parquet.Net 5.6.0 dropped netstandard2.0 support. -->
+    <!-- Parquet.Net 5.6.0 dropped netstandard2.0; v6 dropped pre-.NET 8 entirely. -->
     <PackageReference Include="Parquet.Net" Version="5.5.0" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' != 'net472'">
-    <PackageReference Include="Parquet.Net" Version="5.*" />
+    <PackageReference Include="Parquet.Net" Version="6.*" />
   </ItemGroup>
 
 </Project>

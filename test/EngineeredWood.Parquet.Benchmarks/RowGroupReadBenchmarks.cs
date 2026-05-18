@@ -170,9 +170,17 @@ public class RowGroupReadBenchmarks
     public async Task ParquetNet_ReadRowGroup()
     {
         using var stream = System.IO.File.OpenRead(FilePath);
+#if NET8_0_OR_GREATER
+        await using var reader = await ParquetReader.CreateAsync(stream).ConfigureAwait(false);
+        using var rowGroupReader = reader.OpenRowGroupReader(0);
+        int n = checked((int)reader.RowGroups[0].RowCount);
+        foreach (DataField field in reader.Schema.GetDataFields())
+        {
+            await ParquetNetReadHelpers.DrainColumnV6Async(rowGroupReader, field, n).ConfigureAwait(false);
+        }
+#else
         using var reader = await ParquetReader.CreateAsync(stream).ConfigureAwait(false);
         using var rowGroupReader = reader.OpenRowGroupReader(0);
-
         foreach (DataField field in reader.Schema.GetDataFields())
         {
             var column = await rowGroupReader.ReadColumnAsync(field).ConfigureAwait(false);
@@ -180,5 +188,6 @@ public class RowGroupReadBenchmarks
             // a materialized nullable array — equivalent work to what EW does eagerly.
             _ = column.Data.Length;
         }
+#endif
     }
 }

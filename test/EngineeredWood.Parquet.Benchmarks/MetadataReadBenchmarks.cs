@@ -57,7 +57,11 @@ public class MetadataReadBenchmarks
     public async Task ParquetNet_ReadMetadata()
     {
         using var stream = System.IO.File.OpenRead(FilePath);
+#if NET8_0_OR_GREATER
+        await using var reader = await ParquetReader.CreateAsync(stream).ConfigureAwait(false);
+#else
         using var reader = await ParquetReader.CreateAsync(stream).ConfigureAwait(false);
+#endif
         _ = reader.Schema;
     }
 }

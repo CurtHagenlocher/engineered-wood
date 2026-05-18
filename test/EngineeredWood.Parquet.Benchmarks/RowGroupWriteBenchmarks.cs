@@ -8,7 +8,10 @@ using BenchmarkDotNet.Attributes;
 using EngineeredWood.IO.Local;
 using EngineeredWood.Compression;
 using EngineeredWood.Parquet;
+using Parquet;
+using Parquet.Schema;
 using Field = Apache.Arrow.Field;
+using PqDataField = Parquet.Schema.DataField;
 
 namespace EngineeredWood.Benchmarks;
 
@@ -196,6 +199,161 @@ public class RowGroupWriteBenchmarks
         });
         await writer.WriteRowGroupAsync(CurrentBatch);
         await writer.CloseAsync();
+    }
+
+    [Benchmark(Description = "Parquet.Net")]
+    public async Task ParquetNet_Write()
+    {
+        var path = Path.Combine(_dir, $"pn-{Scenario}.parquet");
+        var batch = CurrentBatch;
+
+        var fields = new PqDataField[batch.ColumnCount];
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            var f = batch.Schema.FieldsList[c];
+            fields[c] = CreateParquetNetField(f);
+        }
+        var schema = new ParquetSchema(fields);
+
+#if NET8_0_OR_GREATER
+        await using var stream = File.Create(path);
+        await using var writer = await ParquetWriter.CreateAsync(schema, stream);
+#else
+        using var stream = File.Create(path);
+        using var writer = await ParquetWriter.CreateAsync(schema, stream);
+#endif
+        using var rg = writer.CreateRowGroup();
+
+        for (int c = 0; c < batch.ColumnCount; c++)
+        {
+            await WriteParquetNetColumn(rg, fields[c], batch.Column(c), batch.Schema.FieldsList[c])
+                .ConfigureAwait(false);
+        }
+    }
+
+    private static PqDataField CreateParquetNetField(Field f) => f.DataType switch
+    {
+        Int32Type when f.IsNullable => new DataField<int?>(f.Name),
+        Int32Type => new DataField<int>(f.Name),
+        Int64Type when f.IsNullable => new DataField<long?>(f.Name),
+        Int64Type => new DataField<long>(f.Name),
+        DoubleType when f.IsNullable => new DataField<double?>(f.Name),
+        DoubleType => new DataField<double>(f.Name),
+        FloatType when f.IsNullable => new DataField<float?>(f.Name),
+        FloatType => new DataField<float>(f.Name),
+        BooleanType when f.IsNullable => new DataField<bool?>(f.Name),
+        BooleanType => new DataField<bool>(f.Name),
+        StringType => new DataField<string>(f.Name),
+        _ => throw new NotSupportedException($"Unsupported type: {f.DataType}"),
+    };
+
+    private static async Task WriteParquetNetColumn(
+        ParquetRowGroupWriter rg, PqDataField pqField, IArrowArray array, Field field)
+    {
+        switch (array)
+        {
+            case Int32Array a when field.IsNullable:
+            {
+                var values = new int?[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.IsNull(i) ? null : a.GetValue(i);
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<int>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case Int32Array a:
+            {
+                var values = new int[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.GetValue(i)!.Value;
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<int>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case Int64Array a when field.IsNullable:
+            {
+                var values = new long?[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.IsNull(i) ? null : a.GetValue(i);
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<long>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case Int64Array a:
+            {
+                var values = new long[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.GetValue(i)!.Value;
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<long>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case DoubleArray a when field.IsNullable:
+            {
+                var values = new double?[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.IsNull(i) ? null : a.GetValue(i);
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<double>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case DoubleArray a:
+            {
+                var values = new double[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.GetValue(i)!.Value;
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<double>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case BooleanArray a when field.IsNullable:
+            {
+                var values = new bool?[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.IsNull(i) ? null : a.GetValue(i);
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<bool>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case BooleanArray a:
+            {
+                var values = new bool[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.GetValue(i)!.Value;
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync<bool>(pqField, values.AsMemory()).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            case StringArray a:
+            {
+                var values = new string?[a.Length];
+                for (int i = 0; i < a.Length; i++) values[i] = a.IsNull(i) ? null : a.GetString(i);
+#if NET8_0_OR_GREATER
+                await rg.WriteAsync(pqField, (IReadOnlyCollection<string>)values!).ConfigureAwait(false);
+#else
+                await rg.WriteColumnAsync(new global::Parquet.Data.DataColumn(pqField, values)).ConfigureAwait(false);
+#endif
+                break;
+            }
+            default:
+                throw new NotSupportedException($"Unsupported array type: {array.GetType().Name}");
+        }
     }
 
     [Benchmark(Description = "ParquetSharp")]

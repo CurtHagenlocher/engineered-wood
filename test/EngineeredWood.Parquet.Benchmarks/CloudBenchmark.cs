@@ -222,10 +222,18 @@ public static class CloudBenchmark
                 new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
 #endif
 
+#if NET8_0_OR_GREATER
+            await using var reader = await global::Parquet.ParquetReader.CreateAsync(stream);
+            using var rg = reader.OpenRowGroupReader(rowGroupIndex);
+            int rowCount = checked((int)reader.RowGroups[rowGroupIndex].RowCount);
+            foreach (var field in reader.Schema.GetDataFields())
+                await ParquetNetReadHelpers.DrainColumnV6Async(rg, field, rowCount);
+#else
             using var reader = await global::Parquet.ParquetReader.CreateAsync(stream);
             using var rg = reader.OpenRowGroupReader(rowGroupIndex);
             foreach (var field in reader.Schema.GetDataFields())
                 await rg.ReadColumnAsync(field);
+#endif
 
             sw.Stop();
             times[i] = sw.Elapsed.TotalMilliseconds;
@@ -262,7 +270,7 @@ public static class CloudBenchmark
         }
 
         Console.WriteLine("Reading via Parquet.Net...");
-        global::Parquet.Data.DataColumn[] pnetColumns;
+        PnReadResult[] pnetColumns;
         {
 #if NET8_0_OR_GREATER
             await using var stream = await blobClient.OpenReadAsync(
@@ -271,12 +279,27 @@ public static class CloudBenchmark
             using var stream = await blobClient.OpenReadAsync(
                 new Azure.Storage.Blobs.Models.BlobOpenReadOptions(allowModifications: false));
 #endif
+#if NET8_0_OR_GREATER
+            await using var reader = await global::Parquet.ParquetReader.CreateAsync(stream);
+#else
             using var reader = await global::Parquet.ParquetReader.CreateAsync(stream);
+#endif
             using var rg = reader.OpenRowGroupReader(rowGroupIndex);
             var fields = reader.Schema.GetDataFields();
-            pnetColumns = new global::Parquet.Data.DataColumn[fields.Length];
+            pnetColumns = new PnReadResult[fields.Length];
+            int pnRowCount = checked((int)reader.RowGroups[rowGroupIndex].RowCount);
             for (int i = 0; i < fields.Length; i++)
-                pnetColumns[i] = await rg.ReadColumnAsync(fields[i]);
+            {
+#if NET8_0_OR_GREATER
+                var arr = await ParquetNetReadHelpers.ReadColumnAsArrayV6Async(rg, fields[i], pnRowCount);
+                pnetColumns[i] = arr is null
+                    ? new PnReadResult(System.Array.Empty<int>(), null)
+                    : new PnReadResult(arr, null);
+#else
+                var col = await rg.ReadColumnAsync(fields[i]);
+                pnetColumns[i] = new PnReadResult(col.Data, col.DefinitionLevels);
+#endif
+            }
         }
 
         Console.WriteLine("Reading via ParquetSharp...");
@@ -338,7 +361,7 @@ public static class CloudBenchmark
     private enum CompareResult { Pass, Skip, Fail }
 
     private static CompareResult CompareColumn(
-        IArrowArray ewCol, global::Parquet.Data.DataColumn pnetCol,
+        IArrowArray ewCol, PnReadResult pnetCol,
         System.Array psArr, string psTypeName, int rowCount, string colName)
     {
         // Extract EW values as object?[] for scalar types
@@ -353,7 +376,7 @@ public static class CloudBenchmark
         object?[]? pnetValues = ExtractParquetNetValues(pnetCol, rowCount);
         if (pnetValues == null)
         {
-            Console.WriteLine($"  [{colName}] SKIP (non-scalar Parquet.Net type: {pnetCol.Data?.GetType().Name})");
+            Console.WriteLine($"  [{colName}] SKIP (non-scalar Parquet.Net type: {pnetCol.Data.GetType().Name})");
             return CompareResult.Skip;
         }
 
@@ -479,31 +502,46 @@ public static class CloudBenchmark
     }
 
     private static object?[]? ExtractParquetNetValues(
-        global::Parquet.Data.DataColumn col, int count)
+        PnReadResult col, int count)
     {
         var data = col.Data;
-        if (data is int[] ints) return BoxArray(ints, col, count);
+        if (data is int[] ints) return BoxArray(ints, col.DefinitionLevels, count);
         if (data is int?[] nints) return BoxNullable(nints, count);
-        if (data is long[] longs) return BoxArray(longs, col, count);
+        if (data is long[] longs) return BoxArray(longs, col.DefinitionLevels, count);
         if (data is long?[] nlongs) return BoxNullable(nlongs, count);
-        if (data is float[] floats) return BoxArray(floats, col, count);
+        if (data is float[] floats) return BoxArray(floats, col.DefinitionLevels, count);
         if (data is float?[] nfloats) return BoxNullable(nfloats, count);
-        if (data is double[] doubles) return BoxArray(doubles, col, count);
+        if (data is double[] doubles) return BoxArray(doubles, col.DefinitionLevels, count);
         if (data is double?[] ndoubles) return BoxNullable(ndoubles, count);
-        if (data is bool[] bools) return BoxArray(bools, col, count);
+        if (data is bool[] bools) return BoxArray(bools, col.DefinitionLevels, count);
         if (data is bool?[] nbools) return BoxNullable(nbools, count);
-        if (data is DateTime[] dts) return BoxArray(dts, col, count);
+        if (data is DateTime[] dts) return BoxArray(dts, col.DefinitionLevels, count);
         if (data is DateTime?[] ndts) return BoxNullable(ndts, count);
-        if (data is DateTimeOffset[] dtos) return BoxArray(dtos, col, count);
+        if (data is DateTimeOffset[] dtos) return BoxArray(dtos, col.DefinitionLevels, count);
         if (data is DateTimeOffset?[] ndtos) return BoxNullable(ndtos, count);
         return null;
     }
 
-    private static object?[] BoxArray<T>(T[] data, global::Parquet.Data.DataColumn col, int count)
+    /// <summary>
+    /// Unified shape for Parquet.Net read results across v5 (DataColumn) and v6 (typed ReadAsync).
+    /// On v6, nullable columns are scattered into <c>T?[]</c> directly so DefinitionLevels is null.
+    /// On v5, nullable required columns return densely-packed <c>T[]</c> plus def levels.
+    /// </summary>
+    private sealed class PnReadResult
+    {
+        public PnReadResult(System.Array data, int[]? defLevels)
+        {
+            Data = data;
+            DefinitionLevels = defLevels;
+        }
+        public System.Array Data { get; }
+        public int[]? DefinitionLevels { get; }
+    }
+
+    private static object?[] BoxArray<T>(T[] data, int[]? defLevels, int count)
         where T : struct
     {
         var result = new object?[count];
-        var defLevels = col.DefinitionLevels;
         // If no def levels, all values are present
         if (defLevels == null)
         {
@@ -512,7 +550,7 @@ public static class CloudBenchmark
         }
         else
         {
-            // Parquet.Net packs non-null values densely; use defLevel to scatter
+            // Parquet.Net 5 packs non-null values densely; use defLevel to scatter
             int valueIdx = 0;
             for (int i = 0; i < count; i++)
             {

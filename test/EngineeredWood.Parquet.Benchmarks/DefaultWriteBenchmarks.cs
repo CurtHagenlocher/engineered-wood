@@ -228,9 +228,19 @@ public class DefaultWriteBenchmarks
 
 #if NET8_0_OR_GREATER
         await using var stream = File.Create(path);
+        await using var writer = await ParquetWriter.CreateAsync(schema, stream);
+        using var group = writer.CreateRowGroup();
+
+        // Parquet.Net 6: typed WriteAsync<T> overloads replaced DataColumn. Explicit
+        // type arguments are required so the generic overload binds correctly instead
+        // of the string/byte[] helper overloads.
+        await group.WriteAsync<int>((DataField)schema[0], _ids.AsMemory());
+        await group.WriteAsync<long>((DataField)schema[1], _timestamps.AsMemory());
+        await group.WriteAsync<double>((DataField)schema[2], _pnValues.AsMemory());
+        await group.WriteAsync((DataField)schema[3], (IReadOnlyCollection<string>)_names!);
+        await group.WriteAsync<bool>((DataField)schema[4], _pnFlags.AsMemory());
 #else
         using var stream = File.Create(path);
-#endif
         using var writer = await ParquetWriter.CreateAsync(schema, stream);
         using var group = writer.CreateRowGroup();
 
@@ -239,5 +249,6 @@ public class DefaultWriteBenchmarks
         await group.WriteColumnAsync(new DataColumn((DataField)schema[2], _pnValues));
         await group.WriteColumnAsync(new DataColumn((DataField)schema[3], _names!));
         await group.WriteColumnAsync(new DataColumn((DataField)schema[4], _pnFlags));
+#endif
     }
 }
