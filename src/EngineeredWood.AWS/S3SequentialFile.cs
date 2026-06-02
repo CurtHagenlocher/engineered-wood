@@ -29,7 +29,6 @@ public sealed class S3SequentialFile : ISequentialFile
     private readonly int _partSize;
     private readonly byte[] _buffer;
     private int _bufferPosition;
-    private long _position;
     private bool _completed;
     private bool _disposed;
 
@@ -68,13 +67,13 @@ public sealed class S3SequentialFile : ISequentialFile
     /// <param name="uri">The S3 URI parsed into bucket and key.</param>
     /// <param name="partSize">
     /// Size threshold at which buffered data is uploaded as a part.
-    /// Defaults to 5 MiB. Must be at least 1.
+    /// Defaults to 5 MiB. Must be at least 5MiB.
     /// </param>
     public S3SequentialFile(IAmazonS3 client, AmazonS3Uri uri, int partSize = DefaultPartSize)
         : this(client, uri.Bucket, uri.Key, partSize) { }
 
     /// <inheritdoc/>
-    public long Position => _position;
+    public long Position { get; private set; }
 
     /// <inheritdoc/>
     public async ValueTask WriteAsync(ReadOnlyMemory<byte> data, CancellationToken cancellationToken = default)
@@ -95,7 +94,7 @@ public sealed class S3SequentialFile : ISequentialFile
 
             data.Span.Slice(sourceOffset, toCopy).CopyTo(_buffer.AsSpan(_bufferPosition));
             _bufferPosition += toCopy;
-            _position += toCopy;
+            Position += toCopy;
             sourceOffset += toCopy;
             remaining -= toCopy;
 

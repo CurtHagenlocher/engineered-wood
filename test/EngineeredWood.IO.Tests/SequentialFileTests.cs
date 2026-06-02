@@ -131,4 +131,72 @@ public abstract class SequentialFileTests
             await cleanup();
         }
     }
+
+    [Fact]
+    public async Task WriteLargeData_MultiBlock_RoundTrips()
+    {
+        // Write enough data to cross the default block/part boundary.
+        // Azure default is 4 MiB, S3 default is 5 MiB — 6 MiB covers both.
+        const int size = 6 * 1024 * 1024;
+        byte[] data = CreateTestData(size);
+
+        (ISequentialFile file, Func<Task<byte[]>> readBack, Func<Task> cleanup) =
+            await CreateFileAsync(nameof(WriteLargeData_MultiBlock_RoundTrips));
+        try
+        {
+            await file.WriteAsync(data);
+            Assert.Equal(size, file.Position);
+            await file.FlushAsync();
+
+            byte[] actual = await readBack();
+            Assert.Equal(data, actual);
+        }
+        finally
+        {
+            await file.DisposeAsync();
+            await cleanup();
+        }
+    }
+
+    [Fact]
+    public async Task FlushWithNoData_Succeeds()
+    {
+        (ISequentialFile file, _, Func<Task> cleanup) = await CreateFileAsync(nameof(FlushWithNoData_Succeeds));
+        try
+        {
+            await file.FlushAsync();
+            Assert.Equal(0, file.Position);
+        }
+        finally
+        {
+            await file.DisposeAsync();
+            await cleanup();
+        }
+    }
+
+    [Fact]
+    public async Task WriteAfterDispose_ThrowsObjectDisposedException()
+    {
+        (ISequentialFile file, _, Func<Task> cleanup) = await CreateFileAsync(nameof(WriteAfterDispose_ThrowsObjectDisposedException));
+        await file.WriteAsync(new byte[] { 1, 2, 3 });
+        await file.FlushAsync();
+        await file.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => file.WriteAsync(new byte[] { 4 }).AsTask());
+        await cleanup();
+    }
+
+    [Fact]
+    public async Task FlushAfterDispose_ThrowsObjectDisposedException()
+    {
+        (ISequentialFile file, _, Func<Task> cleanup) = await CreateFileAsync(nameof(FlushAfterDispose_ThrowsObjectDisposedException));
+        await file.WriteAsync(new byte[] { 1 });
+        await file.FlushAsync();
+        await file.DisposeAsync();
+
+        await Assert.ThrowsAsync<ObjectDisposedException>(
+            () => file.FlushAsync().AsTask());
+        await cleanup();
+    }
 }
