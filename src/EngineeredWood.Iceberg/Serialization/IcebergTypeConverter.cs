@@ -13,28 +13,38 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
 
     public override IcebergType Read(ref Utf8JsonReader reader, Type typeToConvert, JsonSerializerOptions options)
     {
-        if (reader.TokenType == JsonTokenType.String)
-            return ParsePrimitive(reader.GetString()!);
+        using var doc = JsonDocument.ParseValue(ref reader);
+        return ReadElement(doc.RootElement, options);
+    }
 
-        if (reader.TokenType == JsonTokenType.StartObject)
+    // Reads an IcebergType from an already-parsed element. Nested element/key/value types
+    // recurse here directly rather than through JsonSerializer, keeping the path trim/AOT safe
+    // without registering the polymorphic IcebergType hierarchy in the source-generated context.
+    private static IcebergType ReadElement(JsonElement element, JsonSerializerOptions options)
+    {
+        if (element.ValueKind == JsonValueKind.String)
+            return ParsePrimitive(element.GetString()!);
+
+        if (element.ValueKind == JsonValueKind.Object)
         {
-            using var doc = JsonDocument.ParseValue(ref reader);
-            var root = doc.RootElement;
-            var type = root.GetProperty("type").GetString()!;
+            var type = element.GetProperty("type").GetString()!;
 
             return type switch
             {
-                "struct" => ReadStruct(root, options),
-                "list" => ReadList(root, options),
-                "map" => ReadMap(root, options),
+                "struct" => ReadStruct(element, options),
+                "list" => ReadList(element, options),
+                "map" => ReadMap(element, options),
                 _ => throw new JsonException($"Unknown nested type: {type}")
             };
         }
 
-        throw new JsonException($"Unexpected token type: {reader.TokenType}");
+        throw new JsonException($"Unexpected value kind: {element.ValueKind}");
     }
 
     public override void Write(Utf8JsonWriter writer, IcebergType value, JsonSerializerOptions options)
+        => WriteType(writer, value, options);
+
+    private static void WriteType(Utf8JsonWriter writer, IcebergType value, JsonSerializerOptions options)
     {
         switch (value)
         {
@@ -121,14 +131,14 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
 
     private static StructType ReadStruct(JsonElement element, JsonSerializerOptions options)
     {
-        var fields = element.GetProperty("fields").Deserialize<List<NestedField>>(options)!;
+        var fields = element.GetProperty("fields").Deserialize(options.TypeInfo<List<NestedField>>())!;
         return new StructType(fields);
     }
 
     private static ListType ReadList(JsonElement element, JsonSerializerOptions options)
     {
         var elementId = element.GetProperty("element-id").GetInt32();
-        var elementType = element.GetProperty("element").Deserialize<IcebergType>(options)!;
+        var elementType = ReadElement(element.GetProperty("element"), options);
         var elementRequired = element.GetProperty("element-required").GetBoolean();
         return new ListType(elementId, elementType, elementRequired);
     }
@@ -136,9 +146,9 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
     private static MapType ReadMap(JsonElement element, JsonSerializerOptions options)
     {
         var keyId = element.GetProperty("key-id").GetInt32();
-        var keyType = element.GetProperty("key").Deserialize<IcebergType>(options)!;
+        var keyType = ReadElement(element.GetProperty("key"), options);
         var valueId = element.GetProperty("value-id").GetInt32();
-        var valueType = element.GetProperty("value").Deserialize<IcebergType>(options)!;
+        var valueType = ReadElement(element.GetProperty("value"), options);
         var valueRequired = element.GetProperty("value-required").GetBoolean();
         return new MapType(keyId, keyType, valueId, valueType, valueRequired);
     }
@@ -148,7 +158,7 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
         writer.WriteStartObject();
         writer.WriteString("type", "struct");
         writer.WritePropertyName("fields");
-        JsonSerializer.Serialize(writer, structType.Fields, options);
+        JsonSerializer.Serialize(writer, structType.Fields, options.TypeInfo<IReadOnlyList<NestedField>>());
         writer.WriteEndObject();
     }
 
@@ -158,7 +168,7 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
         writer.WriteString("type", "list");
         writer.WriteNumber("element-id", listType.ElementId);
         writer.WritePropertyName("element");
-        JsonSerializer.Serialize(writer, listType.ElementType, options);
+        WriteType(writer, listType.ElementType, options);
         writer.WriteBoolean("element-required", listType.ElementRequired);
         writer.WriteEndObject();
     }
@@ -169,10 +179,10 @@ internal sealed class IcebergTypeConverter : JsonConverter<IcebergType>
         writer.WriteString("type", "map");
         writer.WriteNumber("key-id", mapType.KeyId);
         writer.WritePropertyName("key");
-        JsonSerializer.Serialize(writer, mapType.KeyType, options);
+        WriteType(writer, mapType.KeyType, options);
         writer.WriteNumber("value-id", mapType.ValueId);
         writer.WritePropertyName("value");
-        JsonSerializer.Serialize(writer, mapType.ValueType, options);
+        WriteType(writer, mapType.ValueType, options);
         writer.WriteBoolean("value-required", mapType.ValueRequired);
         writer.WriteEndObject();
     }

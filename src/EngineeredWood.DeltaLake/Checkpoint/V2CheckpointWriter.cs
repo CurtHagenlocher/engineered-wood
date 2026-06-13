@@ -91,18 +91,20 @@ public sealed class V2CheckpointWriter
             .ConfigureAwait(false);
 
         // Update _last_checkpoint
-        var lastCheckpoint = new
+        using var lastCheckpointStream = new MemoryStream();
+        using (var w = new Utf8JsonWriter(lastCheckpointStream))
         {
-            version = snapshot.Version,
-            size = (long)actions.Count,
-            v2Checkpoint = new
-            {
-                path = checkpointPath,
-                sidecarFiles = useSidecars ? 1 : 0,
-            },
-        };
+            w.WriteStartObject();
+            w.WriteNumber("version", snapshot.Version);
+            w.WriteNumber("size", (long)actions.Count);
+            w.WriteStartObject("v2Checkpoint");
+            w.WriteString("path", checkpointPath);
+            w.WriteNumber("sidecarFiles", useSidecars ? 1 : 0);
+            w.WriteEndObject();
+            w.WriteEndObject();
+        }
+        byte[] json = lastCheckpointStream.ToArray();
 
-        byte[] json = JsonSerializer.SerializeToUtf8Bytes(lastCheckpoint);
         await _fs.WriteAllBytesAsync(
             DeltaVersion.LastCheckpointPath, json, cancellationToken).ConfigureAwait(false);
     }

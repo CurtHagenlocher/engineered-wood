@@ -14,11 +14,11 @@ internal sealed class SchemaConverter : JsonConverter<Schema>
         var root = doc.RootElement;
 
         var schemaId = root.GetProperty("schema-id").GetInt32();
-        var fields = root.GetProperty("fields").Deserialize<List<NestedField>>(options)!;
+        var fields = root.GetProperty("fields").Deserialize(options.TypeInfo<List<NestedField>>())!;
 
         IReadOnlyList<int>? identifierFieldIds = null;
         if (root.TryGetProperty("identifier-field-ids", out var idsElement))
-            identifierFieldIds = idsElement.Deserialize<List<int>>(options);
+            identifierFieldIds = idsElement.Deserialize(options.TypeInfo<List<int>>());
 
         return new Schema(schemaId, fields, identifierFieldIds);
     }
@@ -29,12 +29,12 @@ internal sealed class SchemaConverter : JsonConverter<Schema>
         writer.WriteNumber("schema-id", value.SchemaId);
         writer.WriteString("type", "struct");
         writer.WritePropertyName("fields");
-        JsonSerializer.Serialize(writer, value.Fields, options);
+        JsonSerializer.Serialize(writer, value.Fields, options.TypeInfo<IReadOnlyList<NestedField>>());
 
         if (value.IdentifierFieldIds is not null)
         {
             writer.WritePropertyName("identifier-field-ids");
-            JsonSerializer.Serialize(writer, value.IdentifierFieldIds, options);
+            JsonSerializer.Serialize(writer, value.IdentifierFieldIds, options.TypeInfo<IReadOnlyList<int>>());
         }
 
         writer.WriteEndObject();

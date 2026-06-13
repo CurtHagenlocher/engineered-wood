@@ -50,11 +50,15 @@ public sealed class CheckpointWriter
         }
 
         // Write _last_checkpoint
-        byte[] json = JsonSerializer.SerializeToUtf8Bytes(new
+        using var lastCheckpointStream = new MemoryStream();
+        using (var w = new Utf8JsonWriter(lastCheckpointStream))
         {
-            version = snapshot.Version,
-            size = actionCount,
-        });
+            w.WriteStartObject();
+            w.WriteNumber("version", snapshot.Version);
+            w.WriteNumber("size", actionCount);
+            w.WriteEndObject();
+        }
+        byte[] json = lastCheckpointStream.ToArray();
 
         await _fs.WriteAllBytesAsync(
             DeltaVersion.LastCheckpointPath, json, cancellationToken).ConfigureAwait(false);

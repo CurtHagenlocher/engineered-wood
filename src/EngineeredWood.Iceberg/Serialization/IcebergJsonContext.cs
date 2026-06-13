@@ -40,6 +40,8 @@ namespace EngineeredWood.Iceberg.Serialization;
 [JsonSerializable(typeof(IReadOnlyList<int>))]
 [JsonSerializable(typeof(List<ManifestEntry>))]
 [JsonSerializable(typeof(List<ManifestListEntry>))]
+[JsonSerializable(typeof(IReadOnlyList<ManifestEntry>))]
+[JsonSerializable(typeof(IReadOnlyList<ManifestListEntry>))]
 [JsonSerializable(typeof(List<NestedField>))]
 [JsonSerializable(typeof(List<int>))]
 [JsonSourceGenerationOptions(

@@ -2,6 +2,7 @@
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
 using EngineeredWood.Arrow;
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using EngineeredWood.Orc.Encodings;
@@ -29,7 +30,11 @@ internal sealed class FloatColumnReader : ColumnReader
             for (int i = 0; i < batchSize; i++)
             {
                 if (present == null || present[i])
+#if NET8_0_OR_GREATER
+                    values[i] = BinaryPrimitives.ReadSingleLittleEndian(_dataStream.ReadSpan(4));
+#else
                     values[i] = MemoryMarshal.Read<float>(_dataStream.ReadSpan(4));
+#endif
             }
         }
 
@@ -59,7 +64,11 @@ internal sealed class DoubleColumnReader : ColumnReader
             for (int i = 0; i < batchSize; i++)
             {
                 if (present == null || present[i])
+#if NET8_0_OR_GREATER
+                    values[i] = BinaryPrimitives.ReadDoubleLittleEndian(_dataStream.ReadSpan(8));
+#else
                     values[i] = MemoryMarshal.Read<double>(_dataStream.ReadSpan(8));
+#endif
             }
         }
 

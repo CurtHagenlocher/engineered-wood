@@ -1,9 +1,9 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
-using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Text.Json.Serialization.Metadata;
 using EngineeredWood.DeltaLake.Actions;
 
 namespace EngineeredWood.DeltaLake.Log;
@@ -17,16 +17,24 @@ internal static class ActionSerializer
 {
     private static readonly JsonSerializerOptions s_options = CreateOptions();
 
+    // The action wrapper format is handled entirely by this converter; we invoke it
+    // directly (rather than via the reflection-based JsonSerializer entry points) so the
+    // top-level DeltaAction round-trip stays trim/AOT safe without registering the
+    // abstract DeltaAction in the source-generated context.
+    private static readonly DeltaActionConverter s_converter = new();
+
+    private static readonly JsonTypeInfo<DeletionVector> s_deletionVectorInfo =
+        (JsonTypeInfo<DeletionVector>)s_options.GetTypeInfo(typeof(DeletionVector));
+
     private static JsonSerializerOptions CreateOptions()
     {
-        var options = new JsonSerializerOptions
+        return new JsonSerializerOptions
         {
             PropertyNamingPolicy = JsonNamingPolicy.CamelCase,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
             WriteIndented = false,
+            TypeInfoResolver = DeltaJsonContext.Default,
         };
-        options.Converters.Add(new DeltaActionConverter());
-        return options;
     }
 
     /// <summary>
@@ -45,7 +53,10 @@ internal static class ActionSerializer
                 // Skip empty lines and lines that are only whitespace
                 if (!line.IsEmpty && HasNonWhitespace(line))
                 {
-                    var action = JsonSerializer.Deserialize<DeltaAction>(line, s_options);
+                    var reader = new Utf8JsonReader(line);
+                    if (!reader.Read())
+                        continue;
+                    var action = s_converter.Read(ref reader, typeof(DeltaAction), s_options);
                     if (action is not null)
                         actions.Add(action);
                 }
@@ -61,13 +72,16 @@ internal static class ActionSerializer
     /// </summary>
     public static byte[] Serialize(IReadOnlyList<DeltaAction> actions)
     {
-        var sb = new StringBuilder();
+        using var ms = new MemoryStream();
         foreach (var action in actions)
         {
-            sb.Append(JsonSerializer.Serialize(action, s_options));
-            sb.Append('\n');
+            using (var writer = new Utf8JsonWriter(ms))
+            {
+                s_converter.Write(writer, action, s_options);
+            }
+            ms.WriteByte((byte)'\n');
         }
-        return System.Text.Encoding.UTF8.GetBytes(sb.ToString());
+        return ms.ToArray();
     }
 
     private static bool HasNonWhitespace(ReadOnlySpan<byte> data)
@@ -199,7 +213,7 @@ internal static class ActionSerializer
                     case "dataChange": dataChange = r.GetBoolean(); break;
                     case "stats": stats = r.GetString(); break;
                     case "tags": tags = ReadStringDict(ref r); break;
-                    case "deletionVector": deletionVector = JsonSerializer.Deserialize<DeletionVector>(ref r, options); break;
+                    case "deletionVector": deletionVector = JsonSerializer.Deserialize(ref r, s_deletionVectorInfo); break;
                     case "baseRowId": baseRowId = r.GetInt64(); break;
                     case "defaultRowCommitVersion": defaultRowCommitVersion = r.GetInt64(); break;
                     case "clusteringProvider": clusteringProvider = r.GetString(); break;
@@ -248,7 +262,7 @@ internal static class ActionSerializer
                     case "partitionValues": partitionValues = ReadStringDict(ref r); break;
                     case "size": size = r.GetInt64(); break;
                     case "tags": tags = ReadStringDict(ref r); break;
-                    case "deletionVector": deletionVector = JsonSerializer.Deserialize<DeletionVector>(ref r, options); break;
+                    case "deletionVector": deletionVector = JsonSerializer.Deserialize(ref r, s_deletionVectorInfo); break;
                     case "baseRowId": baseRowId = r.GetInt64(); break;
                     case "defaultRowCommitVersion": defaultRowCommitVersion = r.GetInt64(); break;
                     default: r.Skip(); break;
@@ -533,7 +547,7 @@ internal static class ActionSerializer
             if (add.DeletionVector is not null)
             {
                 writer.WritePropertyName("deletionVector");
-                JsonSerializer.Serialize(writer, add.DeletionVector, options);
+                JsonSerializer.Serialize(writer, add.DeletionVector, s_deletionVectorInfo);
             }
             if (add.BaseRowId.HasValue) writer.WriteNumber("baseRowId", add.BaseRowId.Value);
             if (add.DefaultRowCommitVersion.HasValue) writer.WriteNumber("defaultRowCommitVersion", add.DefaultRowCommitVersion.Value);
@@ -555,7 +569,7 @@ internal static class ActionSerializer
             if (remove.DeletionVector is not null)
             {
                 writer.WritePropertyName("deletionVector");
-                JsonSerializer.Serialize(writer, remove.DeletionVector, options);
+                JsonSerializer.Serialize(writer, remove.DeletionVector, s_deletionVectorInfo);
             }
             if (remove.BaseRowId.HasValue) writer.WriteNumber("baseRowId", remove.BaseRowId.Value);
             if (remove.DefaultRowCommitVersion.HasValue) writer.WriteNumber("defaultRowCommitVersion", remove.DefaultRowCommitVersion.Value);

@@ -1,6 +1,7 @@
 // Copyright (c) Curt Hagenlocher. All rights reserved.
 // Licensed under the Apache License, Version 2.0. See LICENSE in the project root for license information.
 
+using System.Buffers.Binary;
 using System.Runtime.InteropServices;
 using Apache.Arrow;
 using EngineeredWood.Orc.Encodings;
@@ -33,7 +34,11 @@ internal sealed class FloatColumnWriter : ColumnWriter
             if (v > _max) _max = v;
             _sum += v;
             BloomFilter?.AddDouble(v);
+#if NET8_0_OR_GREATER
+            BinaryPrimitives.WriteSingleLittleEndian(tmp, v);
+#else
             MemoryMarshal.Write(tmp, ref v);
+#endif
             _dataStream.Write(tmp);
         }
     }
@@ -119,7 +124,11 @@ internal sealed class DoubleColumnWriter : ColumnWriter
             if (v > _max) _max = v;
             _sum += v;
             BloomFilter?.AddDouble(v);
+#if NET8_0_OR_GREATER
+            BinaryPrimitives.WriteDoubleLittleEndian(tmp, v);
+#else
             MemoryMarshal.Write(tmp, ref v);
+#endif
             _dataStream.Write(tmp);
         }
     }

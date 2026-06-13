@@ -27,6 +27,8 @@ public static class ManifestIO
             PropertyNamingPolicy = KebabCaseNamingPolicy.Instance,
             DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
             WriteIndented = false,
+            // Source-generated context only — no reflection fallback, so the library stays trim/AOT safe.
+            TypeInfoResolver = IcebergJsonContext.Default,
         };
         return options;
     }
@@ -94,7 +96,7 @@ public static class ManifestIO
         CancellationToken ct = default)
     {
         var ms = new MemoryStream();
-        JsonSerializer.Serialize(ms, entries, JsonOptions);
+        JsonSerializer.Serialize(ms, entries, JsonOptions.TypeInfo<IReadOnlyList<ManifestEntry>>());
         var data = ms.ToArray();
         await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
         return data.Length;
@@ -104,7 +106,7 @@ public static class ManifestIO
         ITableFileSystem fs, string path, CancellationToken ct = default)
     {
         var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<List<ManifestEntry>>(data, JsonOptions)
+        return JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestEntry>>())
             ?? throw new InvalidOperationException($"Failed to read manifest: {path}");
     }
 
@@ -113,7 +115,7 @@ public static class ManifestIO
         CancellationToken ct = default)
     {
         var ms = new MemoryStream();
-        JsonSerializer.Serialize(ms, entries, JsonOptions);
+        JsonSerializer.Serialize(ms, entries, JsonOptions.TypeInfo<IReadOnlyList<ManifestListEntry>>());
         var data = ms.ToArray();
         await fs.WriteAllBytesAsync(path, data, ct).ConfigureAwait(false);
         return data.Length;
@@ -123,7 +125,7 @@ public static class ManifestIO
         ITableFileSystem fs, string path, CancellationToken ct = default)
     {
         var data = await fs.ReadAllBytesAsync(path, ct).ConfigureAwait(false);
-        return JsonSerializer.Deserialize<List<ManifestListEntry>>(data, JsonOptions)
+        return JsonSerializer.Deserialize(data, JsonOptions.TypeInfo<List<ManifestListEntry>>())
             ?? throw new InvalidOperationException($"Failed to read manifest list: {path}");
     }
 

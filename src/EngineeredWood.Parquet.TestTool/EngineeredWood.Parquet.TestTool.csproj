@@ -12,6 +12,19 @@
     <Nullable>enable</Nullable>
   </PropertyGroup>
 
+  <!--
+    End-to-end AOT validation. Opt in with `-p:AotValidation=true` to native-AOT
+    publish the net10.0 build (requires a RID, e.g. `-r win-x64`). This runs ILC over
+    the whole net10.0 closure — including dependencies (Apache.Arrow, ZstdSharp,
+    Snappier, ...) that the IsAotCompatible analyzers can't see — so a successful
+    publish + run is the airtight proof the libraries are AOT-safe in practice.
+    Scoped to net10.0 so it never touches the net8.0/net472 legs or the referenced
+    libraries' netstandard2.0 builds (which can't AOT).
+  -->
+  <PropertyGroup Condition="'$(TargetFramework)' == 'net10.0' and '$(AotValidation)' == 'true'">
+    <PublishAot>true</PublishAot>
+  </PropertyGroup>
+
   <ItemGroup>
     <PackageReference Include="PolySharp" Version="1.15.0">
       <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>

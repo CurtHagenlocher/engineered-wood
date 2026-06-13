@@ -12,7 +12,7 @@ internal sealed class TableIdentifierConverter : JsonConverter<TableIdentifier>
     {
         using var doc = JsonDocument.ParseValue(ref reader);
         var root = doc.RootElement;
-        var ns = root.GetProperty("namespace").Deserialize<Namespace>(options)!;
+        var ns = root.GetProperty("namespace").Deserialize(options.TypeInfo<Namespace>())!;
         var name = root.GetProperty("name").GetString()!;
         return new TableIdentifier(ns, name);
     }
@@ -21,7 +21,7 @@ internal sealed class TableIdentifierConverter : JsonConverter<TableIdentifier>
     {
         writer.WriteStartObject();
         writer.WritePropertyName("namespace");
-        JsonSerializer.Serialize(writer, value.Namespace, options);
+        JsonSerializer.Serialize(writer, value.Namespace, options.TypeInfo<Namespace>());
         writer.WriteString("name", value.Name);
         writer.WriteEndObject();
     }
