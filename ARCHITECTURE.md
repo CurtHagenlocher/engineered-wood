@@ -123,8 +123,12 @@ src/
     Expressions/                        Iceberg-flavored Expressions factory + TableScan
     Serialization/                      JSON serialization for table metadata
     Catalog interfaces and implementations (FileSystem, InMemory)
-  EngineeredWood.Azure/                 Azure Blob Storage backends
-    IO/Azure/                           AzureBlobRandomAccessFile, AzureBlobSequentialFile
+  EngineeredWood.Azure/                 Azure Blob Storage backends (namespace EngineeredWood.IO.Azure)
+    AzureBlobRandomAccessFile, AzureBlobSequentialFile, AzureTableFileSystem
+  EngineeredWood.Gcs/                   Google Cloud Storage backends (namespace EngineeredWood.IO.Gcs)
+    GcsRandomAccessFile, GcsSequentialFile, GcsTableFileSystem
+  EngineeredWood.Aws/                   Amazon S3 backends (namespace EngineeredWood.IO.Aws)
+    S3RandomAccessFile, S3SequentialFile, S3TableFileSystem
 test/
   EngineeredWood.Parquet.Tests/             xUnit tests for Parquet
   EngineeredWood.Parquet.Benchmarks/        BenchmarkDotNet suites for Parquet
@@ -197,9 +201,13 @@ Replaces `Stream` with two interfaces designed for columnar access patterns.
 |---|---|
 | `LocalRandomAccessFile` | `RandomAccess` API; sequential sync reads (OS page cache efficient) |
 | `AzureBlobRandomAccessFile` | HTTP range requests; `SemaphoreSlim` throttle (default 16); delegates multi-range reads to `CoalescingFileReader` |
+| `GcsRandomAccessFile` | Google Cloud Storage ranged `DownloadObjectAsync`; same throttle + coalescing |
+| `S3RandomAccessFile` | Amazon S3 `GetObject` + `ByteRange`; same throttle + coalescing |
 | `CoalescingFileReader` | Decorator that merges nearby ranges (gap ≤ 64 KB, merged ≤ 16 MB) to reduce round trips, then slices results back to original order |
 
-**Writing: `ISequentialFile`** — Append-only: `WriteAsync(ReadOnlyMemory<byte>)` + `FlushAsync()` + `Position`. Implementations for local files (`LocalSequentialFile`) and Azure (`AzureBlobSequentialFile`).
+**Writing: `ISequentialFile`** — Append-only: `WriteAsync(ReadOnlyMemory<byte>)` + `FlushAsync()` + `Position`. `LocalSequentialFile` writes to disk; the cloud writers stream with bounded memory using each backend's native chunked upload rather than buffering the whole object — Azure block blobs (`AzureBlobSequentialFile`), GCS resumable uploads (`GcsSequentialFile`, fed through a bounded `System.Threading.Channels` pipe by a background upload task), and S3 multipart uploads (`S3SequentialFile`, which drives the part loop directly).
+
+**Directory / table operations: `ITableFileSystem`** — Table formats (Delta Lake, Iceberg, Lance datasets) manage many files under a root and need list / open-read / create / rename / delete / exists / read-all / write-all. `LocalTableFileSystem` backs the local filesystem; `AzureTableFileSystem`, `GcsTableFileSystem`, and `S3TableFileSystem` back the three clouds. `RenameAsync` is the load-bearing operation: commit protocols write a temp object and rename it onto the target, which must fail if the target already exists. None of the clouds offer a true atomic rename, so each implements it as a copy + delete-source where the copy carries the backend's atomic "create only if absent" precondition — `IfGenerationMatch = 0` (GCS), `If-None-Match: *` (Azure and S3). A lost commit race therefore returns `false` instead of clobbering the winner.
 
 **Buffer management** — `BufferAllocator` is an abstract factory for `IMemoryOwner<byte>`. The concrete `PooledBufferAllocator` wraps `ArrayPool<byte>.Shared` and slices rented arrays to exact size, reducing GC pressure.
 

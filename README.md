@@ -7,7 +7,7 @@ A .NET library for reading and writing columnar file formats — **Apache Parque
 - **Five formats, one Arrow surface.** Parquet, ORC, Avro, Lance, and Vortex readers and writers all speak `Apache.Arrow.RecordBatch`; Delta Lake, Lance dataset, and Iceberg sit on top of them.
 - **Predicate pushdown across formats.** A shared expression library (`EngineeredWood.Expressions`) drives row-group pruning in Parquet, file pruning in Delta Lake, scan planning in Iceberg, predicate-based delete/update on Lance datasets, and zone-stats pruning on Vortex — one predicate type works against any of them.
 - **Table-format support.** Delta Lake Reader v3 / Writer v7 with deletion vectors, column mapping, type widening, change data feed, identity columns, row tracking, and V2 checkpoints. Lance datasets with Create / Append / Overwrite / Delete / Update / Compact / Vacuum and version + timestamp time travel. Iceberg v1/v2/v3 metadata with manifest read/write and partition-transform-aware scan planning.
-- **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files or Azure Blob Storage.
+- **Cloud-native I/O.** An offset-based I/O layer (instead of `Stream`) lets readers issue concurrent, coalesced range requests against local files, Azure Blob Storage, Google Cloud Storage, or Amazon S3. Table formats run on the same backends through a shared `ITableFileSystem` abstraction with conflict-free commit support.
 - **Pure-managed compression.** Snappy, Zstd, and LZ4 via managed codecs; no native dependencies.
 - **Multi-targeted.** Libraries build for `netstandard2.0`, `net8.0`, and `net10.0`.
 
@@ -35,7 +35,9 @@ src/
   EngineeredWood.DeltaLake/              Delta Lake transaction log (low-level)
   EngineeredWood.DeltaLake.Table/        Delta Lake table API (high-level Arrow I/O)
   EngineeredWood.Iceberg/                Apache Iceberg metadata + scan planning
-  EngineeredWood.Azure/                  Azure Blob Storage backends
+  EngineeredWood.Azure/                  Azure Blob Storage I/O backends
+  EngineeredWood.Gcs/                    Google Cloud Storage I/O backends
+  EngineeredWood.Aws/                    Amazon S3 I/O backends
 test/                                    xUnit tests, BenchmarkDotNet suites, and a 92-file
                                          cross-tool Parquet compatibility harness
 ```
@@ -527,10 +529,16 @@ disjoint byte ranges — each "seek + read" on cloud storage is a separate
 HTTP request. The offset-based interfaces support concurrent reads with no
 shared cursor, batched range requests, and pooled buffers.
 
-| Backend | Read | Write |
-|---|---|---|
-| Local files | `LocalRandomAccessFile` | `LocalSequentialFile` |
-| Azure Blob Storage | `AzureBlobRandomAccessFile` | `AzureBlobSequentialFile` |
+| Backend | Random-access read | Sequential write | Directory / table ops |
+|---|---|---|---|
+| Local files | `LocalRandomAccessFile` | `LocalSequentialFile` | `LocalTableFileSystem` |
+| Azure Blob Storage | `AzureBlobRandomAccessFile` | `AzureBlobSequentialFile` | `AzureTableFileSystem` |
+| Google Cloud Storage | `GcsRandomAccessFile` | `GcsSequentialFile` | `GcsTableFileSystem` |
+| Amazon S3 | `S3RandomAccessFile` | `S3SequentialFile` | `S3TableFileSystem` |
+
+The cloud backends live in separate packages — `EngineeredWood.Azure` (on `Azure.Storage.Blobs`), `EngineeredWood.Gcs` (on `Clast.Google.Cloud.Storage.V1`), and `EngineeredWood.Aws` (on `AWSSDK.S3`) — so consumers pull in only the SDK they use.
+
+Each cloud writer streams with bounded memory using the backend's native chunked-upload mechanism — Azure block blobs, GCS resumable uploads, and S3 multipart uploads — rather than buffering the whole object. `ITableFileSystem` adds the directory-level operations table formats need (list / open / create / rename / delete / exists); its `RenameAsync` uses each backend's atomic create-if-absent precondition, giving Delta Lake and Iceberg the conflict-free commit guarantee they rely on.
 
 `CoalescingFileReader` is a decorator that merges nearby byte ranges to reduce I/O round trips — particularly useful on cloud storage.
 
@@ -804,6 +812,41 @@ var scan = new TableScan(metadata, fileSystem)
 var result = await scan.PlanFilesAsync();
 // result.DataFiles contains files that may match — read them with the
 // Parquet/ORC/Avro readers in this same library.
+```
+
+### Cloud storage
+
+Any reader or writer that takes an `IRandomAccessFile` / `ISequentialFile` works
+directly against cloud storage — pass the backend's file handle instead of the
+local one. For Amazon S3 (Azure and GCS are the same shape with their own handles):
+
+```csharp
+using Amazon.S3;
+using EngineeredWood.IO.Aws;
+using EngineeredWood.Parquet;
+
+var s3 = new AmazonS3Client();
+
+// Read a Parquet object straight from S3 (concurrent, coalesced range GETs).
+await using var file = new S3RandomAccessFile(s3, "my-bucket", "data/events.parquet");
+await using var reader = new ParquetFileReader(file);
+await foreach (var batch in reader.ReadAllAsync()) { /* ... */ }
+```
+
+Table formats run on cloud storage through `ITableFileSystem`. Swap
+`LocalTableFileSystem` for `S3TableFileSystem`, `AzureTableFileSystem`, or
+`GcsTableFileSystem` — everything else is unchanged:
+
+```csharp
+using Amazon.S3;
+using EngineeredWood.IO.Aws;
+using EngineeredWood.DeltaLake.Table;
+
+var s3 = new AmazonS3Client();
+var fs = new S3TableFileSystem(s3, "my-bucket", rootPath: "tables/events");
+
+await using var table = await DeltaTable.OpenAsync(fs);
+await foreach (var batch in table.ReadAllAsync()) { /* ... */ }
 ```
 
 ## Building
